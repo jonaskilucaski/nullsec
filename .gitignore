@@ -1,0 +1,27 @@
+# Secrets
+.env
+*.env
+secrets.*
+creds.*
+credentials.*
+config.local*
+
+# NullSec output
+output/
+outputs/
+results/
+reports/
+logs/
+*.log
+*.tmp
+
+# Backups
+*.bak
+*.old
+*.orig
+
+# Editor/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
