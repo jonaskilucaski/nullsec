@@ -1,6 +1,6 @@
 # NullSec
 
-**Current version:** v1.0.1
+**Current version:** v1.0.2
 
 **NullSec** is a Bash-based bug bounty reconnaissance automation framework that organizes target discovery, validation, web probing, URL collection, prioritization, vulnerability scanning, JavaScript analysis, visual reconnaissance, fuzzing, and reporting into a checkpointed multi-phase workflow.
 
@@ -198,7 +198,7 @@ Display the current version:
 Expected output:
 
 ```text
-NullSec Framework v1.0.1
+NullSec Framework v1.0.2
 Created by Jonaski
 ```
 
@@ -207,6 +207,19 @@ Created by Jonaski
 Run the default `normal` scan:
 
 ```bash
+./nullsec.sh -d example.com
+```
+
+Run with a custom Amass timeout:
+
+```bash
+NULLSEC_AMASS_TIMEOUT=1800 ./nullsec.sh -d example.com
+```
+
+Use the Nuclei templates environment variable:
+
+```bash
+export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"
 ./nullsec.sh -d example.com
 ```
 
@@ -270,11 +283,15 @@ Runtime depends on the number of discovered assets, target responsiveness, netwo
 
 Collects and merges results from Subfinder, Amass, Assetfinder, crt.sh, Hakrawler, PureDNS, and optionally Gotator. Amass v4 is preferred for its live colored Open Asset Model relationship output.
 
-Primary output:
+Primary outputs:
 
 ```text
 phase1-subdomains/all-subdomains.txt
+phase1-subdomains/amass-clean.txt
+phase1-subdomains/amass-detailed.txt
 ```
+
+`amass-detailed.txt` is diagnostic graph output only. NullSec merges only `amass-clean.txt` into the final subdomain corpus.
 
 ### Phase 2 — Validation and resolution
 
@@ -560,6 +577,12 @@ export AMASS_V4_BIN=amass-v4
 export AMASS_V4_CONFIG="$HOME/.config/amass/config.yaml"
 ```
 
+Set a custom Amass timeout for larger domains:
+
+```bash
+NULLSEC_AMASS_TIMEOUT=1800 ./nullsec.sh -d example.com
+```
+
 Force the fallback binary:
 
 ```bash
@@ -625,6 +648,8 @@ cat /usr/share/wordlists/resolvers.txt
 Review:
 
 ```text
+phase1-subdomains/amass-clean.txt
+phase1-subdomains/amass-clean-export.log
 phase1-subdomains/amass-detailed.txt
 phase1-subdomains/amass-v4.log
 phase1-subdomains/amass-error.log
@@ -672,6 +697,17 @@ Then reproduce each behavior manually with a controlled request and compare it a
 8. Test IDOR, authorization, business logic, and authenticated workflows manually.
 
 ## Changelog
+
+### v1.0.2
+- Fixed Nuclei templates path detection
+- Added support for the NUCLEI_TEMPLATES environment variable
+- Added fallback detection for $HOME/.local/nuclei-templates
+- Made Amass timeout configurable
+- Added NULLSEC_AMASS_TIMEOUT override
+- Improved Amass timeout warning message
+- Preserved Amass detailed graph output for diagnostics
+- Prevented raw Amass graph data from polluting merged subdomain results
+- Improved Amass zero-result terminal output
 
 ### v1.0.1
 - Fixed Nuclei templates path detection

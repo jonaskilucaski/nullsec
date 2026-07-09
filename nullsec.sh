@@ -29,7 +29,7 @@ umask 077
 #                           CONFIGURATION SECTION                              #
 #==============================================================================#
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 AUTHOR="Jonaski"
 
 TARGET=""
@@ -155,12 +155,15 @@ NUCLEI_SEVERITY="critical,high,medium"
 # Katana crawl depth
 KATANA_DEPTH=3
 
-# Amass wall-clock timeout in seconds (fast mode uses a shorter cap).
+# Amass wall-clock timeout in seconds.
+# Default normal-mode budget is 900s. Deep mode raises the default to 1800s.
+# Override per run, for example:
+#   NULLSEC_AMASS_TIMEOUT=1800 ./nullsec.sh -d example.com
 # Prefer Amass v4.2.x because it streams the colored Open Asset Model graph:
 #   host.example.com (FQDN) --> a_record --> 192.0.2.10 (IPAddress)
 # Override these with environment variables when using a different binary name
 # or configuration location. The maintained Amass binary remains a fallback.
-AMASS_TIMEOUT=600
+AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-900}"
 AMASS_PREFER_V4="${AMASS_PREFER_V4:-true}"
 AMASS_V4_BIN="${AMASS_V4_BIN:-amass-v4}"
 AMASS_V4_CONFIG="${AMASS_V4_CONFIG:-$HOME/.config/amass/config.yaml}"
@@ -761,8 +764,8 @@ apply_scan_mode() {
             # Katana — shallower crawl
             KATANA_DEPTH=1
 
-            # Amass — short timeout so it doesn't block everything
-            AMASS_TIMEOUT=120
+            # Amass — configurable timeout; fast mode keeps a shorter default.
+            AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-300}"
 
             # Concurrency — lower threads since we're running more often
             HTTPX_THREADS=15
@@ -810,7 +813,7 @@ apply_scan_mode() {
 
             NUCLEI_SEVERITY="critical,high,medium"
             KATANA_DEPTH=2
-            AMASS_TIMEOUT=300
+            AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-900}"
 
             HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
@@ -859,7 +862,7 @@ apply_scan_mode() {
 
             NUCLEI_SEVERITY="critical,high,medium,low"
             KATANA_DEPTH=3
-            AMASS_TIMEOUT=600
+            AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-1800}"
 
             HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
@@ -1115,13 +1118,35 @@ phase1_subdomain_discovery() {
     fi
     success "Subfinder: $(count_lines "$p1dir/subfinder.txt") subdomains"
 
-    info "Running Amass enumeration..."
+    info "Running Amass enumeration with timeout: ${AMASS_TIMEOUT}s"
     local amass_help amass_state amass_export amass_log amass_bin amass_version
-    local amass_minutes amass_detailed
+    local amass_minutes amass_detailed amass_clean amass_legacy amass_clean_log amass_raw
     local -a amass_config_args=()
-    : > "$p1dir/amass.txt"
+    amass_clean="$p1dir/amass-clean.txt"
+    amass_legacy="$p1dir/amass.txt"
+    amass_clean_log="$p1dir/amass-clean-export.log"
+    : > "$amass_clean"
+    : > "$amass_legacy"
+    : > "$amass_clean_log"
     : > "$p1dir/amass-detailed.txt"
 
+    # Amass v4 detailed output is a relationship graph. It is useful for
+    # diagnostics, but it must never be merged directly into all-subdomains.txt.
+    # This cleaner extracts only clean, in-scope FQDN tokens and removes graph
+    # relationship/object lines such as Netblock, IPAddress, ASN, ns_record, etc.
+    _nullsec_export_clean_amass() {
+        local input="$1" output="$2"
+        if [ -s "$input" ]; then
+            grep -Eiv 'Netblock|IPAddress|RIROrganization|ASN|contains|managed_by|announces|ns_record|mx_record' "$input" 2>/dev/null \
+                | grep -Eo '(\*\.)?([a-zA-Z0-9_-]+\.)+[a-zA-Z0-9_-]+' \
+                | sed -E 's/^\*\.//; s/\.$//' \
+                | tr '[:upper:]' '[:lower:]' \
+                | in_scope \
+                | sort -u > "$output" || : > "$output"
+        else
+            : > "$output"
+        fi
+    }
     # Run Amass v4 without redirecting stdout. Keeping stdout attached to the
     # terminal is intentional: it preserves v4's live ANSI colors and its rich
     # Open Asset Model relationships while -o independently saves plain text.
@@ -1145,27 +1170,12 @@ phase1_subdomain_discovery() {
             amass_config_args=(-config "$AMASS_V4_CONFIG")
         fi
 
-        _run_tracked_command timeout --signal=INT --kill-after=30s "$(( AMASS_TIMEOUT + 45 ))" \
-            "$amass_bin" enum \
-                "${amass_config_args[@]}" \
-                -timeout "$amass_minutes" \
-                -d "$TARGET" \
-                -dir "$amass_state" \
-                -log "$amass_log" \
-                -o "$amass_detailed"
+        _run_tracked_command timeout --signal=INT --kill-after=30s "$(( AMASS_TIMEOUT + 45 ))"             "$amass_bin" enum                 "${amass_config_args[@]}"                 -timeout "$amass_minutes"                 -d "$TARGET"                 -dir "$amass_state"                 -log "$amass_log"                 -o "$amass_detailed"
         rc=$?
 
-        # The v4 text output is a relationship graph, not a hostname-only list.
-        # Extract every FQDN node, normalize it, and enforce the target boundary
-        # before exposing it to any downstream active phase.
-        if [ -s "$amass_detailed" ]; then
-            grep -Eo '([[:alnum:]_*.-]+\.)+[[:alnum:]_-]+[[:space:]]+\(FQDN\)' \
-                "$amass_detailed" 2>/dev/null \
-                | sed -E 's/[[:space:]]+\(FQDN\)$//; s/^\*\.//' \
-                | tr '[:upper:]' '[:lower:]' \
-                | in_scope \
-                | sort -u > "$p1dir/amass.txt" || : > "$p1dir/amass.txt"
-        fi
+        # Export only clean, in-scope FQDNs. Keep the full graph separately for
+        # diagnostics; never merge raw graph relationship lines downstream.
+        _nullsec_export_clean_amass "$amass_detailed" "$amass_clean"
     }
 
     amass_version=""
@@ -1189,12 +1199,12 @@ phase1_subdomain_discovery() {
             # Older Amass fallback. This path is retained only for portability;
             # it does not provide the v4 Open Asset Model relationship display.
             info "Using installed pre-v4 Amass fallback."
-            _run_tracked_command timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT" \
-                "$amass_bin" enum \
-                    -passive -src -d "$TARGET" \
-                    -o "$p1dir/amass.txt" \
-                    2> "$p1dir/amass-error.log"
+            amass_raw="$p1dir/.amass-raw.tmp.$$"
+            : > "$amass_raw"
+            _run_tracked_command timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     -passive -src -d "$TARGET"                     -o "$amass_raw"                     2> "$p1dir/amass-error.log"
             rc=$?
+            _nullsec_export_clean_amass "$amass_raw" "$amass_clean"
+            rm -f "$amass_raw"
         else
             info "Using installed Amass v5 database/export fallback."
             amass_state="$p1dir/.amass-state"
@@ -1210,26 +1220,12 @@ phase1_subdomain_discovery() {
                 amass_v5_config_args=(-config "$HOME/.config/amass/config.yaml")
             fi
 
-            _run_tracked_command timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT" \
-                "$amass_bin" enum \
-                    "${amass_v5_config_args[@]}" \
-                    -d "$TARGET" \
-                    -nocolor \
-                    -dir "$amass_state" \
-                    -log amass.log \
-                    >/dev/null 2>&1
+            _run_tracked_command timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     "${amass_v5_config_args[@]}"                     -d "$TARGET"                     -nocolor                     -dir "$amass_state"                     -log amass.log                     >/dev/null 2>&1
             rc=$?
 
-            if "$amass_bin" subs \
-                -names -nocolor \
-                -d "$TARGET" \
-                -dir "$amass_state" \
-                -o "$amass_export" \
-                >/dev/null 2>> "$amass_log"; then
+            if "$amass_bin" subs                 -names -nocolor                 -d "$TARGET"                 -dir "$amass_state"                 -o "$amass_export"                 >/dev/null 2>> "$amass_log"; then
                 if [ -s "$amass_export" ]; then
-                    tr '[:upper:]' '[:lower:]' < "$amass_export" \
-                        | in_scope \
-                        | sort -u > "$p1dir/amass.txt"
+                    _nullsec_export_clean_amass "$amass_export" "$amass_clean"
                 fi
             else
                 warn "Amass v5 result export failed; see $amass_log"
@@ -1243,21 +1239,32 @@ phase1_subdomain_discovery() {
         phase_errors=$(( phase_errors + 1 ))
     fi
 
-    unset -f _nullsec_run_amass_v4
+    unset -f _nullsec_run_amass_v4 _nullsec_export_clean_amass
 
+    # Legacy compatibility: keep amass.txt as a clean hostname-only copy, while
+    # the explicit amass-clean.txt file is the source used by merges.
+    cp -f "$amass_clean" "$amass_legacy" 2>/dev/null || : > "$amass_legacy"
+
+    local amass_clean_count
+    amass_clean_count=$(count_lines "$amass_clean")
+    printf 'Amass clean subdomains exported: %s\n' "$amass_clean_count" > "$amass_clean_log"
     if [ "$rc" -eq 124 ]; then
-        warn "Amass reached its ${AMASS_TIMEOUT}s scan budget; partial graph output was preserved."
-        phase_errors=$(( phase_errors + 1 ))
+        warn "Amass reached the timeout. This does not mean the scan failed. Increase NULLSEC_AMASS_TIMEOUT if needed."
+        [ -s "$p1dir/amass-detailed.txt" ] && warn "Partial Amass graph output was preserved: $p1dir/amass-detailed.txt"
     elif [ "$rc" -ne 0 ]; then
         warn "Amass failed with exit code $rc; review the Amass log."
         phase_errors=$(( phase_errors + 1 ))
-    elif [ ! -s "$p1dir/amass.txt" ]; then
-        warn "Amass completed successfully but exported 0 clean subdomains."
     fi
 
-    success "Amass: $(count_lines "$p1dir/amass.txt") clean subdomains"
-    [ -s "$p1dir/amass-detailed.txt" ] && \
-        info "Amass v4 relationship graph saved: $p1dir/amass-detailed.txt"
+    if [ -s "$p1dir/amass-detailed.txt" ]; then
+        info "Amass detailed graph saved for diagnostics: $p1dir/amass-detailed.txt"
+    fi
+
+    if [ "$amass_clean_count" -gt 0 ]; then
+        success "Amass clean subdomains exported: $amass_clean_count"
+    else
+        info "Amass graph saved for diagnostics. Continuing with other sources."
+    fi
 
     info "Running Assetfinder..."
     tmp="$p1dir/.assetfinder.tmp.$$"
@@ -1301,9 +1308,9 @@ phase1_subdomain_discovery() {
     success "crt.sh: $(count_lines "$p1dir/crtsh.txt") subdomains"
 
     info "Merging passive enumeration results..."
-    if ! cat "$p1dir/subfinder.txt" "$p1dir/amass.txt" \
+    if ! cat "$p1dir/subfinder.txt" "$p1dir/amass-clean.txt" \
         "$p1dir/assetfinder.txt" "$p1dir/crtsh.txt" 2>/dev/null \
-        | sort -u > "$p1dir/all-subdomains-passive.txt"; then
+        | in_scope | sort -u > "$p1dir/all-subdomains-passive.txt"; then
         error "Failed to merge passive subdomain sources."
         merge_phase_backup "$p1dir"
         return 1
@@ -4127,6 +4134,7 @@ main() {
     info "Scan Mode       : $SCAN_MODE"
     info "Nuclei Update   : $UPDATE_NUCLEI"
     info "Rate Limiting   : $RATE_LIMIT"
+    info "Amass Timeout   : ${AMASS_TIMEOUT}s"
     resolve_nuclei_templates true || true
     echo ""
 
