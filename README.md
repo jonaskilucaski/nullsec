@@ -690,6 +690,10 @@ NullSec is provided for educational purposes and authorized security testing. Th
 
 By using NullSec, you agree that you are solely responsible for obtaining permission, defining scope, selecting safe scan settings, validating results, and complying with all applicable laws and program rules.
 
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
 ---
 
 Created by Jonaski for bug bounty reconnaissance and security research.
