@@ -1,6 +1,6 @@
 # NullSec
 
-**Current version:** v1.0.0
+**Current version:** v1.0.1
 
 **NullSec** is a Bash-based bug bounty reconnaissance automation framework that organizes target discovery, validation, web probing, URL collection, prioritization, vulnerability scanning, JavaScript analysis, visual reconnaissance, fuzzing, and reporting into a checkpointed multi-phase workflow.
 
@@ -139,19 +139,26 @@ Modify the paths in the configuration section of `nullsec.sh` when your installa
 
 ### Nuclei templates
 
-The default template directory is:
+NullSec detects Nuclei templates in this order:
 
-```bash
-$HOME/nuclei-templates
-```
+1. `NUCLEI_TEMPLATES` when it is set and points to a valid directory
+2. `$HOME/.local/nuclei-templates`
+3. `$HOME/nuclei-templates`
 
-Update templates manually:
+Install or update templates manually:
 
 ```bash
 nuclei -ut
 ```
 
-Or let NullSec update them before a scan with the `-u` option.
+If your templates are installed under the newer local path, you can also set:
+
+```bash
+export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"
+```
+
+Missing templates show a warning only; normal mode does not fail only because the template directory is absent.
+Or let NullSec update templates before a scan with the `-u` option.
 
 ## Installation
 
@@ -191,7 +198,7 @@ Display the current version:
 Expected output:
 
 ```text
-NullSec Framework v1.0.0
+NullSec Framework v1.0.1
 Created by Jonaski
 ```
 
@@ -666,6 +673,12 @@ Then reproduce each behavior manually with a controlled request and compare it a
 
 ## Changelog
 
+### v1.0.1
+- Fixed Nuclei templates path detection
+- Added support for NUCLEI_TEMPLATES environment variable
+- Added fallback detection for $HOME/.local/nuclei-templates
+- Improved Nuclei warning message
+
 ### v1.0.0
 - Added official NullSec branding
 - Added author name: Jonaski
@@ -689,10 +702,6 @@ Also test the affected phase against a domain you own or a purpose-built lab. Do
 NullSec is provided for educational purposes and authorized security testing. The author and contributors are not responsible for misuse, service disruption, data loss, account suspension, legal consequences, or violations of third-party policies.
 
 By using NullSec, you agree that you are solely responsible for obtaining permission, defining scope, selecting safe scan settings, validating results, and complying with all applicable laws and program rules.
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ---
 

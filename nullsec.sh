@@ -29,7 +29,7 @@ umask 077
 #                           CONFIGURATION SECTION                              #
 #==============================================================================#
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 AUTHOR="Jonaski"
 
 TARGET=""
@@ -98,7 +98,11 @@ PHASE10_WALL_TIMEOUT=3600
 PHASE11_WALL_TIMEOUT=3600
 
 # Nuclei templates path
-NUCLEI_TEMPLATES="$HOME/nuclei-templates"
+# Leave empty by default so resolve_nuclei_templates() can prefer:
+# 1) a valid NUCLEI_TEMPLATES environment variable,
+# 2) $HOME/.local/nuclei-templates,
+# 3) $HOME/nuclei-templates.
+NUCLEI_TEMPLATES="${NUCLEI_TEMPLATES:-}"
 
 # Scan mode — set by --mode flag (fast | normal | deep)
 # Can also be overridden by individual flags after apply_scan_mode() is called.
@@ -434,6 +438,38 @@ check_readable_file() {
         return 0
     fi
     echo -e "  ${YELLOW}○${NC} $label (missing, empty, or unreadable — related phase may be skipped/reduced)"
+    return 1
+}
+
+resolve_nuclei_templates() {
+    local announce="${1:-true}"
+    local configured="${NUCLEI_TEMPLATES:-}"
+    local candidate resolved
+
+    if [ -n "$configured" ]; then
+        if [ -d "$configured" ]; then
+            resolved=$(cd "$configured" 2>/dev/null && pwd -P)
+            NUCLEI_TEMPLATES="$resolved"
+            [ "$announce" = true ] && success "Using Nuclei templates directory: $NUCLEI_TEMPLATES"
+            return 0
+        fi
+        [ "$announce" = true ] && warn "NUCLEI_TEMPLATES is set but not a valid directory: $configured"
+    fi
+
+    for candidate in "$HOME/.local/nuclei-templates" "$HOME/nuclei-templates"; do
+        if [ -d "$candidate" ]; then
+            resolved=$(cd "$candidate" 2>/dev/null && pwd -P)
+            NUCLEI_TEMPLATES="$resolved"
+            [ "$announce" = true ] && success "Using Nuclei templates directory: $NUCLEI_TEMPLATES"
+            return 0
+        fi
+    done
+
+    NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"
+    if [ "$announce" = true ]; then
+        warn "Nuclei templates directory not found. Run: nuclei -ut"
+        warn 'Or set: export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"'
+    fi
     return 1
 }
 
@@ -962,8 +998,13 @@ check_tools() {
         echo -e "  ${YELLOW}○${NC} web-content fuzzing wordlists not required in $SCAN_MODE mode"
     fi
 
-    if [ ! -d "$NUCLEI_TEMPLATES" ]; then
-        warn "Nuclei templates directory not found at $NUCLEI_TEMPLATES. Run 'nuclei -ut' or set NUCLEI_TEMPLATES."
+    echo ""
+    echo -e "${CYAN}--- Nuclei Templates ---${NC}"
+    if [ -d "$NUCLEI_TEMPLATES" ]; then
+        echo -e "  ${GREEN}✓${NC} $NUCLEI_TEMPLATES"
+    else
+        echo -e "  ${YELLOW}○${NC} not found — run 'nuclei -ut' or set:"
+        echo '    export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"'
     fi
 
     if [ ${#missing_required[@]} -ne 0 ]; then
@@ -1012,6 +1053,7 @@ print_version() {
 }
 
 usage() {
+    local exit_code="${1:-1}"
     echo "Usage: $0 -d <target-domain> [options]"
     echo ""
     echo "Options:"
@@ -1023,6 +1065,7 @@ usage() {
     echo "  -r                Enable rate limiting / polite delays between phases"
     echo "  -c <dir>          Resume scan from checkpoint in existing output directory"
     echo "  --version         Show NullSec version and author"
+    echo "  --help            Show this help message"
     echo "  -h                Show this help message"
     echo ""
     echo "Amass compatibility:"
@@ -1046,7 +1089,7 @@ usage() {
     echo "  $0 -d example.com -m fast"
     echo "  $0 -d example.com -m deep -u -r"
     echo "  $0 -d example.com -m normal -o /path/to/output"
-    exit 1
+    exit "$exit_code"
 }
 
 #==============================================================================#
@@ -2715,12 +2758,7 @@ phase7_vulnerability_scanning() {
     # operator should make consciously.  We surface a one-time inventory so
     # Jonaski can audit which templates are unsigned and decide whether to
     # keep them.  Inventory is best-effort and won't fail the phase.
-    local _nt_dir
-    _nt_dir=$(nuclei -td 2>/dev/null | head -1)
-    if [ -z "$_nt_dir" ] || [ ! -d "$_nt_dir" ]; then
-        # Fall back to the common default location
-        _nt_dir="$HOME/nuclei-templates"
-    fi
+    local _nt_dir="$NUCLEI_TEMPLATES"
     if [ -d "$_nt_dir" ]; then
         # A template is considered "potentially unsigned" if it lives outside
         # the official numbered version directory and lacks the standard
@@ -3764,15 +3802,20 @@ phase12_active_vulns() {
     fi
 
     if [ -s "$OUTPUT_DIR/phase3-probing/status-403.txt" ]; then
-        info "Attempting 403 Forbidden bypass techniques..."
-        if ! nuclei -l "$OUTPUT_DIR/phase3-probing/status-403.txt" \
-            -t "$NUCLEI_TEMPLATES/http/fuzzing/403-bypass.yaml" \
-            -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
-            -o "$p12dir/403-bypass-confirmed.txt" -silent 2>/dev/null; then
-            warn "403-bypass confirmation scan failed; partial output was preserved."
-            phase_status=1
+        local bypass_template="$NUCLEI_TEMPLATES/http/fuzzing/403-bypass.yaml"
+        if [ -f "$bypass_template" ]; then
+            info "Attempting 403 Forbidden bypass techniques..."
+            if ! nuclei -l "$OUTPUT_DIR/phase3-probing/status-403.txt" \
+                -t "$bypass_template" \
+                -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
+                -o "$p12dir/403-bypass-confirmed.txt" -silent 2>/dev/null; then
+                warn "403-bypass confirmation scan failed; partial output was preserved."
+                phase_status=1
+            fi
+            [ -s "$p12dir/403-bypass-confirmed.txt" ] && success "🚨 403 bypass found! → $p12dir/403-bypass-confirmed.txt"
+        else
+            warn "403-bypass template missing: $bypass_template — skipping 403 bypass confirmation."
         fi
-        [ -s "$p12dir/403-bypass-confirmed.txt" ] && success "🚨 403 bypass found! → $p12dir/403-bypass-confirmed.txt"
     fi
 
     if [ -s "$p5dir/api-endpoints.txt" ]; then
@@ -3990,10 +4033,15 @@ EOF
 #==============================================================================#
 
 main() {
-    if [ "${1:-}" = "--version" ]; then
-        print_version
-        exit 0
-    fi
+    case "${1:-}" in
+        --version)
+            print_version
+            exit 0
+            ;;
+        --help)
+            usage 0
+            ;;
+    esac
 
     local RESUME_DIR="" OUTPUT_EXPLICIT=false MODE_CHANGED=false
     while getopts "d:o:m:surc:h" opt; do
@@ -4005,7 +4053,7 @@ main() {
             u) UPDATE_NUCLEI=true ;;
             r) RATE_LIMIT=true ;;
             c) RESUME_DIR="$OPTARG" ;;
-            h) usage ;;
+            h) usage 0 ;;
             *) usage ;;
         esac
     done
@@ -4079,6 +4127,7 @@ main() {
     info "Scan Mode       : $SCAN_MODE"
     info "Nuclei Update   : $UPDATE_NUCLEI"
     info "Rate Limiting   : $RATE_LIMIT"
+    resolve_nuclei_templates true || true
     echo ""
 
     [ "$SKIP_TOOL_CHECK" = false ] && check_tools
