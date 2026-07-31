@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "program": "Wolt HackerOne bug bounty",
+  "stage": 1,
+  "offline_only": true,
+  "nullsec_execution_allowed": false,
+  "network_execution_allowed": false,
+  "wildcard": {
+    "policy_asset": "*.wolt.com",
+    "passive_discovery_seed": "wolt.com",
+    "literal_wildcard_may_be_passed_to_tools": false,
+    "discovered_hosts_require_review": true
+  },
+  "approved_exact_web_assets": [
+    "wolt.com",
+    "restaurant-api.wolt.com",
+    "ops.wolt.com",
+    "merchant.wolt.com",
+    "drive.wolt.com",
+    "corporate.wolt.com",
+    "authentication.wolt.com"
+  ],
+  "explicit_exclusions": [
+    "wolt.atlassian.net",
+    "press.wolt.com",
+    "links.wolt.com",
+    "gettest.wolt.com",
+    "blog.wolt.com"
+  ],
+  "mobile_assets": [
+    "com.wolt.courierapp",
+    "com.wolt.android",
+    "943905271",
+    "1477299281"
+  ],
+  "precedence": [
+    "malformed",
+    "mobile_asset",
+    "explicit_exclusion",
+    "approved_exact",
+    "wildcard_eligible_pending_review",
+    "non_wolt"
+  ],
+  "future_http_requirements": {
+    "required_header_name": "X-HackerOne-Research",
+    "header_enabled_in_stage_1": false,
+    "username_must_reject_cr_lf": true,
+    "username_must_reject_header_injection": true
+  },
+  "account_and_data_rules": {
+    "researcher_owned_accounts_and_data_only": true,
+    "customer_accounts_may_be_self_registered": true,
+    "courier_accounts_available": false,
+    "merchant_accounts_available": false,
+    "designated_test_entities_required_where_applicable": true
+  },
+  "prohibited_testing": [
+    "payment-processor testing",
+    "brute force",
+    "DoS or DDoS",
+    "web-cache poisoned denial-of-service",
+    "spam or social engineering",
+    "physical intrusion",
+    "email bombing",
+    "mass account or entity creation",
+    "victim-device attacks",
+    "data modification outside researcher-owned test data"
+  ]
+}

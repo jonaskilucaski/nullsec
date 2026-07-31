@@ -1,0 +1,7 @@
+wolt.com
+restaurant-api.wolt.com
+ops.wolt.com
+merchant.wolt.com
+drive.wolt.com
+corporate.wolt.com
+authentication.wolt.com
