@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "source_id": "assetfinder",
+  "collection_status": "success",
+  "record_count": 3,
+  "records": ["api.wolt.com", "ops.wolt.com", "blog.wolt.com"]
+}

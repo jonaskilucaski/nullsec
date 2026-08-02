@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "source_id": "subfinder",
+  "collection_status": "success",
+  "record_count": 8,
+  "records": [
+    "wolt.com",
+    "api.wolt.com",
+    "press.wolt.com",
+    "example.com",
+    "com.wolt.android",
+    "https://wolt.com",
+    "API.WOLT.COM.",
+    "api.wolt.com"
+  ]
+}

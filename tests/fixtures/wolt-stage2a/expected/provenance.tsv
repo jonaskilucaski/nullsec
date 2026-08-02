@@ -1,0 +1,9 @@
+hostname	classification	source_id
+api.wolt.com	PENDING_WILDCARD_REVIEW	assetfinder
+api.wolt.com	PENDING_WILDCARD_REVIEW	subfinder
+blog.wolt.com	EXCLUDED	assetfinder
+com.wolt.android	MOBILE_ASSET	subfinder
+example.com	NON_WOLT	subfinder
+ops.wolt.com	APPROVED_EXACT	assetfinder
+press.wolt.com	EXCLUDED	subfinder
+wolt.com	APPROVED_EXACT	subfinder
