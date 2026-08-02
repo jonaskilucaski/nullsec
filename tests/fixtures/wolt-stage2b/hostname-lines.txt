@@ -1,0 +1,10 @@
+api.wolt.com
+MixedCase.WOLT.COM.
+api.wolt.com
+https://example.invalid/path
+192.0.2.1
+2001:db8::1
+192.0.2.0/24
+*.wolt.com
+com.wolt.android
+printable data !@#$%^&*()
