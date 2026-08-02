@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "source_id": "shodan",
+  "collection_status": "failed",
+  "error_code": "COLLECTION_FAILED",
+  "record_count": 0,
+  "records": []
+}
