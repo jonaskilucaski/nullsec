@@ -23,10 +23,10 @@ builtin cd -P -- "$launcher_dir" 2>/dev/null || startup_fail
 readonly REPOSITORY_DIR=$PWD
 readonly LAUNCHER_PATH="$REPOSITORY_DIR/nullsec-wolt-stage2c.sh"
 readonly PYTHON_CORE="$REPOSITORY_DIR/lib/wolt-stage2c.py"
-readonly EXPECTED_CORE_SHA256=17934098880e99f828eee620e7ac95085ee16795170604e31e3f37e45c5a06af
+readonly EXPECTED_CORE_SHA256=1a62db9621b61c1fc755a9c8340daaf406d53b29fae84401058eb5b897804b83
 readonly EXPECTED_INTEGRITY_SCHEMA=1
 readonly EXPECTED_INVENTORY_IDENTITY=b1578ab823271e0837f43fd607e6d98180b5221e92b47a676610ae734a036434
-readonly EXPECTED_INVENTORY_AGGREGATE=9aca946b49fd9263753af12a728b3d3cdb20c309dfcf0b603c72ecc91a747ec0
+readonly EXPECTED_INVENTORY_AGGREGATE=2280dc2db2036abc92ba627b1d8610557fe095aeae3e3ffcdb634306549f569b
 
 [[ "$REPOSITORY_DIR/${0##*/}" == "$LAUNCHER_PATH" && ! -L $REPOSITORY_DIR &&
    -f $LAUNCHER_PATH && ! -L $LAUNCHER_PATH && -f $PYTHON_CORE && ! -L $PYTHON_CORE ]] || startup_fail
@@ -80,7 +80,7 @@ result_meta=$(/usr/bin/stat -c '%f|%u|%a|%h' -- "$stdout_path" "$stderr_path" 2>
 unset result_meta
 
 if (
-    ulimit -f 4 || exit 125
+    ulimit -S -f 4 || exit 125
     /usr/bin/python3 -I -S -B "$PYTHON_CORE" \
         --repository "$REPOSITORY_DIR" \
         --launcher "$LAUNCHER_PATH" \
@@ -115,9 +115,9 @@ unset result_meta stdout_line stderr_line
 
 empty_hash=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 case "$child_status:$stdout_size:$stdout_hash:$stderr_size:$stderr_hash" in
-    0:29:e376b296c1b5fc10b29fd0dd16c04025fe9d5ffd73cba97a01c54c2e4db57f49:0:$empty_hash)
+    0:32:5d71a51a16130aa3aad5ada7902346f89dde123395604cad036330b39822b724:0:$empty_hash)
         public_code=0; public_result=success ;;
-    0:218:003d4b77f1453320ba68a58008818e23c0c11d4b22a336f654655ce34f431db0:0:$empty_hash)
+    0:344:906340108f048fa5184e9e3bae242774e3b4b9e843e7ed26253a89ea988e42ee:0:$empty_hash)
         public_code=0; public_result=help ;;
     1:0:$empty_hash:23:658d7cb911abbdb67d24451648ce177557343ac52962060ff27356f491f9eb18)
         public_code=1; public_result=STAGE2C_INTERNAL_ERROR ;;
@@ -127,6 +127,8 @@ case "$child_status:$stdout_size:$stdout_hash:$stderr_size:$stderr_hash" in
         public_code=3; public_result=STAGE2C_INPUT_ERROR ;;
     4:0:$empty_hash:21:588667436a3ecf8494095d50dd156f5e9d0c2e064691daf43e74c934c5d7216b)
         public_code=4; public_result=STAGE2C_SCHEMA_ERROR ;;
+    5:0:$empty_hash:20:73a05ff7fe73cee0bfd83d23789207e7089ab9b5f5cadd881b6bd0d9d29161d9)
+        public_code=5; public_result=STAGE2C_CHILD_ERROR ;;
     6:0:$empty_hash:26:5f56cd9658a72d3be8e2a4db837654b7972d824c8392590613ea7ef57ff4ed88)
         public_code=6; public_result=STAGE2C_PUBLICATION_ERROR ;;
     7:0:$empty_hash:25:27e6ce470ce21e8c116d69de6237edbc809feed91e1f4e39ee00ee4fa2d962a4)
@@ -141,12 +143,13 @@ esac
 cleanup_private || startup_fail
 trap - EXIT
 case $public_result in
-    success) builtin printf '%s\n' STAGE2C_PHASE1_VALIDATION_OK ;;
+    success) builtin printf '%s\n' STAGE2C_PHASE2_ORCHESTRATION_OK ;;
     help)
         builtin printf '%s\n' \
             'Usage: nullsec-wolt-stage2c.sh --help' \
             '       nullsec-wolt-stage2c.sh --manifest ABSOLUTE_FILE --output ABSOLUTE_NONEXISTENT_PATH' \
-            'Phase 1 performs offline validation only; it does not orchestrate, classify, or publish.' ;;
+            'Phase 2 performs strictly offline retained-evidence normalization orchestration.' \
+            'It invokes only the fixed offline Stage 2B boundary; it does not classify, execute Stage 2A or NullSec, or perform final publication.' ;;
     *) builtin printf '%s\n' "$public_result" >&2 ;;
 esac
 exit "$public_code"

@@ -1,8 +1,12 @@
 #!/usr/bin/python3
-"""Wolt Stage 2C Phase 1: strictly offline manifest validation primitives.
+"""Wolt Stage 2C Phase 2: strictly offline retained-evidence orchestration.
 
-Phase 1 validates retained artifacts and publication preconditions.  It does not
-invoke another stage, classify evidence, or create/publish an output package.
+Phase 2 retains the Phase 1 validation boundary, invokes only the fixed Stage 2B
+offline normalizer, validates its transient envelopes, and removes all staging.
+It does not classify evidence, invoke Stage 2A or NullSec, or publish a package.
+
+Processes running as this UID are trusted.  A compromised current account or a
+malicious same-UID process is outside this phase's threat model.
 """
 
 import ctypes
@@ -11,8 +15,14 @@ import hashlib
 import json
 import os
 import platform
+import resource
+import secrets
+import selectors
+import signal
 import stat
+import subprocess
 import sys
+import time
 
 
 EXIT_OK = 0
@@ -20,6 +30,7 @@ EXIT_INTERNAL = 1
 EXIT_INTEGRITY = 2
 EXIT_INPUT = 3
 EXIT_SCHEMA = 4
+EXIT_CHILD = 5
 EXIT_PUBLICATION = 6
 EXIT_PROVIDER_FAILURE = 7
 EXIT_DURABILITY_UNCERTAIN = 8
@@ -30,6 +41,7 @@ ERROR_TOKEN = {
     EXIT_INTEGRITY: "STAGE2C_INTEGRITY_ERROR",
     EXIT_INPUT: "STAGE2C_INPUT_ERROR",
     EXIT_SCHEMA: "STAGE2C_SCHEMA_ERROR",
+    EXIT_CHILD: "STAGE2C_CHILD_ERROR",
     EXIT_PUBLICATION: "STAGE2C_PUBLICATION_ERROR",
     EXIT_PROVIDER_FAILURE: "STAGE2C_PROVIDER_FAILURE",
     EXIT_DURABILITY_UNCERTAIN: "STAGE2C_DURABILITY_UNCERTAIN",
@@ -46,6 +58,23 @@ MAX_RETAINED_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_RETAINED_BYTES = 64 * 1024 * 1024
 MAX_PROTECTED_BYTES = 16 * 1024 * 1024
 MAX_LAUNCH_RESULT_BYTES = 4096
+
+# Stage 2B rejects any encoded envelope above its MAX_INPUT (8 MiB).  This
+# separate bound therefore covers every conforming Stage 2B success envelope;
+# it is intentionally unrelated to the 4 KiB launcher transcript fence.
+MAX_STAGE2B_INPUT_BYTES = 8 * 1024 * 1024
+MAX_NORMALIZED_ENVELOPE_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_NORMALIZED_BYTES = 64 * 1024 * 1024
+MAX_TRANSIENT_ARTIFACTS = MAX_ARTIFACTS
+MAX_CHILD_STDOUT_BYTES = 4096
+MAX_CHILD_STDERR_BYTES = 4096
+CHILD_TIMEOUT_SECONDS = 30
+CHILD_CPU_SECONDS = 10
+CHILD_ADDRESS_SPACE_BYTES = 256 * 1024 * 1024
+CHILD_OPEN_FILES = 32
+WORKSPACE_ATTEMPTS = 16
+STAGE2B_SUCCESS_STDOUT = b"STAGE2B_COMPLETE\n"
+STAGE2B_LAUNCHER_RELATIVE = "nullsec-wolt-stage2b.sh"
 
 INTEGRITY_SCHEMA_VERSION = 1
 INVENTORY_ALGORITHM = "sorted-path-sha256-v1"
@@ -493,8 +522,11 @@ def reject_excessive_json_nesting(data, maximum=MAX_JSON_DEPTH,
             depth -= 1
 
 
-def parse_strict_json(data, code=EXIT_SCHEMA, reason="MANIFEST"):
-    if not isinstance(data, bytes) or len(data) > MAX_MANIFEST_BYTES or b"\0" in data:
+def parse_strict_json(data, code=EXIT_SCHEMA, reason="MANIFEST",
+                      maximum_bytes=None):
+    maximum_bytes = MAX_MANIFEST_BYTES if maximum_bytes is None else maximum_bytes
+    if (not isinstance(data, bytes) or len(data) > maximum_bytes or
+            b"\0" in data):
         abort(code, reason + "_SIZE_OR_NUL")
     try:
         reject_excessive_json_nesting(data, code=code, reason=reason)
@@ -902,7 +934,8 @@ def validate_retained_artifacts(parsed, output_context):
         raise
 
 
-def validate_phase1(cfg):
+def open_validated_transaction(cfg):
+    """Validate Phase 1 and retain authenticated descriptors for Phase 2."""
     output_context = validate_nonexistent_output(cfg["output"])
     retained_contexts = []
     try:
@@ -921,11 +954,478 @@ def validate_phase1(cfg):
             abort(EXIT_PUBLICATION, "OUTPUT_APPEARED")
         for context in retained_contexts:
             revalidate_open_file(context, EXIT_INPUT, "RETAINED")
-        return parsed
-    finally:
+        return {
+            "parsed": parsed, "output": output_context,
+            "retained": retained_contexts,
+        }
+    except BaseException:
         for context in retained_contexts:
             close_context(context)
         close_context(output_context)
+        raise
+
+
+def close_validated_transaction(transaction):
+    for context in transaction.get("retained", ()):
+        close_context(context)
+    output_context = transaction.get("output")
+    if isinstance(output_context, dict):
+        close_context(output_context)
+
+
+def validate_phase1(cfg):
+    transaction = open_validated_transaction(cfg)
+    try:
+        return transaction["parsed"]
+    finally:
+        close_validated_transaction(transaction)
+
+
+def assert_output_reserved(context, ops=os):
+    revalidate_output_parent(context, ops)
+    try:
+        ops.stat(context["name"], dir_fd=context["fd"],
+                 follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        abort(EXIT_PUBLICATION, "OUTPUT_RESERVATION_INSPECT")
+    abort(EXIT_PUBLICATION, "OUTPUT_RESERVATION_LOST")
+
+
+def authorize_workspace_link_delta(transaction, delta, ops=os):
+    """Record only the output-parent nlink change caused by our workspace."""
+    output_value = ops.fstat(transaction["output"]["fd"])
+    output_inode = (output_value.st_dev, output_value.st_ino)
+    for context in transaction["retained"]:
+        for record in context.get("ancestors", ()):
+            if (record["device"], record["inode"]) != output_inode:
+                continue
+            current = ops.fstat(record["fd"])
+            previous = record["identity"]
+            updated = ancestor_identity(current)
+            if updated[:-1] != previous[:-1] or updated[-1] != previous[-1] + delta:
+                abort(EXIT_INPUT, "WORKSPACE_ANCESTOR_DELTA")
+            record["identity"] = updated
+            record["link_count"] = current.st_nlink
+
+
+def create_transient_workspace(output_context, ops=os):
+    assert_output_reserved(output_context, ops)
+    name = None
+    for _attempt in range(WORKSPACE_ATTEMPTS):
+        candidate = ".nullsec-wolt-stage2c-phase2-" + secrets.token_hex(16)
+        try:
+            ops.mkdir(candidate, 0o700, dir_fd=output_context["fd"])
+            name = candidate
+            break
+        except FileExistsError:
+            continue
+        except OSError:
+            abort(EXIT_PUBLICATION, "WORKSPACE_CREATE")
+    if name is None:
+        abort(EXIT_PUBLICATION, "WORKSPACE_COLLISION")
+    descriptor = -1
+    try:
+        flags = (ops.O_RDONLY | ops.O_DIRECTORY | ops.O_NOFOLLOW |
+                 getattr(ops, "O_CLOEXEC", 0))
+        descriptor = ops.open(name, flags, dir_fd=output_context["fd"])
+        current = ops.fstat(descriptor)
+        named = ops.stat(name, dir_fd=output_context["fd"],
+                         follow_symlinks=False)
+        if (not stat.S_ISDIR(current.st_mode) or
+                ancestor_identity(current) != ancestor_identity(named) or
+                current.st_uid != ops.geteuid() or
+                stat.S_IMODE(current.st_mode) != 0o700 or
+                current.st_nlink != 2):
+            abort(EXIT_PUBLICATION, "WORKSPACE_IDENTITY")
+        try:
+            ops.fsync(descriptor)
+            ops.fsync(output_context["fd"])
+        except OSError:
+            abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CREATE_FSYNC")
+        return {
+            "fd": descriptor, "name": name,
+            "path": os.path.join(output_context["parent"], name),
+            "identity": ancestor_identity(current), "output": output_context,
+        }
+    except BaseException:
+        if descriptor >= 0:
+            try:
+                ops.close(descriptor)
+            except OSError:
+                pass
+        try:
+            ops.rmdir(name, dir_fd=output_context["fd"])
+            ops.fsync(output_context["fd"])
+        except OSError:
+            abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CREATE_ROLLBACK")
+        raise
+
+
+def revalidate_workspace(workspace, expected_names=(), ops=os):
+    output_context = workspace["output"]
+    assert_output_reserved(output_context, ops)
+    try:
+        current = ops.fstat(workspace["fd"])
+        named = ops.stat(workspace["name"], dir_fd=output_context["fd"],
+                         follow_symlinks=False)
+        if (ancestor_identity(current) != workspace["identity"] or
+                ancestor_identity(named) != workspace["identity"] or
+                not stat.S_ISDIR(current.st_mode) or
+                current.st_uid != ops.geteuid() or
+                stat.S_IMODE(current.st_mode) != 0o700):
+            abort(EXIT_CHILD, "WORKSPACE_CHANGED")
+        inventory = ops.listdir(workspace["fd"])
+    except Failure:
+        raise
+    except (OSError, TypeError):
+        abort(EXIT_CHILD, "WORKSPACE_REVALIDATE")
+    if (len(inventory) != len(set(inventory)) or
+            set(inventory) != set(expected_names)):
+        abort(EXIT_CHILD, "WORKSPACE_INVENTORY")
+
+
+def _set_child_limit(kind, value):
+    _current_soft, current_hard = resource.getrlimit(kind)
+    if current_hard != resource.RLIM_INFINITY and current_hard < value:
+        raise OSError(errno.EPERM, "resource hard limit")
+    resource.setrlimit(kind, (value, value))
+
+
+def apply_child_limits():
+    _set_child_limit(resource.RLIMIT_CPU, CHILD_CPU_SECONDS)
+    _set_child_limit(resource.RLIMIT_FSIZE, MAX_NORMALIZED_ENVELOPE_BYTES)
+    _set_child_limit(resource.RLIMIT_AS, CHILD_ADDRESS_SPACE_BYTES)
+    _set_child_limit(resource.RLIMIT_NOFILE, CHILD_OPEN_FILES)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def terminate_child(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait()
+    except BaseException:
+        pass
+
+
+def run_fixed_stage2b(argv, popen=subprocess.Popen):
+    try:
+        process = popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env={"LC_ALL": "C"}, shell=False,
+            close_fds=True, start_new_session=True, preexec_fn=apply_child_limits)
+    except BaseException:
+        abort(EXIT_CHILD, "CHILD_START")
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    deadline = time.monotonic() + CHILD_TIMEOUT_SECONDS
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        selector.register(process.stderr, selectors.EVENT_READ, stderr)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_child(process)
+                abort(EXIT_CHILD, "CHILD_TIMEOUT")
+            for key, _event in selector.select(remaining):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except OSError:
+                    terminate_child(process)
+                    abort(EXIT_CHILD, "CHILD_READ")
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                key.data.extend(chunk)
+                limit = (MAX_CHILD_STDOUT_BYTES if key.data is stdout
+                         else MAX_CHILD_STDERR_BYTES)
+                if len(key.data) > limit:
+                    terminate_child(process)
+                    abort(EXIT_CHILD, "CHILD_OUTPUT_LIMIT")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            terminate_child(process)
+            abort(EXIT_CHILD, "CHILD_TIMEOUT")
+        try:
+            status = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            terminate_child(process)
+            abort(EXIT_CHILD, "CHILD_TIMEOUT")
+    except Failure:
+        raise
+    except BaseException:
+        terminate_child(process)
+        abort(EXIT_CHILD, "CHILD_INTERNAL")
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    return status, bytes(stdout), bytes(stderr)
+
+
+def validate_stage2b_transcript(status, stdout, stderr):
+    if (type(status) is not int or type(stdout) is not bytes or
+            type(stderr) is not bytes or
+            len(stdout) > MAX_CHILD_STDOUT_BYTES or
+            len(stderr) > MAX_CHILD_STDERR_BYTES or status != EXIT_OK or
+            stdout != STAGE2B_SUCCESS_STDOUT or stderr != b""):
+        abort(EXIT_CHILD, "CHILD_RESULT")
+
+
+def retained_records(data):
+    if (len(data) > MAX_STAGE2B_INPUT_BYTES or b"\0" in data or b"\r" in data or
+            any(byte >= 128 or (byte < 32 and byte != 10) or byte == 127
+                for byte in data)):
+        abort(EXIT_CHILD, "RETAINED_NORMALIZATION_INPUT")
+    if not data:
+        return []
+    body = data[:-1] if data.endswith(b"\n") else data
+    records = body.split(b"\n")
+    if (len(records) > 100000 or any(not record for record in records) or
+            any(len(record) > 4096 for record in records)):
+        abort(EXIT_CHILD, "RETAINED_NORMALIZATION_INPUT")
+    return [record.decode("ascii") for record in records]
+
+
+def reread_retained(context, artifact):
+    revalidate_open_file(context, EXIT_INPUT, "RETAINED")
+    try:
+        os.lseek(context["fd"], 0, os.SEEK_SET)
+    except OSError:
+        abort(EXIT_INPUT, "RETAINED_SEEK")
+    data, digest, value = read_fd_stable(
+        context["fd"], MAX_STAGE2B_INPUT_BYTES, EXIT_INPUT, "RETAINED",
+        oversize_code=EXIT_CHILD)
+    if (file_identity(value) != context["identity"] or
+            value.st_size != artifact["size_bytes"] or
+            digest != artifact["sha256"]):
+        abort(EXIT_INPUT, "RETAINED_REVALIDATION_MISMATCH")
+    revalidate_open_file(context, EXIT_INPUT, "RETAINED")
+    return data
+
+
+def validate_normalized_envelope(workspace, name, artifact, retained_data, ops=os):
+    revalidate_workspace(workspace, (name,), ops)
+    descriptor = open_regular_at(
+        workspace["fd"], name, EXIT_CHILD, "NORMALIZED",
+        exact_mode=0o400, ops=ops)
+    try:
+        before = ops.fstat(descriptor)
+        if before.st_uid != ops.geteuid() or before.st_nlink != 1:
+            abort(EXIT_CHILD, "NORMALIZED_IDENTITY")
+        data, digest, after = read_fd_stable(
+            descriptor, MAX_NORMALIZED_ENVELOPE_BYTES,
+            EXIT_CHILD, "NORMALIZED", ops=ops)
+        named = ops.stat(name, dir_fd=workspace["fd"], follow_symlinks=False)
+        if (file_identity(before) != file_identity(after) or
+                file_identity(named) != file_identity(after)):
+            abort(EXIT_CHILD, "NORMALIZED_REPLACED")
+        value = parse_strict_json(
+            data, EXIT_CHILD, "NORMALIZED",
+            maximum_bytes=MAX_NORMALIZED_ENVELOPE_BYTES)
+        keys = frozenset((
+            "schema_version", "source_id", "collection_status",
+            "record_count", "records",
+        ))
+        if not isinstance(value, dict) or set(value) != keys:
+            abort(EXIT_CHILD, "NORMALIZED_KEYS")
+        count = value["record_count"]
+        records = value["records"]
+        if (type(value["schema_version"]) is not int or
+                value["schema_version"] != 1 or
+                value["source_id"] != artifact["source_id"] or
+                value["collection_status"] != "success" or
+                type(count) is not int or count < 0 or count > 100000 or
+                not isinstance(records, list) or len(records) != count):
+            abort(EXIT_CHILD, "NORMALIZED_VALUES")
+        for record in records:
+            if not isinstance(record, str):
+                abort(EXIT_CHILD, "NORMALIZED_RECORD_TYPE")
+            try:
+                encoded = record.encode("ascii", "strict")
+            except UnicodeError:
+                abort(EXIT_CHILD, "NORMALIZED_RECORD_ENCODING")
+            if (len(encoded) > 4096 or
+                    any(byte < 32 or byte == 127 for byte in encoded)):
+                abort(EXIT_CHILD, "NORMALIZED_RECORD_VALUE")
+        if records != retained_records(retained_data):
+            abort(EXIT_CHILD, "NORMALIZED_RECORD_BINDING")
+        canonical = (json.dumps(
+            value, ensure_ascii=True, sort_keys=True, allow_nan=False,
+            separators=(",", ":")) + "\n").encode("ascii")
+        if data != canonical:
+            abort(EXIT_CHILD, "NORMALIZED_CANONICAL")
+        final = ops.fstat(descriptor)
+        named = ops.stat(name, dir_fd=workspace["fd"], follow_symlinks=False)
+        if (file_identity(final) != file_identity(after) or
+                file_identity(named) != file_identity(after)):
+            abort(EXIT_CHILD, "NORMALIZED_CHANGED")
+        return {
+            "artifact_id": artifact["artifact_id"],
+            "source_id": artifact["source_id"], "profile": artifact["profile"],
+            "source_sha256": artifact["sha256"],
+            "source_size_bytes": artifact["size_bytes"],
+            "normalized_sha256": digest,
+            "normalized_size_bytes": len(data), "record_count": count,
+            "identity": file_identity(after),
+        }
+    finally:
+        ops.close(descriptor)
+
+
+def remove_workspace_entry(workspace, name, expected_identity=None, ops=os):
+    try:
+        value = ops.stat(name, dir_fd=workspace["fd"], follow_symlinks=False)
+        if expected_identity is not None and file_identity(value) != expected_identity:
+            abort(EXIT_DURABILITY_UNCERTAIN, "STAGED_CLEANUP_IDENTITY")
+        ops.unlink(name, dir_fd=workspace["fd"])
+        ops.fsync(workspace["fd"])
+        try:
+            ops.stat(name, dir_fd=workspace["fd"], follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        abort(EXIT_DURABILITY_UNCERTAIN, "STAGED_CLEANUP_PRESENT")
+    except Failure:
+        raise
+    except FileNotFoundError:
+        return
+    except OSError:
+        abort(EXIT_DURABILITY_UNCERTAIN, "STAGED_CLEANUP")
+
+
+def cleanup_transient_workspace(workspace, ops=os):
+    if workspace is None:
+        return
+    output_context = workspace["output"]
+    failure = None
+    try:
+        current = ops.fstat(workspace["fd"])
+        named = ops.stat(workspace["name"], dir_fd=output_context["fd"],
+                         follow_symlinks=False)
+        if (ancestor_identity(current) != workspace["identity"] or
+                ancestor_identity(named) != workspace["identity"]):
+            abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP_IDENTITY")
+        for name in ops.listdir(workspace["fd"]):
+            validate_simple_name(name, EXIT_DURABILITY_UNCERTAIN,
+                                 "WORKSPACE_CLEANUP")
+            value = ops.stat(name, dir_fd=workspace["fd"],
+                             follow_symlinks=False)
+            if stat.S_ISDIR(value.st_mode):
+                abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP_DIRECTORY")
+            ops.unlink(name, dir_fd=workspace["fd"])
+        ops.fsync(workspace["fd"])
+        if ops.listdir(workspace["fd"]):
+            abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP_INVENTORY")
+        current = ops.fstat(workspace["fd"])
+        named = ops.stat(workspace["name"], dir_fd=output_context["fd"],
+                         follow_symlinks=False)
+        if (ancestor_identity(current) != workspace["identity"] or
+                ancestor_identity(named) != workspace["identity"]):
+            abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP_CHANGED")
+        ops.rmdir(workspace["name"], dir_fd=output_context["fd"])
+        ops.fsync(output_context["fd"])
+        try:
+            ops.stat(workspace["name"], dir_fd=output_context["fd"],
+                     follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP_PRESENT")
+    except Failure as caught:
+        failure = caught
+    except BaseException:
+        failure = Failure(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP")
+    finally:
+        try:
+            ops.close(workspace["fd"])
+        except OSError:
+            if failure is None:
+                failure = Failure(EXIT_DURABILITY_UNCERTAIN,
+                                  "WORKSPACE_CLEANUP_CLOSE")
+        workspace["fd"] = -1
+    if failure is not None:
+        if failure.code == EXIT_DURABILITY_UNCERTAIN:
+            raise failure
+        abort(EXIT_DURABILITY_UNCERTAIN, "WORKSPACE_CLEANUP")
+
+
+def orchestrate_phase2(cfg, transaction, child_runner=None):
+    child_runner = run_fixed_stage2b if child_runner is None else child_runner
+    parsed = transaction["parsed"]
+    if parsed["transaction_class"] != "success-evidence":
+        abort(EXIT_INTERNAL, "ORCHESTRATION_TRANSACTION_CLASS")
+    if len(parsed["artifacts"]) > MAX_TRANSIENT_ARTIFACTS:
+        abort(EXIT_SCHEMA, "TRANSIENT_ARTIFACT_COUNT")
+    workspace = None
+    results = []
+    total_normalized = 0
+    pending_failure = None
+    try:
+        assert_output_reserved(transaction["output"])
+        workspace = create_transient_workspace(transaction["output"])
+        authorize_workspace_link_delta(transaction, 1)
+        for ordinal, (artifact, retained_context) in enumerate(zip(
+                parsed["artifacts"], transaction["retained"])):
+            output_name = "normalized-%04d.json" % ordinal
+            revalidate_workspace(workspace, ())
+            verify_integrity(cfg)
+            revalidate_open_file(retained_context, EXIT_INPUT, "RETAINED")
+            assert_output_reserved(transaction["output"])
+            child_path = os.path.join(cfg["repository"], STAGE2B_LAUNCHER_RELATIVE)
+            argv = [
+                child_path, "--source", artifact["source_id"],
+                "--profile", "hostname-lines-v1",
+                "--input", artifact["retained_path"],
+                "--output", os.path.join(workspace["path"], output_name),
+            ]
+            status, stdout, stderr = child_runner(argv)
+            validate_stage2b_transcript(status, stdout, stderr)
+            revalidate_open_file(retained_context, EXIT_INPUT, "RETAINED")
+            revalidate_workspace(workspace, (output_name,))
+            retained_data = reread_retained(retained_context, artifact)
+            result = validate_normalized_envelope(
+                workspace, output_name, artifact, retained_data)
+            result["ordinal"] = ordinal
+            total_normalized += result["normalized_size_bytes"]
+            if total_normalized > MAX_TOTAL_NORMALIZED_BYTES:
+                abort(EXIT_CHILD, "NORMALIZED_TOTAL")
+            results.append(result)
+            remove_workspace_entry(workspace, output_name, result["identity"])
+            revalidate_workspace(workspace, ())
+            assert_output_reserved(transaction["output"])
+        verify_integrity(cfg)
+        assert_output_reserved(transaction["output"])
+    except BaseException as caught:
+        pending_failure = caught
+    cleanup_succeeded = False
+    try:
+        cleanup_transient_workspace(workspace)
+        cleanup_succeeded = workspace is not None
+    except Failure as cleanup_failure:
+        pending_failure = cleanup_failure
+    if cleanup_succeeded:
+        try:
+            authorize_workspace_link_delta(transaction, -1)
+            for retained_context in transaction["retained"]:
+                revalidate_open_file(retained_context, EXIT_INPUT, "RETAINED")
+        except BaseException as revalidation_failure:
+            pending_failure = revalidation_failure
+    if pending_failure is not None:
+        raise pending_failure
+    assert_output_reserved(transaction["output"])
+    return results
 
 
 
@@ -935,8 +1435,10 @@ def help_text():
         "Usage: nullsec-wolt-stage2c.sh --help\n"
         "       nullsec-wolt-stage2c.sh --manifest ABSOLUTE_FILE "
         "--output ABSOLUTE_NONEXISTENT_PATH\n"
-        "Phase 1 performs offline validation only; it does not orchestrate, "
-        "classify, or publish.\n"
+        "Phase 2 performs strictly offline retained-evidence normalization "
+        "orchestration.\n"
+        "It invokes only the fixed offline Stage 2B boundary; it does not "
+        "classify, execute Stage 2A or NullSec, or perform final publication.\n"
     )
 
 
@@ -949,7 +1451,7 @@ def validate_launcher_result(status, stdout, stderr):
             len(stderr) > MAX_LAUNCH_RESULT_BYTES):
         return rejected
     if status == EXIT_OK and stderr == b"":
-        if stdout == b"STAGE2C_PHASE1_VALIDATION_OK\n":
+        if stdout == b"STAGE2C_PHASE2_ORCHESTRATION_OK\n":
             return status, stdout, stderr
         expected_help = help_text().encode("ascii")
         if stdout == expected_help:
@@ -971,12 +1473,17 @@ def main(argv=None):
         if cfg["mode"] == "help":
             sys.stdout.write(help_text())
         else:
-            transaction = validate_phase1(cfg)
-            if transaction["transaction_class"] == "provider-failure":
-                abort(EXIT_PROVIDER_FAILURE, "VALIDATED_PROVIDER_FAILURE")
-            if transaction["transaction_class"] != "success-evidence":
-                abort(EXIT_INTERNAL, "TRANSACTION_CLASS")
-            sys.stdout.write("STAGE2C_PHASE1_VALIDATION_OK\n")
+            transaction = open_validated_transaction(cfg)
+            try:
+                parsed = transaction["parsed"]
+                if parsed["transaction_class"] == "provider-failure":
+                    abort(EXIT_PROVIDER_FAILURE, "VALIDATED_PROVIDER_FAILURE")
+                if parsed["transaction_class"] != "success-evidence":
+                    abort(EXIT_INTERNAL, "TRANSACTION_CLASS")
+                orchestrate_phase2(cfg, transaction)
+            finally:
+                close_validated_transaction(transaction)
+            sys.stdout.write("STAGE2C_PHASE2_ORCHESTRATION_OK\n")
         return EXIT_OK
     except Failure as failure:
         token = ERROR_TOKEN.get(failure.code, ERROR_TOKEN[EXIT_INTERNAL])
