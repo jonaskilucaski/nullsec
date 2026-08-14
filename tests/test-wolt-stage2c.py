@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Direct, bytecode-free unit tests for Wolt Stage 2C Phase 1."""
+"""Direct, bytecode-free unit and fault tests for Wolt Stage 2C Phase 2."""
 
 import contextlib
 import copy
@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import stat
 import sys
@@ -187,6 +188,7 @@ class TemporaryCase(unittest.TestCase):
         with (mock.patch.object(s2, "verify_process_identity"),
               mock.patch.object(s2, "qualify_platform"),
               mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "orchestrate_phase2", return_value=[]),
               contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
             code = s2.main(internal_args(
                 "--manifest", str(manifest), "--output", str(output)))
@@ -711,6 +713,8 @@ class AncestorChainBindingTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(s2, "qualify_platform"))
             stack.enter_context(mock.patch.object(s2, "verify_integrity"))
             stack.enter_context(mock.patch.object(
+                s2, "orchestrate_phase2", return_value=[]))
+            stack.enter_context(mock.patch.object(
                 s2, "_validate_trusted_ancestor",
                 side_effect=self.sandbox_ancestor_validator))
             stack.enter_context(mock.patch.object(
@@ -945,7 +949,7 @@ class PhaseResultTests(TemporaryCase):
         code, stdout, stderr, output = self.run_main(
             success_manifest, self.directory / "repeat-success-output")
         self.assertEqual((code, stdout, stderr),
-                         (0, "STAGE2C_PHASE1_VALIDATION_OK\n", ""))
+                         (0, "STAGE2C_PHASE2_ORCHESTRATION_OK\n", ""))
         self.assertFalse(output.exists())
 
         provider_manifest = self.write("repeat-provider.json", document([
@@ -973,7 +977,7 @@ class PhaseResultTests(TemporaryCase):
                 code, stdout, stderr, output = self.run_main(
                     manifest, self.directory / ("boundary-output-" + str(count)))
                 self.assertEqual((code, stdout, stderr),
-                                 (0, "STAGE2C_PHASE1_VALIDATION_OK\n", ""))
+                                 (0, "STAGE2C_PHASE2_ORCHESTRATION_OK\n", ""))
                 self.assertFalse(output.exists())
         manifest = self.write("boundary-manifest-above", document(values))
         code, stdout, stderr, output = self.run_main(
@@ -1000,7 +1004,7 @@ class PhaseResultTests(TemporaryCase):
             code, stdout, stderr, _output = self.run_main(
                 success_manifest, output_success)
         self.assertEqual((code, stdout, stderr),
-                         (0, "STAGE2C_PHASE1_VALIDATION_OK\n", ""))
+                         (0, "STAGE2C_PHASE2_ORCHESTRATION_OK\n", ""))
         self.assertFalse(output_success.exists())
         attacker.assert_not_called()
 
@@ -1045,6 +1049,380 @@ class PhaseResultTests(TemporaryCase):
         self.assertFalse(output.exists())
 
 
+class Phase2OrchestrationTests(TemporaryCase):
+    def cfg_and_transaction(self, artifacts, name="phase2"):
+        manifest = self.write(name + "-manifest.json", document(artifacts))
+        output = self.directory / (name + "-output")
+        cfg = s2.parse_cli(internal_args(
+            "--manifest", str(manifest), "--output", str(output)))
+        transaction = s2.open_validated_transaction(cfg)
+        return cfg, transaction, output
+
+    def normalized_bytes(self, source, retained):
+        records = s2.retained_records(Path(retained).read_bytes())
+        value = {
+            "schema_version": 1, "source_id": source,
+            "collection_status": "success", "record_count": len(records),
+            "records": records,
+        }
+        return (json.dumps(value, sort_keys=True, ensure_ascii=True,
+                           allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
+
+    def successful_runner(self, calls):
+        def runner(argv):
+            calls.append(tuple(argv))
+            output = Path(argv[8])
+            output.write_bytes(self.normalized_bytes(argv[2], argv[6]))
+            output.chmod(0o400)
+            return 0, b"STAGE2B_COMPLETE\n", b""
+        return runner
+
+    def invoke(self, artifacts, runner=None, name="phase2"):
+        cfg, transaction, output = self.cfg_and_transaction(artifacts, name)
+        calls = []
+        runner = self.successful_runner(calls) if runner is None else runner
+        try:
+            with mock.patch.object(s2, "verify_integrity"):
+                results = s2.orchestrate_phase2(cfg, transaction, runner)
+        finally:
+            s2.close_validated_transaction(transaction)
+        residue = [path for path in self.directory.iterdir()
+                   if path.name.startswith(".nullsec-wolt-stage2c-phase2-")]
+        return results, calls, output, residue
+
+    def test_one_multiple_repeated_and_deterministic_order(self):
+        one = self.write("one-lines", b"b.wolt.com\na.wolt.com\n")
+        two = self.write("two-lines", b"c.wolt.com\n")
+        values = [
+            artifact(two, source="subfinder", artifact_id="z-last"),
+            artifact(one, source="subfinder", artifact_id="a-first"),
+        ]
+        results, calls, output, residue = self.invoke(values)
+        self.assertEqual([value["artifact_id"] for value in results],
+                         ["a-first", "z-last"])
+        self.assertEqual([value["ordinal"] for value in results], [0, 1])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[2] for call in calls], ["subfinder", "subfinder"])
+        self.assertEqual([call[6] for call in calls], [str(one), str(two)])
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+    def test_fixed_executable_exact_argv_and_injection_is_data_only(self):
+        retained = self.write("--command-provider-lines", b"a.wolt.com\n")
+        values = [artifact(retained, artifact_id="command-provider-shell")]
+        _results, calls, _output, _residue = self.invoke(values, name="argv")
+        call = calls[0]
+        self.assertEqual(call[0], str(ROOT / "nullsec-wolt-stage2b.sh"))
+        self.assertEqual(call[1:5], (
+            "--source", "subfinder", "--profile", "hostname-lines-v1"))
+        self.assertEqual(call[5:7], ("--input", str(retained)))
+        self.assertEqual(call[7], "--output")
+        self.assertTrue(Path(call[8]).name == "normalized-0000.json")
+        self.assertNotIn("command-provider-shell", call)
+        self.assertEqual(len(call), 9)
+
+    def test_provider_failure_and_mixed_never_orchestrate(self):
+        retained = self.write("failure-receipt", b"failure\n")
+        provider = self.write("provider.json", document([artifact(
+            retained, source="shodan", profile="retained-provider-failure-v1")]))
+        child = mock.Mock()
+        workspace = mock.Mock()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (mock.patch.object(s2, "verify_process_identity"),
+              mock.patch.object(s2, "qualify_platform"),
+              mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "orchestrate_phase2", child),
+              mock.patch.object(s2, "create_transient_workspace", workspace),
+              contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+            code = s2.main(internal_args(
+                "--manifest", str(provider), "--output",
+                str(self.directory / "provider-output")))
+        self.assertEqual((code, stdout.getvalue(), stderr.getvalue()),
+                         (7, "", "STAGE2C_PROVIDER_FAILURE\n"))
+        child.assert_not_called()
+        workspace.assert_not_called()
+
+        other = self.write("mixed-lines", b"a.wolt.com\n")
+        mixed = self.write("mixed-phase2.json", document([
+            artifact(other), artifact(retained, source="shodan",
+                profile="retained-provider-failure-v1", artifact_id="z-failure")]))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (mock.patch.object(s2, "verify_process_identity"),
+              mock.patch.object(s2, "qualify_platform"),
+              mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "orchestrate_phase2", child),
+              contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+            code = s2.main(internal_args(
+                "--manifest", str(mixed), "--output",
+                str(self.directory / "mixed-phase2-output")))
+        self.assertEqual((code, stdout.getvalue(), stderr.getvalue()),
+                         (3, "", "STAGE2C_INPUT_ERROR\n"))
+        child.assert_not_called()
+
+    def test_missing_output_child_failure_and_output_target_appearance(self):
+        retained = self.write("missing-lines", b"a.wolt.com\n")
+        values = [artifact(retained)]
+        for result in ((9, b"", b""), (-9, b"", b""),
+                       (0, b"STAGE2B_COMPLETE\n", b""),
+                       (0, b"wrong\n", b""),
+                       (0, b"STAGE2B_COMPLETE\n", b"warning\n")):
+            with self.subTest(result=result):
+                cfg, transaction, output = self.cfg_and_transaction(
+                    values, "child-" + str(abs(result[0])))
+                try:
+                    with mock.patch.object(s2, "verify_integrity"):
+                        failure(self, 5, s2.orchestrate_phase2,
+                                cfg, transaction, lambda _argv, value=result: value)
+                finally:
+                    s2.close_validated_transaction(transaction)
+                self.assertFalse(output.exists())
+
+        cfg, transaction, output = self.cfg_and_transaction(values, "appeared")
+        def appearing(argv):
+            output.write_bytes(b"do-not-delete")
+            output.chmod(0o600)
+            Path(argv[8]).write_bytes(self.normalized_bytes(argv[2], argv[6]))
+            Path(argv[8]).chmod(0o400)
+            return 0, b"STAGE2B_COMPLETE\n", b""
+        try:
+            with mock.patch.object(s2, "verify_integrity"):
+                failure(self, 6, s2.orchestrate_phase2,
+                        cfg, transaction, appearing)
+        finally:
+            s2.close_validated_transaction(transaction)
+        self.assertEqual(output.read_bytes(), b"do-not-delete")
+        output.unlink()
+
+    def test_retained_replacement_before_and_after_child(self):
+        for when in ("before", "after"):
+            retained = self.write(when + "-retained", b"a.wolt.com\n")
+            cfg, transaction, output = self.cfg_and_transaction(
+                [artifact(retained)], "replace-" + when)
+            replacement = self.write(when + "-replacement", b"b.wolt.com\n")
+            def runner(argv):
+                if when == "after":
+                    Path(argv[8]).write_bytes(self.normalized_bytes(argv[2], argv[6]))
+                    Path(argv[8]).chmod(0o400)
+                os.replace(replacement, retained)
+                return 0, b"STAGE2B_COMPLETE\n", b""
+            if when == "before":
+                os.replace(replacement, retained)
+            try:
+                with mock.patch.object(s2, "verify_integrity"):
+                    failure(self, 3, s2.orchestrate_phase2,
+                            cfg, transaction, runner)
+            finally:
+                s2.close_validated_transaction(transaction)
+            self.assertFalse(output.exists())
+
+    def test_workspace_replacement_and_cleanup_failure(self):
+        output_context = self.output_context("workspace-output")
+        workspace = s2.create_transient_workspace(output_context)
+        original = self.directory / (workspace["name"] + "-detached")
+        named = self.directory / workspace["name"]
+        named.rename(original)
+        named.mkdir(mode=0o700)
+        try:
+            failure(self, 5, s2.revalidate_workspace, workspace, ())
+        finally:
+            named.rmdir()
+            original.rename(named)
+            s2.cleanup_transient_workspace(workspace)
+            s2.close_context(output_context)
+
+        output_context = self.output_context("cleanup-output")
+        workspace = s2.create_transient_workspace(output_context)
+        original_rmdir = s2.os.rmdir
+        def failed_rmdir(path, *args, **kwargs):
+            if path == workspace["name"]:
+                raise OSError(errno.EIO, "fault")
+            return original_rmdir(path, *args, **kwargs)
+        try:
+            with mock.patch.object(s2.os, "rmdir", side_effect=failed_rmdir):
+                failure(self, 8, s2.cleanup_transient_workspace, workspace)
+        finally:
+            if (self.directory / workspace["name"]).exists():
+                (self.directory / workspace["name"]).rmdir()
+            s2.close_context(output_context)
+
+    def test_normalized_file_and_schema_fault_matrix(self):
+        retained = self.write("schema-retained", b"a.wolt.com\n")
+        artifact_value = artifact(retained)
+        expected = json.loads(self.normalized_bytes("subfinder", retained))
+        cases = []
+        cases.append(("malformed", b"not-json\n"))
+        cases.append(("duplicate", b'{"schema_version":1,"schema_version":1}\n'))
+        for label, changes in (
+                ("source", {"source_id": "amass"}),
+                ("status", {"collection_status": "failed"}),
+                ("count", {"record_count": 2}),
+                ("records-type", {"records": [7]}),
+                ("records-control", {"records": ["a\\nb"]})):
+            value = dict(expected)
+            value.update(changes)
+            cases.append((label, (json.dumps(
+                value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")))
+        for label, payload in cases:
+            with self.subTest(label=label):
+                output_context = self.output_context("schema-output-" + label)
+                workspace = s2.create_transient_workspace(output_context)
+                name = "normalized.json"
+                path = self.directory / workspace["name"] / name
+                path.write_bytes(payload)
+                path.chmod(0o400)
+                try:
+                    failure(self, 5, s2.validate_normalized_envelope,
+                            workspace, name, artifact_value,
+                            retained.read_bytes())
+                finally:
+                    s2.cleanup_transient_workspace(workspace)
+                    s2.close_context(output_context)
+
+    def test_normalized_object_mode_symlink_hardlink_and_oversize(self):
+        retained = self.write("object-retained", b"a.wolt.com\n")
+        artifact_value = artifact(retained)
+        payload = self.normalized_bytes("subfinder", retained)
+        for label in ("mode", "symlink", "hardlink", "oversize"):
+            with self.subTest(label=label):
+                output_context = self.output_context("object-output-" + label)
+                workspace = s2.create_transient_workspace(output_context)
+                path = self.directory / workspace["name"] / "normalized.json"
+                external = None
+                if label == "symlink":
+                    external = self.write("symlink-target", payload, 0o400)
+                    path.symlink_to(external)
+                elif label == "hardlink":
+                    external = self.write("hardlink-target", payload, 0o400)
+                    os.link(external, path)
+                elif label == "oversize":
+                    path.write_bytes(b"x" * (s2.MAX_NORMALIZED_ENVELOPE_BYTES + 1))
+                    path.chmod(0o400)
+                else:
+                    path.write_bytes(payload)
+                    path.chmod(0o600)
+                try:
+                    failure(self, 5, s2.validate_normalized_envelope,
+                            workspace, "normalized.json", artifact_value,
+                            retained.read_bytes())
+                finally:
+                    s2.cleanup_transient_workspace(workspace)
+                    s2.close_context(output_context)
+
+    def test_normalized_owner_and_named_replacement_are_rejected(self):
+        retained = self.write("identity-retained", b"a.wolt.com\n")
+        artifact_value = artifact(retained)
+        payload = self.normalized_bytes("subfinder", retained)
+
+        output_context = self.output_context("owner-output")
+        workspace = s2.create_transient_workspace(output_context)
+        path = self.directory / workspace["name"] / "normalized.json"
+        path.write_bytes(payload)
+        path.chmod(0o400)
+        opened = []
+        original_open = s2.open_regular_at
+        original_fstat = s2.os.fstat
+        def capture_open(*args, **kwargs):
+            descriptor = original_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+        def wrong_owner(descriptor):
+            value = original_fstat(descriptor)
+            if opened and descriptor == opened[-1]:
+                fields = list(value)
+                fields[stat.ST_UID] = os.geteuid() + 1000
+                return os.stat_result(fields)
+            return value
+        try:
+            with (mock.patch.object(s2, "open_regular_at", side_effect=capture_open),
+                  mock.patch.object(s2.os, "fstat", side_effect=wrong_owner)):
+                failure(self, 5, s2.validate_normalized_envelope,
+                        workspace, "normalized.json", artifact_value,
+                        retained.read_bytes())
+        finally:
+            s2.cleanup_transient_workspace(workspace)
+            s2.close_context(output_context)
+
+        output_context = self.output_context("replacement-output")
+        workspace = s2.create_transient_workspace(output_context)
+        path = self.directory / workspace["name"] / "normalized.json"
+        path.write_bytes(payload)
+        path.chmod(0o400)
+        replacement = self.write("normalized-replacement", payload, 0o400)
+        original_read = s2.read_fd_stable
+        changed = False
+        def replace_after_read(*args, **kwargs):
+            nonlocal changed
+            result = original_read(*args, **kwargs)
+            if not changed:
+                os.replace(replacement, path)
+                changed = True
+            return result
+        try:
+            with mock.patch.object(s2, "read_fd_stable", side_effect=replace_after_read):
+                failure(self, 5, s2.validate_normalized_envelope,
+                        workspace, "normalized.json", artifact_value,
+                        retained.read_bytes())
+        finally:
+            s2.cleanup_transient_workspace(workspace)
+            s2.close_context(output_context)
+        self.assertTrue(changed)
+
+    def test_child_runner_sanitizes_environment_and_bounds_transcript(self):
+        captured = {}
+        def popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured.update(kwargs)
+            out_read, out_write = os.pipe()
+            err_read, err_write = os.pipe()
+            os.write(out_write, b"STAGE2B_COMPLETE\n")
+            os.close(out_write)
+            os.close(err_write)
+            return types.SimpleNamespace(
+                stdout=os.fdopen(out_read, "rb", buffering=0),
+                stderr=os.fdopen(err_read, "rb", buffering=0), pid=999999,
+                wait=lambda timeout=None: 0, kill=lambda: None)
+        argv = [str(ROOT / "nullsec-wolt-stage2b.sh")]
+        self.assertEqual(s2.run_fixed_stage2b(argv, popen),
+                         (0, b"STAGE2B_COMPLETE\n", b""))
+        self.assertEqual(captured["env"], {"LC_ALL": "C"})
+        self.assertIs(captured["shell"], False)
+        self.assertIs(captured["close_fds"], True)
+        self.assertIs(captured["start_new_session"], True)
+        self.assertEqual(captured["argv"], argv)
+        for result in (
+                (0, b"x" * (s2.MAX_CHILD_STDOUT_BYTES + 1), b""),
+                (0, b"STAGE2B_COMPLETE\n", b"x" * (s2.MAX_CHILD_STDERR_BYTES + 1)),
+                (-signal.SIGKILL, b"", b""), (0, b"one\ntwo\n", b"")):
+            failure(self, 5, s2.validate_stage2b_transcript, *result)
+
+    def test_child_timeout_is_killed_and_reaped(self):
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        killed = []
+        waited = []
+        process = types.SimpleNamespace(
+            stdout=os.fdopen(out_read, "rb", buffering=0),
+            stderr=os.fdopen(err_read, "rb", buffering=0), pid=999999,
+            kill=lambda: killed.append(True),
+            wait=lambda timeout=None: waited.append(timeout) or 0)
+        try:
+            with (mock.patch.object(s2.time, "monotonic", side_effect=(0, 31)),
+                  mock.patch.object(s2.os, "killpg", side_effect=OSError())):
+                failure(self, 5, s2.run_fixed_stage2b,
+                        [str(ROOT / "nullsec-wolt-stage2b.sh")],
+                        lambda _argv, **_kwargs: process)
+        finally:
+            os.close(out_write)
+            os.close(err_write)
+        self.assertTrue(killed)
+        self.assertTrue(waited)
+
+    def test_same_uid_limitation_is_explicit(self):
+        core = CORE.read_text(encoding="utf-8")
+        self.assertIn("malicious same-UID process is outside", core)
+        self.assertIn("same-UID replacement", LAUNCHER.read_text(encoding="utf-8"))
+
+
 class IntegrityAndResultTests(unittest.TestCase):
     def run_controlled_main(self, *, parse=None, validate=None, process=None):
         stdout = io.StringIO()
@@ -1059,11 +1437,14 @@ class IntegrityAndResultTests(unittest.TestCase):
         parse_patch = (mock.patch.object(s2, "parse_cli", return_value=parse) if
                        not isinstance(parse, BaseException) else
                        mock.patch.object(s2, "parse_cli", side_effect=parse))
-        validate_patch = (mock.patch.object(s2, "validate_phase1", return_value=validate) if
-                          not isinstance(validate, BaseException) else
-                          mock.patch.object(s2, "validate_phase1", side_effect=validate))
+        transaction = {"parsed": validate, "retained": [], "output": None}
+        validate_patch = (mock.patch.object(
+            s2, "open_validated_transaction", return_value=transaction) if
+            not isinstance(validate, BaseException) else mock.patch.object(
+                s2, "open_validated_transaction", side_effect=validate))
         with (process_patch, mock.patch.object(s2, "qualify_platform"), parse_patch,
               mock.patch.object(s2, "verify_integrity"), validate_patch,
+              mock.patch.object(s2, "orchestrate_phase2", return_value=[]),
               contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
             code = s2.main([])
         return code, stdout.getvalue(), stderr.getvalue()
@@ -1122,25 +1503,25 @@ class IntegrityAndResultTests(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256((ROOT / relative).read_bytes()).hexdigest(), digest)
 
-    def test_static_offline_phase1_capability_boundary(self):
+    def test_static_offline_phase2_capability_boundary(self):
         core = CORE.read_text(encoding="utf-8")
         launcher = LAUNCHER.read_text(encoding="utf-8")
         forbidden_core = (
             "import socket", "import urllib", "import http", "requests",
-            "os.system", "os.popen", "Popen", "run(", "check_call",
+            "os.system", "os.popen", "shell=True", "check_call",
             "check_output", "execv", "spawn", "eval(", "classification_package",
         )
         for token in forbidden_core:
             self.assertNotIn(token, core)
+        self.assertIn("subprocess.Popen", core)
+        self.assertIn('STAGE2B_LAUNCHER_RELATIVE = "nullsec-wolt-stage2b.sh"', core)
+        self.assertNotIn('STAGE2B_LAUNCHER_RELATIVE = os.environ', core)
         self.assertNotIn("source ", launcher)
         self.assertNotIn("eval ", launcher)
         self.assertNotIn("/usr/bin/env python", launcher)
         self.assertIn("/usr/bin/python3 -I -S -B", launcher)
-        forbidden_test_module = "sub" + "process"
-        self.assertNotIn(forbidden_test_module,
-                         Path(__file__).read_text(encoding="utf-8"))
 
-    def test_phase1_removes_all_publication_authority_and_cleanup_surface(self):
+    def test_phase2_has_transient_staging_but_no_final_publication_authority(self):
         tree = ast.parse(CORE.read_text(encoding="utf-8"))
         forbidden = (
             "_build_workspace_boundary", "TransactionWorkspace", "WorkspaceEntry",
@@ -1163,6 +1544,9 @@ class IntegrityAndResultTests(unittest.TestCase):
                     self.assertNotIn(name, core)
         self.assertNotIn("authority = object()", core)
         self.assertNotIn("__new__", core)
+        self.assertNotIn("os.rename", core)
+        self.assertNotIn("os.replace", core)
+        self.assertIn("cleanup_transient_workspace", declared)
 
     def test_introspection_copy_reconstruction_and_registry_insertion_have_no_authority(self):
         capability_types = ("TransactionWorkspace", "WorkspaceEntry", "SealedEntry")
@@ -1200,7 +1584,7 @@ class IntegrityAndResultTests(unittest.TestCase):
                                          for constant in code_values))
 
     def test_launcher_result_contract_accepts_every_exact_fixed_result(self):
-        success = (0, b"STAGE2C_PHASE1_VALIDATION_OK\n", b"")
+        success = (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK\n", b"")
         help_result = (0, s2.help_text().encode("ascii"), b"")
         self.assertEqual(s2.validate_launcher_result(*success), success)
         self.assertEqual(s2.validate_launcher_result(*help_result), help_result)
@@ -1215,8 +1599,8 @@ class IntegrityAndResultTests(unittest.TestCase):
         cases = (
             (126, b"", b"/usr/bin/python3: Permission denied\n"),
             (127, b"", b"/usr/bin/python3: No such file\n"),
-            (0, b"STAGE2C_PHASE1_VALIDATION_OK", b""),
-            (0, b"STAGE2C_PHASE1_VALIDATION_OK\n", b"warning\n"),
+            (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK", b""),
+            (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK\n", b"warning\n"),
             (1, b"", b"STAGE2C_INTERNAL_ERROR\npartial"),
             (1, secret, b""), (2, b"", secret), (255, b"", b""),
             (0, b"x" * (s2.MAX_LAUNCH_RESULT_BYTES + 1), b""),
@@ -1235,7 +1619,8 @@ class IntegrityAndResultTests(unittest.TestCase):
         self.assertIn('/usr/bin/python3 -I -S -B "$PYTHON_CORE"', launcher)
         self.assertIn('>"$stdout_path" 2>"$stderr_path"', launcher)
         self.assertIn(") 2>/dev/null; then", launcher)
-        self.assertIn("ulimit -f 4", launcher)
+        self.assertIn("ulimit -S -f 4", launcher)
+        self.assertNotIn("ulimit -f 4", launcher)
         self.assertIn("/usr/bin/mktemp -d -p /tmp", launcher)
         self.assertIn("/proc/$$/fd/$result_fd/stdout", launcher)
         self.assertIn("$stdout_size -le 4096", launcher)
@@ -1246,10 +1631,10 @@ class IntegrityAndResultTests(unittest.TestCase):
         self.assertNotIn("cat \"$stdout_path\"", launcher)
         self.assertNotIn("cat \"$stderr_path\"", launcher)
         for token in tuple(s2.ERROR_TOKEN.values()) + (
-                "STAGE2C_PHASE1_VALIDATION_OK",):
+                "STAGE2C_PHASE2_ORCHESTRATION_OK",):
             self.assertIn(token, launcher)
         exact_results = [
-            (0, b"STAGE2C_PHASE1_VALIDATION_OK\n", b""),
+            (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK\n", b""),
             (0, s2.help_text().encode("ascii"), b""),
         ]
         exact_results.extend(
@@ -1399,7 +1784,12 @@ class IntegrityAndResultTests(unittest.TestCase):
             "MAX_MANIFEST_BYTES", "MAX_JSON_DEPTH", "MAX_ARTIFACTS",
             "MAX_ARTIFACT_ID_BYTES", "MAX_PATH_BYTES", "MAX_RETAINED_BYTES",
             "MAX_TOTAL_RETAINED_BYTES", "MAX_PROTECTED_BYTES",
-            "MAX_LAUNCH_RESULT_BYTES",
+            "MAX_LAUNCH_RESULT_BYTES", "MAX_STAGE2B_INPUT_BYTES",
+            "MAX_NORMALIZED_ENVELOPE_BYTES", "MAX_TOTAL_NORMALIZED_BYTES",
+            "MAX_TRANSIENT_ARTIFACTS", "MAX_CHILD_STDOUT_BYTES",
+            "MAX_CHILD_STDERR_BYTES", "CHILD_TIMEOUT_SECONDS",
+            "CHILD_CPU_SECONDS", "CHILD_ADDRESS_SPACE_BYTES",
+            "CHILD_OPEN_FILES", "WORKSPACE_ATTEMPTS",
         )
         usage = s2.help_text()
         for name in names:
