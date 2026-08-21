@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Direct, bytecode-free unit and fault tests for Wolt Stage 2C Phase 2."""
+"""Direct, bytecode-free unit and fault tests for Wolt Stage 2C Phase 3."""
 
 import contextlib
 import copy
@@ -188,7 +188,7 @@ class TemporaryCase(unittest.TestCase):
         with (mock.patch.object(s2, "verify_process_identity"),
               mock.patch.object(s2, "qualify_platform"),
               mock.patch.object(s2, "verify_integrity"),
-              mock.patch.object(s2, "orchestrate_phase2", return_value=[]),
+              mock.patch.object(s2, "orchestrate_phase3", return_value={}),
               contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
             code = s2.main(internal_args(
                 "--manifest", str(manifest), "--output", str(output)))
@@ -713,7 +713,7 @@ class AncestorChainBindingTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(s2, "qualify_platform"))
             stack.enter_context(mock.patch.object(s2, "verify_integrity"))
             stack.enter_context(mock.patch.object(
-                s2, "orchestrate_phase2", return_value=[]))
+                s2, "orchestrate_phase3", return_value={}))
             stack.enter_context(mock.patch.object(
                 s2, "_validate_trusted_ancestor",
                 side_effect=self.sandbox_ancestor_validator))
@@ -949,7 +949,7 @@ class PhaseResultTests(TemporaryCase):
         code, stdout, stderr, output = self.run_main(
             success_manifest, self.directory / "repeat-success-output")
         self.assertEqual((code, stdout, stderr),
-                         (0, "STAGE2C_PHASE2_ORCHESTRATION_OK\n", ""))
+                         (0, "STAGE2C_PHASE3_AGGREGATION_OK\n", ""))
         self.assertFalse(output.exists())
 
         provider_manifest = self.write("repeat-provider.json", document([
@@ -977,7 +977,7 @@ class PhaseResultTests(TemporaryCase):
                 code, stdout, stderr, output = self.run_main(
                     manifest, self.directory / ("boundary-output-" + str(count)))
                 self.assertEqual((code, stdout, stderr),
-                                 (0, "STAGE2C_PHASE2_ORCHESTRATION_OK\n", ""))
+                                 (0, "STAGE2C_PHASE3_AGGREGATION_OK\n", ""))
                 self.assertFalse(output.exists())
         manifest = self.write("boundary-manifest-above", document(values))
         code, stdout, stderr, output = self.run_main(
@@ -1004,7 +1004,7 @@ class PhaseResultTests(TemporaryCase):
             code, stdout, stderr, _output = self.run_main(
                 success_manifest, output_success)
         self.assertEqual((code, stdout, stderr),
-                         (0, "STAGE2C_PHASE2_ORCHESTRATION_OK\n", ""))
+                         (0, "STAGE2C_PHASE3_AGGREGATION_OK\n", ""))
         self.assertFalse(output_success.exists())
         attacker.assert_not_called()
 
@@ -1090,6 +1090,19 @@ class Phase2OrchestrationTests(TemporaryCase):
                    if path.name.startswith(".nullsec-wolt-stage2c-phase2-")]
         return results, calls, output, residue
 
+    def invoke_phase3(self, artifacts, runner=None, name="phase3"):
+        cfg, transaction, output = self.cfg_and_transaction(artifacts, name)
+        calls = []
+        runner = self.successful_runner(calls) if runner is None else runner
+        try:
+            with mock.patch.object(s2, "verify_integrity"):
+                aggregate = s2.orchestrate_phase3(cfg, transaction, runner)
+        finally:
+            s2.close_validated_transaction(transaction)
+        residue = [path for path in self.directory.iterdir()
+                   if path.name.startswith(".nullsec-wolt-stage2c-phase2-")]
+        return aggregate, calls, output, residue
+
     def test_one_multiple_repeated_and_deterministic_order(self):
         one = self.write("one-lines", b"b.wolt.com\na.wolt.com\n")
         two = self.write("two-lines", b"c.wolt.com\n")
@@ -1104,6 +1117,115 @@ class Phase2OrchestrationTests(TemporaryCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual([call[2] for call in calls], ["subfinder", "subfinder"])
         self.assertEqual([call[6] for call in calls], [str(one), str(two)])
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+    def test_phase3_manifest_order_independence_and_stable_order(self):
+        first = self.write("phase3-order-first", b"z.example\na.example\n")
+        second = self.write("phase3-order-second", b"m.example\n")
+        first_artifact = artifact(
+            first, source="assetfinder", artifact_id="artifact-a")
+        second_artifact = artifact(
+            second, source="subfinder", artifact_id="artifact-z")
+        aggregate_one, _calls, output_one, residue_one = self.invoke_phase3(
+            [second_artifact, first_artifact], name="phase3-order-one")
+        aggregate_two, _calls, output_two, residue_two = self.invoke_phase3(
+            [first_artifact, second_artifact], name="phase3-order-two")
+        self.assertEqual(aggregate_one, aggregate_two)
+        canonical_one = json.dumps(
+            aggregate_one, ensure_ascii=True, sort_keys=True,
+            allow_nan=False, separators=(",", ":")).encode("ascii")
+        canonical_two = json.dumps(
+            aggregate_two, ensure_ascii=True, sort_keys=True,
+            allow_nan=False, separators=(",", ":")).encode("ascii")
+        self.assertEqual(canonical_one, canonical_two)
+        self.assertEqual(set(aggregate_one), {
+            "schema_version", "aggregation_profile", "transaction_class",
+            "source_artifact_count", "record_occurrence_count",
+            "unique_record_count", "sources", "records",
+        })
+        self.assertEqual(aggregate_one["schema_version"], 1)
+        self.assertEqual(
+            aggregate_one["aggregation_profile"],
+            "exact-ascii-record-provenance-v1")
+        self.assertEqual(aggregate_one["transaction_class"], "success-evidence")
+        self.assertTrue(all(set(source) == {
+            "ordinal", "artifact_id", "source_id", "profile",
+            "source_sha256", "source_size_bytes", "normalized_sha256",
+            "normalized_size_bytes", "record_count",
+        } for source in aggregate_one["sources"]))
+        self.assertTrue(all(set(record) == {"value", "occurrences"}
+                            for record in aggregate_one["records"]))
+        self.assertEqual(
+            [source["artifact_id"] for source in aggregate_one["sources"]],
+            ["artifact-a", "artifact-z"])
+        self.assertEqual(
+            [record["value"] for record in aggregate_one["records"]],
+            ["a.example", "m.example", "z.example"])
+        self.assertEqual(
+            [source["ordinal"] for source in aggregate_one["sources"]], [0, 1])
+        self.assertFalse(output_one.exists())
+        self.assertFalse(output_two.exists())
+        self.assertEqual((residue_one, residue_two), ([], []))
+
+    def test_phase3_duplicate_occurrences_within_one_artifact(self):
+        retained = self.write(
+            "phase3-within-duplicates", b"same.example\nsame.example\nunique.example\n")
+        aggregate, _calls, output, residue = self.invoke_phase3(
+            [artifact(retained, artifact_id="duplicates-within")],
+            name="phase3-within")
+        self.assertEqual(aggregate["record_occurrence_count"], 3)
+        self.assertEqual(aggregate["unique_record_count"], 2)
+        self.assertEqual(aggregate["records"][0], {
+            "value": "same.example", "occurrences": ((0, 0), (0, 1)),
+        })
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+    def test_phase3_duplicates_across_sources_and_repeated_source_instances(self):
+        first = self.write("phase3-cross-first", b"same.example\n")
+        second = self.write("phase3-cross-second", b"same.example\n")
+        third = self.write("phase3-cross-third", b"same.example\n")
+        aggregate, _calls, output, residue = self.invoke_phase3([
+            artifact(first, source="subfinder", artifact_id="instance-a"),
+            artifact(second, source="subfinder", artifact_id="instance-b"),
+            artifact(third, source="assetfinder", artifact_id="instance-c"),
+        ], name="phase3-cross")
+        self.assertEqual(
+            [source["source_id"] for source in aggregate["sources"]],
+            ["subfinder", "subfinder", "assetfinder"])
+        self.assertEqual(
+            [source["artifact_id"] for source in aggregate["sources"]],
+            ["instance-a", "instance-b", "instance-c"])
+        self.assertEqual(aggregate["records"], ({
+            "value": "same.example",
+            "occurrences": ((0, 0), (1, 0), (2, 0)),
+        },))
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+    def test_phase3_empty_source_and_all_empty_aggregate(self):
+        empty_one = self.write("phase3-empty-one", b"")
+        nonempty = self.write("phase3-nonempty", b"record.example\n")
+        aggregate, _calls, output, residue = self.invoke_phase3([
+            artifact(empty_one, source="subfinder", artifact_id="empty-a"),
+            artifact(nonempty, source="assetfinder", artifact_id="nonempty-b"),
+        ], name="phase3-empty-mixed")
+        self.assertEqual(
+            [source["record_count"] for source in aggregate["sources"]], [0, 1])
+        self.assertEqual(aggregate["record_occurrence_count"], 1)
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+        empty_two = self.write("phase3-empty-two", b"")
+        all_empty, _calls, output, residue = self.invoke_phase3([
+            artifact(empty_one, source="subfinder", artifact_id="empty-a"),
+            artifact(empty_two, source="assetfinder", artifact_id="empty-b"),
+        ], name="phase3-empty-all")
+        self.assertEqual(all_empty["source_artifact_count"], 2)
+        self.assertEqual(all_empty["record_occurrence_count"], 0)
+        self.assertEqual(all_empty["unique_record_count"], 0)
+        self.assertEqual(all_empty["records"], ())
         self.assertFalse(output.exists())
         self.assertEqual(residue, [])
 
@@ -1131,7 +1253,7 @@ class Phase2OrchestrationTests(TemporaryCase):
         with (mock.patch.object(s2, "verify_process_identity"),
               mock.patch.object(s2, "qualify_platform"),
               mock.patch.object(s2, "verify_integrity"),
-              mock.patch.object(s2, "orchestrate_phase2", child),
+              mock.patch.object(s2, "orchestrate_phase3", child),
               mock.patch.object(s2, "create_transient_workspace", workspace),
               contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
             code = s2.main(internal_args(
@@ -1150,7 +1272,7 @@ class Phase2OrchestrationTests(TemporaryCase):
         with (mock.patch.object(s2, "verify_process_identity"),
               mock.patch.object(s2, "qualify_platform"),
               mock.patch.object(s2, "verify_integrity"),
-              mock.patch.object(s2, "orchestrate_phase2", child),
+              mock.patch.object(s2, "orchestrate_phase3", child),
               contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
             code = s2.main(internal_args(
                 "--manifest", str(mixed), "--output",
@@ -1256,8 +1378,10 @@ class Phase2OrchestrationTests(TemporaryCase):
                 ("source", {"source_id": "amass"}),
                 ("status", {"collection_status": "failed"}),
                 ("count", {"record_count": 2}),
+                ("bool-count", {"record_count": True}),
                 ("records-type", {"records": [7]}),
-                ("records-control", {"records": ["a\\nb"]})):
+                ("records-control", {"records": ["a\\nb"]}),
+                ("records-unicode", {"records": ["caf\u00e9.example"]})):
             value = dict(expected)
             value.update(changes)
             cases.append((label, (json.dumps(
@@ -1367,6 +1491,293 @@ class Phase2OrchestrationTests(TemporaryCase):
             s2.close_context(output_context)
         self.assertTrue(changed)
 
+    def test_phase3_aggregate_rejects_source_profile_count_and_bool_mismatch(self):
+        retained = self.write("phase3-binding", b"x")
+        cfg, transaction, _output = self.cfg_and_transaction(
+            [artifact(retained, artifact_id="binding-a")], "phase3-binding")
+        try:
+            with mock.patch.object(s2, "verify_integrity"):
+                results = s2.orchestrate_phase2(
+                    cfg, transaction, self.successful_runner([]))
+            parsed = transaction["parsed"]
+        finally:
+            s2.close_validated_transaction(transaction)
+
+        cases = (
+            ("source", {"source_id": "amass"}),
+            ("profile", {"profile": "retained-provider-failure-v1"}),
+            ("count", {"record_count": 2}),
+            ("bool-count", {"record_count": True}),
+            ("ordinal", {"ordinal": True}),
+            ("bool-source-size", {"source_size_bytes": True}),
+            ("bool-normalized-size", {"normalized_size_bytes": True}),
+        )
+        for label, changes in cases:
+            with self.subTest(label=label):
+                changed = [dict(results[0])]
+                changed[0].update(changes)
+                failure(self, 1, s2.aggregate_validated_success_envelopes,
+                        parsed, changed)
+        provider = dict(parsed)
+        provider["transaction_class"] = "provider-failure"
+        failure(self, 1, s2.aggregate_validated_success_envelopes,
+                provider, results)
+
+    def test_phase3_exact_count_and_byte_limits_and_one_over(self):
+        exact_count = self.write("phase3-count-exact", b"a\nb\nc\n")
+        with (mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 3),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 64)):
+            aggregate, _calls, output, residue = self.invoke_phase3(
+                [artifact(exact_count, artifact_id="count-exact")],
+                name="phase3-count-exact")
+        self.assertEqual(aggregate["record_occurrence_count"], 3)
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+        over_count = self.write("phase3-count-over", b"a\nb\nc\nd\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(over_count, artifact_id="count-over")],
+            "phase3-count-over")
+        with (mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 3),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 64)):
+            failure(self, 5, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertTrue(all(context["fd"] == -1
+                            for context in transaction["retained"]))
+        self.assertEqual(transaction["output"]["fd"], -1)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(
+            ".nullsec-wolt-stage2c-phase2-") for path in self.directory.iterdir()))
+
+        exact_bytes = self.write("phase3-bytes-exact", b"aa\nbbb\n")
+        with (mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 10),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 5)):
+            aggregate, _calls, output, residue = self.invoke_phase3(
+                [artifact(exact_bytes, artifact_id="bytes-exact")],
+                name="phase3-bytes-exact")
+        self.assertEqual(aggregate["record_occurrence_count"], 2)
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+        over_bytes = self.write("phase3-bytes-over", b"aa\nbbbb\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(over_bytes, artifact_id="bytes-over")],
+            "phase3-bytes-over")
+        with (mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 10),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 5)):
+            failure(self, 5, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertTrue(all(context["fd"] == -1
+                            for context in transaction["retained"]))
+        self.assertEqual(transaction["output"]["fd"], -1)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(
+            ".nullsec-wolt-stage2c-phase2-") for path in self.directory.iterdir()))
+
+    def test_phase3_duplicate_occurrences_consume_count_and_byte_limits(self):
+        exact_count = self.write("phase3-duplicate-count-exact", b"x\nx\nx\n")
+        with (mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 3),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 64)):
+            aggregate, _calls, output, residue = self.invoke_phase3(
+                [artifact(exact_count, artifact_id="duplicate-count-exact")],
+                name="phase3-duplicate-count-exact")
+        self.assertEqual(aggregate["record_occurrence_count"], 3)
+        self.assertEqual(aggregate["unique_record_count"], 1)
+        self.assertEqual(
+            aggregate["records"][0]["occurrences"], ((0, 0), (0, 1), (0, 2)))
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+        over_count = self.write(
+            "phase3-duplicate-count-over", b"x\nx\nx\nx\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(over_count, artifact_id="duplicate-count-over")],
+            "phase3-duplicate-count-over")
+        with (mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 3),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 64)):
+            failure(self, 5, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertTrue(all(context["fd"] == -1
+                            for context in transaction["retained"]))
+        self.assertEqual(transaction["output"]["fd"], -1)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(
+            ".nullsec-wolt-stage2c-phase2-") for path in self.directory.iterdir()))
+
+        exact_bytes = self.write("phase3-duplicate-bytes-exact", b"x\nx\nx\nx\n")
+        with (mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 10),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 4)):
+            aggregate, _calls, output, residue = self.invoke_phase3(
+                [artifact(exact_bytes, artifact_id="duplicate-bytes-exact")],
+                name="phase3-duplicate-bytes-exact")
+        self.assertEqual(aggregate["record_occurrence_count"], 4)
+        self.assertEqual(aggregate["unique_record_count"], 1)
+        self.assertFalse(output.exists())
+        self.assertEqual(residue, [])
+
+        over_bytes = self.write(
+            "phase3-duplicate-bytes-over", b"x\nx\nx\nx\nx\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(over_bytes, artifact_id="duplicate-bytes-over")],
+            "phase3-duplicate-bytes-over")
+        with (mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_OCCURRENCES", 10),
+              mock.patch.object(s2, "MAX_AGGREGATE_RECORD_BYTES", 4)):
+            failure(self, 5, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertTrue(all(context["fd"] == -1
+                            for context in transaction["retained"]))
+        self.assertEqual(transaction["output"]["fd"], -1)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(
+            ".nullsec-wolt-stage2c-phase2-") for path in self.directory.iterdir()))
+
+    def test_phase3_retained_replacement_during_aggregation_fails_closed(self):
+        retained = self.write("phase3-retained-during", b"original.example\n")
+        replacement = self.write(
+            "phase3-retained-during-replacement", b"replacement.example\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(retained, artifact_id="retained-during-a")],
+            "phase3-retained-during")
+        original_aggregate = s2.aggregate_validated_success_envelopes
+        aggregation_ran = []
+
+        def replacing(parsed, results):
+            aggregate = original_aggregate(parsed, results)
+            os.replace(replacement, retained)
+            aggregation_ran.append(True)
+            return aggregate
+
+        with (mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(
+                  s2, "aggregate_validated_success_envelopes",
+                  side_effect=replacing)):
+            failure(self, 3, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertEqual(aggregation_ran, [True])
+        self.assertEqual(retained.read_bytes(), b"replacement.example\n")
+        self.assertTrue(all(context["fd"] == -1
+                            for context in transaction["retained"]))
+        self.assertEqual(transaction["output"]["fd"], -1)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(
+            ".nullsec-wolt-stage2c-phase2-") for path in self.directory.iterdir()))
+        self.assertEqual(list(self.directory.rglob("normalized-*.json")), [])
+
+    def test_phase3_integrity_checks_surround_aggregation_and_fail_closed(self):
+        def assert_closed_without_residue(transaction, output):
+            self.assertTrue(all(context["fd"] == -1
+                                for context in transaction["retained"]))
+            self.assertEqual(transaction["output"]["fd"], -1)
+            self.assertFalse(output.exists())
+            self.assertFalse(any(path.name.startswith(
+                ".nullsec-wolt-stage2c-phase2-")
+                for path in self.directory.iterdir()))
+            self.assertEqual(list(self.directory.rglob("normalized-*.json")), [])
+
+        before = self.write("phase3-integrity-before", b"before.example\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(before, artifact_id="integrity-before-a")],
+            "phase3-integrity-before")
+        before_events = []
+        aggregate_before = mock.Mock()
+
+        def fail_before_aggregation(_cfg):
+            before_events.append("integrity")
+            if len(before_events) == 3:
+                raise s2.Failure(2, "injected-before-aggregation")
+
+        with (mock.patch.object(
+                  s2, "verify_integrity", side_effect=fail_before_aggregation),
+              mock.patch.object(
+                  s2, "aggregate_validated_success_envelopes",
+                  aggregate_before)):
+            failure(self, 2, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertEqual(before_events, ["integrity", "integrity", "integrity"])
+        aggregate_before.assert_not_called()
+        assert_closed_without_residue(transaction, output)
+
+        after = self.write("phase3-integrity-after", b"after.example\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(after, artifact_id="integrity-after-a")],
+            "phase3-integrity-after")
+        after_events = []
+        original_aggregate = s2.aggregate_validated_success_envelopes
+
+        def fail_after_aggregation(_cfg):
+            after_events.append("integrity")
+            if after_events.count("integrity") == 4:
+                raise s2.Failure(2, "injected-after-aggregation")
+
+        def record_aggregation(parsed, results):
+            after_events.append("aggregate")
+            return original_aggregate(parsed, results)
+
+        with (mock.patch.object(
+                  s2, "verify_integrity", side_effect=fail_after_aggregation),
+              mock.patch.object(
+                  s2, "aggregate_validated_success_envelopes",
+                  side_effect=record_aggregation)):
+            failure(self, 2, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertEqual(after_events, [
+            "integrity", "integrity", "integrity", "aggregate", "integrity",
+        ])
+        assert_closed_without_residue(transaction, output)
+
+    def test_phase3_output_reservation_loss_during_aggregation(self):
+        retained = self.write("phase3-output-loss", b"reserved.example\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(retained, artifact_id="reservation-a")],
+            "phase3-output-loss")
+        original_aggregate = s2.aggregate_validated_success_envelopes
+
+        def appearing(parsed, results):
+            aggregate = original_aggregate(parsed, results)
+            output.write_bytes(b"foreign-object")
+            output.chmod(0o600)
+            return aggregate
+
+        try:
+            with (mock.patch.object(s2, "verify_integrity"),
+                  mock.patch.object(
+                      s2, "aggregate_validated_success_envelopes",
+                      side_effect=appearing)):
+                failure(self, 6, s2.orchestrate_phase3, cfg, transaction,
+                        self.successful_runner([]))
+            self.assertEqual(output.read_bytes(), b"foreign-object")
+            self.assertTrue(all(context["fd"] == -1
+                                for context in transaction["retained"]))
+            self.assertEqual(transaction["output"]["fd"], -1)
+            self.assertFalse(any(path.name.startswith(
+                ".nullsec-wolt-stage2c-phase2-")
+                for path in self.directory.iterdir()))
+        finally:
+            if output.exists():
+                output.unlink()
+
+    def test_phase3_injected_aggregation_failure_cleans_and_closes(self):
+        retained = self.write("phase3-aggregate-failure", b"failure.example\n")
+        cfg, transaction, output = self.cfg_and_transaction(
+            [artifact(retained, artifact_id="failure-a")],
+            "phase3-aggregate-failure")
+        with (mock.patch.object(s2, "verify_integrity"),
+              mock.patch.object(
+                  s2, "aggregate_validated_success_envelopes",
+                  side_effect=s2.Failure(5, "injected"))):
+            failure(self, 5, s2.orchestrate_phase3, cfg, transaction,
+                    self.successful_runner([]))
+        self.assertTrue(all(context["fd"] == -1
+                            for context in transaction["retained"]))
+        self.assertEqual(transaction["output"]["fd"], -1)
+        self.assertFalse(output.exists())
+        self.assertFalse(any(path.name.startswith(
+            ".nullsec-wolt-stage2c-phase2-") for path in self.directory.iterdir()))
+
     def test_child_runner_sanitizes_environment_and_bounds_transcript(self):
         captured = {}
         def popen(argv, **kwargs):
@@ -1444,7 +1855,7 @@ class IntegrityAndResultTests(unittest.TestCase):
                 s2, "open_validated_transaction", side_effect=validate))
         with (process_patch, mock.patch.object(s2, "qualify_platform"), parse_patch,
               mock.patch.object(s2, "verify_integrity"), validate_patch,
-              mock.patch.object(s2, "orchestrate_phase2", return_value=[]),
+              mock.patch.object(s2, "orchestrate_phase3", return_value={}),
               contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
             code = s2.main([])
         return code, stdout.getvalue(), stderr.getvalue()
@@ -1503,7 +1914,7 @@ class IntegrityAndResultTests(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256((ROOT / relative).read_bytes()).hexdigest(), digest)
 
-    def test_static_offline_phase2_capability_boundary(self):
+    def test_static_offline_phase3_capability_boundary(self):
         core = CORE.read_text(encoding="utf-8")
         launcher = LAUNCHER.read_text(encoding="utf-8")
         forbidden_core = (
@@ -1521,7 +1932,7 @@ class IntegrityAndResultTests(unittest.TestCase):
         self.assertNotIn("/usr/bin/env python", launcher)
         self.assertIn("/usr/bin/python3 -I -S -B", launcher)
 
-    def test_phase2_has_transient_staging_but_no_final_publication_authority(self):
+    def test_phase3_has_transient_staging_but_no_final_publication_authority(self):
         tree = ast.parse(CORE.read_text(encoding="utf-8"))
         forbidden = (
             "_build_workspace_boundary", "TransactionWorkspace", "WorkspaceEntry",
@@ -1547,6 +1958,8 @@ class IntegrityAndResultTests(unittest.TestCase):
         self.assertNotIn("os.rename", core)
         self.assertNotIn("os.replace", core)
         self.assertIn("cleanup_transient_workspace", declared)
+        self.assertIn("aggregate_validated_success_envelopes", declared)
+        self.assertIn("orchestrate_phase3", declared)
 
     def test_introspection_copy_reconstruction_and_registry_insertion_have_no_authority(self):
         capability_types = ("TransactionWorkspace", "WorkspaceEntry", "SealedEntry")
@@ -1584,7 +1997,7 @@ class IntegrityAndResultTests(unittest.TestCase):
                                          for constant in code_values))
 
     def test_launcher_result_contract_accepts_every_exact_fixed_result(self):
-        success = (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK\n", b"")
+        success = (0, b"STAGE2C_PHASE3_AGGREGATION_OK\n", b"")
         help_result = (0, s2.help_text().encode("ascii"), b"")
         self.assertEqual(s2.validate_launcher_result(*success), success)
         self.assertEqual(s2.validate_launcher_result(*help_result), help_result)
@@ -1599,8 +2012,8 @@ class IntegrityAndResultTests(unittest.TestCase):
         cases = (
             (126, b"", b"/usr/bin/python3: Permission denied\n"),
             (127, b"", b"/usr/bin/python3: No such file\n"),
-            (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK", b""),
-            (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK\n", b"warning\n"),
+            (0, b"STAGE2C_PHASE3_AGGREGATION_OK", b""),
+            (0, b"STAGE2C_PHASE3_AGGREGATION_OK\n", b"warning\n"),
             (1, b"", b"STAGE2C_INTERNAL_ERROR\npartial"),
             (1, secret, b""), (2, b"", secret), (255, b"", b""),
             (0, b"x" * (s2.MAX_LAUNCH_RESULT_BYTES + 1), b""),
@@ -1631,10 +2044,10 @@ class IntegrityAndResultTests(unittest.TestCase):
         self.assertNotIn("cat \"$stdout_path\"", launcher)
         self.assertNotIn("cat \"$stderr_path\"", launcher)
         for token in tuple(s2.ERROR_TOKEN.values()) + (
-                "STAGE2C_PHASE2_ORCHESTRATION_OK",):
+                "STAGE2C_PHASE3_AGGREGATION_OK",):
             self.assertIn(token, launcher)
         exact_results = [
-            (0, b"STAGE2C_PHASE2_ORCHESTRATION_OK\n", b""),
+            (0, b"STAGE2C_PHASE3_AGGREGATION_OK\n", b""),
             (0, s2.help_text().encode("ascii"), b""),
         ]
         exact_results.extend(
@@ -1786,6 +2199,8 @@ class IntegrityAndResultTests(unittest.TestCase):
             "MAX_TOTAL_RETAINED_BYTES", "MAX_PROTECTED_BYTES",
             "MAX_LAUNCH_RESULT_BYTES", "MAX_STAGE2B_INPUT_BYTES",
             "MAX_NORMALIZED_ENVELOPE_BYTES", "MAX_TOTAL_NORMALIZED_BYTES",
+            "MAX_NORMALIZED_RECORDS", "MAX_NORMALIZED_RECORD_BYTES",
+            "MAX_AGGREGATE_RECORD_OCCURRENCES", "MAX_AGGREGATE_RECORD_BYTES",
             "MAX_TRANSIENT_ARTIFACTS", "MAX_CHILD_STDOUT_BYTES",
             "MAX_CHILD_STDERR_BYTES", "CHILD_TIMEOUT_SECONDS",
             "CHILD_CPU_SECONDS", "CHILD_ADDRESS_SPACE_BYTES",

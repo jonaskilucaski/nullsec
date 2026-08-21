@@ -1,9 +1,11 @@
 #!/usr/bin/python3
-"""Wolt Stage 2C Phase 2: strictly offline retained-evidence orchestration.
+"""Wolt Stage 2C Phase 3: strictly offline retained-evidence aggregation.
 
 Phase 2 retains the Phase 1 validation boundary, invokes only the fixed Stage 2B
 offline normalizer, validates its transient envelopes, and removes all staging.
-It does not classify evidence, invoke Stage 2A or NullSec, or publish a package.
+Phase 3 deterministically aggregates only those validated success envelopes in
+memory.  It does not classify evidence, invoke Stage 2A or NullSec, or publish a
+package.
 
 Processes running as this UID are trusted.  A compromised current account or a
 malicious same-UID process is outside this phase's threat model.
@@ -65,6 +67,10 @@ MAX_LAUNCH_RESULT_BYTES = 4096
 MAX_STAGE2B_INPUT_BYTES = 8 * 1024 * 1024
 MAX_NORMALIZED_ENVELOPE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_NORMALIZED_BYTES = 64 * 1024 * 1024
+MAX_NORMALIZED_RECORDS = 100000
+MAX_NORMALIZED_RECORD_BYTES = 4096
+MAX_AGGREGATE_RECORD_OCCURRENCES = 100000
+MAX_AGGREGATE_RECORD_BYTES = 8 * 1024 * 1024
 MAX_TRANSIENT_ARTIFACTS = MAX_ARTIFACTS
 MAX_CHILD_STDOUT_BYTES = 4096
 MAX_CHILD_STDERR_BYTES = 4096
@@ -1193,8 +1199,9 @@ def retained_records(data):
         return []
     body = data[:-1] if data.endswith(b"\n") else data
     records = body.split(b"\n")
-    if (len(records) > 100000 or any(not record for record in records) or
-            any(len(record) > 4096 for record in records)):
+    if (len(records) > MAX_NORMALIZED_RECORDS or
+            any(not record for record in records) or
+            any(len(record) > MAX_NORMALIZED_RECORD_BYTES for record in records)):
         abort(EXIT_CHILD, "RETAINED_NORMALIZATION_INPUT")
     return [record.decode("ascii") for record in records]
 
@@ -1247,7 +1254,8 @@ def validate_normalized_envelope(workspace, name, artifact, retained_data, ops=o
                 value["schema_version"] != 1 or
                 value["source_id"] != artifact["source_id"] or
                 value["collection_status"] != "success" or
-                type(count) is not int or count < 0 or count > 100000 or
+                type(count) is not int or count < 0 or
+                count > MAX_NORMALIZED_RECORDS or
                 not isinstance(records, list) or len(records) != count):
             abort(EXIT_CHILD, "NORMALIZED_VALUES")
         for record in records:
@@ -1257,7 +1265,7 @@ def validate_normalized_envelope(workspace, name, artifact, retained_data, ops=o
                 encoded = record.encode("ascii", "strict")
             except UnicodeError:
                 abort(EXIT_CHILD, "NORMALIZED_RECORD_ENCODING")
-            if (len(encoded) > 4096 or
+            if (len(encoded) > MAX_NORMALIZED_RECORD_BYTES or
                     any(byte < 32 or byte == 127 for byte in encoded)):
                 abort(EXIT_CHILD, "NORMALIZED_RECORD_VALUE")
         if records != retained_records(retained_data):
@@ -1279,6 +1287,7 @@ def validate_normalized_envelope(workspace, name, artifact, retained_data, ops=o
             "source_size_bytes": artifact["size_bytes"],
             "normalized_sha256": digest,
             "normalized_size_bytes": len(data), "record_count": count,
+            "records": tuple(records),
             "identity": file_identity(after),
         }
     finally:
@@ -1371,6 +1380,8 @@ def orchestrate_phase2(cfg, transaction, child_runner=None):
     workspace = None
     results = []
     total_normalized = 0
+    total_record_occurrences = 0
+    total_record_bytes = 0
     pending_failure = None
     try:
         assert_output_reserved(transaction["output"])
@@ -1401,6 +1412,13 @@ def orchestrate_phase2(cfg, transaction, child_runner=None):
             total_normalized += result["normalized_size_bytes"]
             if total_normalized > MAX_TOTAL_NORMALIZED_BYTES:
                 abort(EXIT_CHILD, "NORMALIZED_TOTAL")
+            total_record_occurrences += result["record_count"]
+            if total_record_occurrences > MAX_AGGREGATE_RECORD_OCCURRENCES:
+                abort(EXIT_CHILD, "AGGREGATE_RECORD_COUNT")
+            for record in result["records"]:
+                total_record_bytes += len(record.encode("ascii"))
+                if total_record_bytes > MAX_AGGREGATE_RECORD_BYTES:
+                    abort(EXIT_CHILD, "AGGREGATE_RECORD_BYTES")
             results.append(result)
             remove_workspace_entry(workspace, output_name, result["identity"])
             revalidate_workspace(workspace, ())
@@ -1428,6 +1446,121 @@ def orchestrate_phase2(cfg, transaction, child_runner=None):
     return results
 
 
+def aggregate_validated_success_envelopes(parsed, results):
+    """Deterministically aggregate authenticated Phase 2 success results."""
+    if (not isinstance(parsed, dict) or
+            parsed.get("transaction_class") != "success-evidence" or
+            not isinstance(parsed.get("artifacts"), list) or
+            not isinstance(results, list) or
+            len(results) != len(parsed["artifacts"]) or
+            not results or len(results) > MAX_TRANSIENT_ARTIFACTS):
+        abort(EXIT_INTERNAL, "AGGREGATE_TRANSACTION")
+
+    result_keys = frozenset((
+        "artifact_id", "source_id", "profile", "source_sha256",
+        "source_size_bytes", "normalized_sha256", "normalized_size_bytes",
+        "record_count", "records", "identity", "ordinal",
+    ))
+    sources = []
+    occurrences_by_record = {}
+    occurrence_count = 0
+    record_bytes = 0
+
+    for ordinal, (artifact, result) in enumerate(zip(
+            parsed["artifacts"], results)):
+        if (not isinstance(artifact, dict) or not isinstance(result, dict) or
+                set(result) != result_keys or type(result["ordinal"]) is not int or
+                result["ordinal"] != ordinal or
+                result["artifact_id"] != artifact.get("artifact_id") or
+                result["source_id"] != artifact.get("source_id") or
+                result["profile"] != artifact.get("profile") or
+                result["profile"] != "hostname-lines-v1" or
+                result["source_sha256"] != artifact.get("sha256") or
+                result["source_size_bytes"] != artifact.get("size_bytes") or
+                type(result["source_size_bytes"]) is not int or
+                type(result["normalized_size_bytes"]) is not int or
+                result["normalized_size_bytes"] < 0 or
+                type(result["record_count"]) is not int or
+                result["record_count"] < 0 or
+                result["record_count"] > MAX_NORMALIZED_RECORDS or
+                not isinstance(result["records"], tuple) or
+                len(result["records"]) != result["record_count"]):
+            abort(EXIT_INTERNAL, "AGGREGATE_SOURCE_BINDING")
+        for digest_name in ("source_sha256", "normalized_sha256"):
+            digest = result[digest_name]
+            if (not isinstance(digest, str) or len(digest) != 64 or
+                    any(character not in "0123456789abcdef"
+                        for character in digest)):
+                abort(EXIT_INTERNAL, "AGGREGATE_DIGEST")
+
+        sources.append({
+            "ordinal": ordinal,
+            "artifact_id": result["artifact_id"],
+            "source_id": result["source_id"],
+            "profile": result["profile"],
+            "source_sha256": result["source_sha256"],
+            "source_size_bytes": result["source_size_bytes"],
+            "normalized_sha256": result["normalized_sha256"],
+            "normalized_size_bytes": result["normalized_size_bytes"],
+            "record_count": result["record_count"],
+        })
+        for record_ordinal, record in enumerate(result["records"]):
+            if not isinstance(record, str):
+                abort(EXIT_INTERNAL, "AGGREGATE_RECORD_TYPE")
+            try:
+                encoded = record.encode("ascii", "strict")
+            except UnicodeError:
+                abort(EXIT_INTERNAL, "AGGREGATE_RECORD_ENCODING")
+            if (not encoded or len(encoded) > MAX_NORMALIZED_RECORD_BYTES or
+                    any(byte < 32 or byte == 127 for byte in encoded)):
+                abort(EXIT_INTERNAL, "AGGREGATE_RECORD_VALUE")
+            occurrence_count += 1
+            if occurrence_count > MAX_AGGREGATE_RECORD_OCCURRENCES:
+                abort(EXIT_CHILD, "AGGREGATE_RECORD_COUNT")
+            record_bytes += len(encoded)
+            if record_bytes > MAX_AGGREGATE_RECORD_BYTES:
+                abort(EXIT_CHILD, "AGGREGATE_RECORD_BYTES")
+            occurrences_by_record.setdefault(record, []).append(
+                (ordinal, record_ordinal))
+
+    records = tuple(
+        {"value": record, "occurrences": tuple(occurrences_by_record[record])}
+        for record in sorted(
+            occurrences_by_record, key=lambda value: value.encode("ascii"))
+    )
+    return {
+        "schema_version": 1,
+        "aggregation_profile": "exact-ascii-record-provenance-v1",
+        "transaction_class": "success-evidence",
+        "source_artifact_count": len(sources),
+        "record_occurrence_count": occurrence_count,
+        "unique_record_count": len(records),
+        "sources": tuple(sources),
+        "records": records,
+    }
+
+
+def orchestrate_phase3(cfg, transaction, child_runner=None):
+    """Run Phase 2, aggregate in memory, and preserve the publication fence."""
+    try:
+        assert_output_reserved(transaction["output"])
+        results = orchestrate_phase2(cfg, transaction, child_runner)
+        assert_output_reserved(transaction["output"])
+        for retained_context in transaction["retained"]:
+            revalidate_open_file(retained_context, EXIT_INPUT, "RETAINED")
+        verify_integrity(cfg)
+        aggregate = aggregate_validated_success_envelopes(
+            transaction["parsed"], results)
+        verify_integrity(cfg)
+        for retained_context in transaction["retained"]:
+            revalidate_open_file(retained_context, EXIT_INPUT, "RETAINED")
+        assert_output_reserved(transaction["output"])
+        return aggregate
+    except BaseException:
+        close_validated_transaction(transaction)
+        raise
+
+
 
 
 def help_text():
@@ -1435,9 +1568,9 @@ def help_text():
         "Usage: nullsec-wolt-stage2c.sh --help\n"
         "       nullsec-wolt-stage2c.sh --manifest ABSOLUTE_FILE "
         "--output ABSOLUTE_NONEXISTENT_PATH\n"
-        "Phase 2 performs strictly offline retained-evidence normalization "
-        "orchestration.\n"
-        "It invokes only the fixed offline Stage 2B boundary; it does not "
+        "Phase 3 performs strictly offline retained-evidence normalization "
+        "and deterministic in-memory aggregation.\n"
+        "It reuses only the fixed offline Stage 2B boundary; it does not "
         "classify, execute Stage 2A or NullSec, or perform final publication.\n"
     )
 
@@ -1451,7 +1584,7 @@ def validate_launcher_result(status, stdout, stderr):
             len(stderr) > MAX_LAUNCH_RESULT_BYTES):
         return rejected
     if status == EXIT_OK and stderr == b"":
-        if stdout == b"STAGE2C_PHASE2_ORCHESTRATION_OK\n":
+        if stdout == b"STAGE2C_PHASE3_AGGREGATION_OK\n":
             return status, stdout, stderr
         expected_help = help_text().encode("ascii")
         if stdout == expected_help:
@@ -1480,10 +1613,10 @@ def main(argv=None):
                     abort(EXIT_PROVIDER_FAILURE, "VALIDATED_PROVIDER_FAILURE")
                 if parsed["transaction_class"] != "success-evidence":
                     abort(EXIT_INTERNAL, "TRANSACTION_CLASS")
-                orchestrate_phase2(cfg, transaction)
+                orchestrate_phase3(cfg, transaction)
             finally:
                 close_validated_transaction(transaction)
-            sys.stdout.write("STAGE2C_PHASE2_ORCHESTRATION_OK\n")
+            sys.stdout.write("STAGE2C_PHASE3_AGGREGATION_OK\n")
         return EXIT_OK
     except Failure as failure:
         token = ERROR_TOKEN.get(failure.code, ERROR_TOKEN[EXIT_INTERNAL])

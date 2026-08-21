@@ -1,6 +1,6 @@
 {
   "aggregate_algorithm": "sorted-path-sha256-v1",
-  "aggregate_sha256": "2280dc2db2036abc92ba627b1d8610557fe095aeae3e3ffcdb634306549f569b",
+  "aggregate_sha256": "5ed38e8f892e926ffba2a1f5d4651a57679eb9b30182a8dd9a525cf25f60cf88",
   "inventory_algorithm": "sorted-path-sha256-v1",
   "inventory_identity": "b1578ab823271e0837f43fd607e6d98180b5221e92b47a676610ae734a036434",
   "protected_files": {
@@ -15,7 +15,7 @@
     "config/wolt-stage2b-integrity.json": "15c1c2661903fa932fd06d36edbfba09060f21d724955ff81d98d04eff4d5dd5",
     "lib/wolt-stage2a.py": "13df11325f7c805b32846b8c45aeecaf66c355a07bd400b26c45d561db0a419e",
     "lib/wolt-stage2b.py": "e43862424bbe6b9b0cd6dda2a97a085c92ff905b0cb55ab969db33b3c549b191",
-    "lib/wolt-stage2c.py": "1a62db9621b61c1fc755a9c8340daaf406d53b29fae84401058eb5b897804b83",
+    "lib/wolt-stage2c.py": "8a3054837da722dc96adee0bdf58817ed4075d1ddc2a8671e32d068815df835e",
     "nullsec-wolt-stage2a.sh": "ca6548efee68d4cf1e9dab70934c1428ba0df8b634530259915f4732a34fddd8",
     "nullsec-wolt-stage2b.sh": "7f9b4a712eae164adfad09a42c505e3b5ad0b658805bd804db0090c84b68319d",
     "nullsec-wolt.sh": "9396bd2fef4ef6528e45c32e090c517a945ac6812235334b5c4c8c5122721a01",
@@ -38,7 +38,7 @@
     "tests/test-wolt-stage2a.sh": "2bab942540112e5d37d76c4d377918ca4b40a1be00ac4490aa89629ed22850a2",
     "tests/test-wolt-stage2b.py": "ac7b8c0d8ad5b870d9a509956c0dcc3de51fcf88e778751f5d17342ccdf7b6ed",
     "tests/test-wolt-stage2b.sh": "255191f42981293c45425cddc7cd651d2b9c5906d3e1f4475f5e213b5c0530a5",
-    "tests/test-wolt-stage2c.py": "c22786466f641d468ad0ba00405471399d0844ffea5f0c1652c190884a1b8029",
+    "tests/test-wolt-stage2c.py": "82710321f9b95f71211240cde644d5d30f18c9e7df1dd0b53bcbb1fba5b1598f",
     "tests/test-wolt-wrapper.sh": "cd9c966a4f4d52e4cbf7c7b0bca2b93bb454080d94b87a378c32d9555708efb6"
   },
   "protected_modes": {
