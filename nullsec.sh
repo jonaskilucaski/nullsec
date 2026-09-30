@@ -1520,11 +1520,22 @@ phase2_validation() {
     local resolvers_file="$p2dir/resolvers.txt"
     printf '8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n' > "$resolvers_file"
 
-    if ! dnsx -l "$p1dir/all-subdomains.txt" \
-        -r "$resolvers_file" \
-        -o "$p2dir/resolved.txt" \
-        -wd "$p2dir/wildcards.txt" \
-        -a -resp -silent -rl 100 2>"$p2dir/dnsx-error.log"; then
+    # dnsx -wd expects a DOMAIN, not an output filename. Prefer the current
+    # automatic wildcard filter when supported; otherwise use the documented
+    # single-domain wildcard mode with TARGET. Downstream logic only requires
+    # the resolved hostname in field 1, so the manual-mode fallback remains
+    # compatible even though dnsx ignores record-display flags with -wd.
+    local -a dnsx_args=(-l "$p1dir/all-subdomains.txt" -r "$resolvers_file"
+        -o "$p2dir/resolved.txt" -silent -rl 100)
+    if dnsx -h 2>&1 | grep -q -- '-auto-wildcard'; then
+        dnsx_args+=(-auto-wildcard -a -resp)
+        info "dnsx wildcard handling: automatic filtering"
+    else
+        dnsx_args+=(-wd "$TARGET")
+        info "dnsx wildcard handling: manual filtering for $TARGET"
+    fi
+
+    if ! dnsx "${dnsx_args[@]}" 2>"$p2dir/dnsx-error.log"; then
         warn "dnsx failed; see $p2dir/dnsx-error.log. Partial output was preserved."
         phase_errors=$(( phase_errors + 1 ))
     fi
@@ -1534,14 +1545,13 @@ phase2_validation() {
         awk '{print $1}' "$p2dir/resolved.txt" | sed 's/\.$//' | in_scope | sort -u > "$p2dir/valid-subdomains.txt"
     fi
 
-    local total_enum valid wildcards
+    local total_enum valid
     total_enum=$(count_lines "$p1dir/all-subdomains.txt")
     valid=$(count_lines "$p2dir/valid-subdomains.txt")
-    wildcards=$(count_lines "$p2dir/wildcards.txt")
 
     info "Total enumerated  : $total_enum"
     info "Actually resolved : $valid"
-    info "Wildcards filtered: $wildcards"
+    info "Wildcard filtering: handled internally by dnsx (filtered names are not emitted separately)"
 
     if [ "$valid" -eq 0 ]; then
         warn "Phase 2 produced 0 valid subdomains. Later web phases will be skipped or empty."
@@ -3747,7 +3757,8 @@ phase10_screenshots() {
     mkdir -p "$p10dir/403" "$p10dir/interesting" "$p10dir/admin" "$p10dir/all"
 
     _run_gowitness_batch() {
-        local label="$1" input="$2" output_dir="$3" targets="$output_dir/targets.txt"
+        local label="$1" input="$2" output_dir="$3"
+        local targets="$output_dir/targets.txt"
         [ -s "$input" ] || return 0
         head -"$MAX_SCREENSHOTS" "$input" | in_scope > "$targets"
         [ -s "$targets" ] || return 0
