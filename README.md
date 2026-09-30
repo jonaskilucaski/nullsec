@@ -17,7 +17,7 @@ It is designed for **authorized security research only**. Use it exclusively on 
 - Subdomain takeover checks
 - Ownership-aware cloud storage enumeration
 - HTTP probing, technology detection, and status-code grouping
-- Hidden virtual-host discovery
+- Virtual-host discovery paused pending request-boundary enforcement
 - Port scanning and alternate web-service detection
 - Live, in-scope URL corpus generation
 - Parameter discovery and endpoint categorization
@@ -26,8 +26,8 @@ It is designed for **authorized security research only**. Use it exclusively on 
 - JavaScript download, secret detection, and endpoint extraction
 - SSRF, redirect, XSS, SQLi, LFI, IDOR, CORS, and host-header lead generation
 - Optional Dalfox and SQLMap validation
-- Gowitness screenshot capture
-- ffuf directory, backup-file, and virtual-host fuzzing
+- Gowitness integration retained but disabled pending browser egress enforcement
+- Opt-in ffuf directory and backup-file enumeration; virtual-host fuzzing is disabled
 - Active Nuclei confirmation in deep mode
 - Checkpoint-based resume support
 - Safe interrupt handling and child-process cleanup
@@ -68,22 +68,22 @@ The script now performs **mode-aware** dependency checks. A tool is treated as f
 
 | Tool | Purpose | Required when |
 |---|---|---|
-| Amass v4 or Amass fallback | Subdomain and DNS relationship discovery | All modes |
+| Amass v4 or Amass fallback | Active relationship discovery | Requires `-E`; disabled with explicit host rules |
 | Subfinder | Passive subdomain enumeration | All modes |
 | Assetfinder | Passive subdomain enumeration | All modes |
 | dnsx | DNS validation and wildcard detection | All modes |
 | httpx-toolkit | HTTP probing and metadata collection | All modes |
-| Katana | Web crawling | All modes |
+| Katana | Integration disabled pending request-policy enforcement | Not required |
 | Waybackurls | Historical URL collection | All modes |
 | GAU | Historical and indexed URL collection | All modes |
 | Unfurl | URL and parameter extraction | All modes |
 | Nuclei | Template-based scanning and confirmation | All modes |
 | jq | JSON processing | All modes |
-| curl | HTTP requests and connectivity checks | All modes |
-| PureDNS | DNS brute force and permutation resolution | `normal` and `deep` by default |
-| Naabu | Port scanning | `normal` and `deep` by default |
-| ffuf | Virtual-host and content fuzzing | `normal` for vhost discovery; `deep` for vhost and directory fuzzing |
-| Arjun | Active parameter discovery | `deep` by default |
+| curl | HTTP requests with default configuration and redirects disabled | All modes |
+| PureDNS | Generated DNS enumeration | Requires `-E`; disabled with explicit host rules |
+| Naabu | Port scanning | Requires `-E` and `normal`/`deep` |
+| ffuf | Non-recursive content enumeration | Requires `-E` and `deep`; virtual-host path disabled |
+| Arjun | Active parameter discovery with redirects disabled | Requires `-E` and `deep` |
 
 > [!NOTE]
 > The expected ProjectDiscovery binary name is `httpx-toolkit`. This avoids conflicts with the unrelated Python package named `httpx`.
@@ -106,7 +106,7 @@ NullSec continues when optional tools are unavailable, but the related checks ar
 | dig | DNS ownership evidence collection |
 | cloud_enum | Detected but intentionally not used for ungated global-name mutation |
 | S3Scanner | Optional cloud tooling |
-| TruffleHog | Local JavaScript secret detection by default; live credential verification requires explicit `-V` authorization |
+| TruffleHog | Local JavaScript secret detection by default; live credential verification requires explicit `-V` authorization or its environment equivalent |
 
 ### Wordlists
 
@@ -158,13 +158,13 @@ export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"
 ```
 
 Missing templates show a warning only; normal mode does not fail only because the template directory is absent.
-Or let NullSec update templates before a scan with the `-u` option.
+During authorized vulnerability scanning, `-u` requests a template update.
 
 ## Installation
 
 ```bash
-git clone <your-repository-url>
-cd NullSec
+git clone https://github.com/jonaskilucaski/nullsec.git
+cd nullsec
 chmod +x nullsec.sh
 ```
 
@@ -229,10 +229,10 @@ Run a lightweight scan:
 ./nullsec.sh -d example.com -m fast
 ```
 
-Run the full pipeline with template updates and polite inter-phase delays:
+Select deep-mode limits with polite inter-phase delays (authorization defaults remain conservative):
 
 ```bash
-./nullsec.sh -d example.com -m deep -u -r
+./nullsec.sh -d example.com -m deep -r
 ```
 
 Write results to a specific new directory:
@@ -261,7 +261,8 @@ Usage: ./nullsec.sh -d <target-domain> [options]
   -i <file>     Approved host scope (exact hosts or *.suffix patterns)
   -x <file>     Excluded host scope (exact hosts or *.suffix patterns)
   -C <file>     Approved cloud resources (provider:name; exact names only)
-  -A            Explicitly authorize active vulnerability validation/fuzzing
+  -E            Explicitly authorize active enumeration
+  -A            Explicitly authorize vulnerability validation
   -V            Explicitly authorize TruffleHog credential verification
   -c <dir>      Resume from an existing NullSec output directory
   --version     Show NullSec version and author
@@ -270,19 +271,21 @@ Usage: ./nullsec.sh -d <target-domain> [options]
 
 The target must be a plain DNS domain such as `example.com`. Do not pass a URL, path, wildcard, IP address, CIDR range, or labels with leading/trailing hyphens.
 
-For programs with narrower authorization boundaries, provide an explicit include file with `-i` and an exclusion file with `-x`. Scope files accept exact hostnames and leading-wildcard suffixes such as `*.api.example.com`; exclusions override inclusions. When `-i` is omitted, NullSec defaults to the target apex plus its subdomains.
+For programs with narrower authorization boundaries, provide an explicit include file with `-i` and an exclusion file with `-x`. Scope files accept plain DNS hostnames and leading-wildcard suffixes; exclusions override inclusions. `*.api.example.com` matches `a.api.example.com` and `b.a.api.example.com`, but does not include `api.example.com` itself unless that exact host is approved separately. Case and trailing dots are normalized; blank lines and `#` comments are ignored. URLs, ports, IPs, malformed labels, and other wildcard forms are rejected.
 
-Active vulnerability confirmation and directory fuzzing are disabled unless `-A` is supplied. TruffleHog credential/API verification is disabled unless `-V` is supplied.
+When `-i` is omitted, NullSec defaults to the target apex plus its descendants, subject to exclusions. An explicit include file is authoritative: zero-byte and comments-only files deny all. Missing, unreadable, non-regular, or malformed authorization files cause an error before target traffic. Files are re-read and checked against the startup fingerprint before phases and request launches; changed or disappearing files block further work.
 
-`-o` and `-c` cannot be used together. A new `-o` directory must be empty. Resume mode verifies the stored target before continuing.
+Active enumeration requires `-E`; vulnerability validation requires `-A`; credential/API verification requires `-V`. Each has an explicit environment equivalent below. Enabling one class does not enable another, and scan modes still limit which stages run. Installing a tool never grants authorization.
+
+`-o` and `-c` cannot be used together. A new `-o` directory must be empty. Resume requires identical target, mode, and normalized authorization policy; old scans without policy metadata must use a new directory.
 
 ## Scan Modes
 
 | Mode | Intended use | Main behavior | Approximate runtime |
 |---|---|---|---|
-| `fast` | Frequent or scheduled checks | Passive discovery, live probing, URL collection, and critical-only Nuclei scanning; skips cloud enumeration, brute force, port scanning, JavaScript analysis, screenshots, pattern hunting, fuzzing, and active confirmation | 5–15 minutes |
-| `normal` | Daily reconnaissance | Adds DNS brute force, cloud checks, port scanning, asset scoring, JavaScript analysis, pattern hunting, screenshots, and virtual-host discovery; skips permutations, Arjun, directory fuzzing, and Phase 12 confirmation | 30–60 minutes |
-| `deep` | First-time onboarding or thorough periodic scans | Enables the complete pipeline, increases selected limits, and includes permutations, Arjun, directory fuzzing, and active confirmation | 1–4+ hours |
+| `fast` | Frequent checks | Passive sources, scoped DNS/HTTP discovery and historical URLs. Nuclei additionally requires `-A`. | Target-dependent |
+| `normal` | Daily reconnaissance | Adds local prioritization, JS analysis and candidate classification. Generated DNS/port enumeration requires `-E`; cloud probes require `-C`; vulnerability checks require `-A`. | Target-dependent |
+| `deep` | Broader authorized coverage | Adds opt-in Arjun/content enumeration with `-E` and confirmation with `-A`; higher configured limits do not grant authorization. | Target-dependent |
 
 Runtime depends on the number of discovered assets, target responsiveness, network conditions, WAF behavior, tool versions, and configured limits.
 
@@ -290,7 +293,7 @@ Runtime depends on the number of discovered assets, target responsiveness, netwo
 
 ### Phase 1 — Subdomain discovery
 
-Collects and merges results from Subfinder, Amass, Assetfinder, crt.sh, Hakrawler, PureDNS, and optionally Gotator. Amass v4 is preferred for its live colored Open Asset Model relationship output.
+Collects and merges passive results from Subfinder, Assetfinder and crt.sh. Amass active discovery, PureDNS brute force and Gotator resolution require `-E` and are disabled when host include/exclude files are supplied, because these paths generate requests before complete rule enforcement. Hakrawler discovery is disabled.
 
 Primary outputs:
 
@@ -304,7 +307,7 @@ phase1-subdomains/amass-detailed.txt
 
 ### Phase 2 — Validation and resolution
 
-Uses dnsx to resolve discovered names, records DNS responses, filters wildcard behavior, and runs Nuclei takeover templates.
+Scopes candidates before dnsx resolution. Wildcard filtering uses automatic mode when advertised, otherwise manual `-wd TARGET`; help failures or unrecognized contracts block resolution. With explicit host rules, only approved candidates are resolved and generated-name wildcard probes are disabled. Partial failed DNS output stays unvalidated. Nuclei takeover checks additionally require `-A`.
 
 Primary outputs:
 
@@ -340,7 +343,7 @@ phase2.5-cloud/exposed/critical-writable.txt
 
 ### Phase 3 — Live web probing
 
-Uses httpx-toolkit to identify web services, collect titles and technologies, group status codes, and optionally run ffuf virtual-host discovery.
+Uses httpx-toolkit on approved inputs to identify web services, collect titles and technologies, and group status codes. Cross-host redirects are disabled; designated metadata/JS validation probes may follow same-host redirects. Virtual-host discovery is disabled pending a request-boundary adapter for direct-IP and generated Host-header traffic.
 
 Primary outputs:
 
@@ -367,20 +370,23 @@ phase4-portscan/services-on-ports.txt
 
 ### Phase 5 — URL discovery and crawling
 
-Combines Katana, Hakrawler, Cariddi, Waybackurls, GAU, explicitly approved cloud URLs, and alternate-port services. Katana is constrained to each seed FQDN, redirects used by HTTP validation are limited to the same host, and JavaScript downloads do not automatically follow redirects.
+Collects historical URLs from Waybackurls and GAU. Katana, both Hakrawler paths and Cariddi are disabled because their crawl/output scope is not a complete request authorization boundary. Provider cloud feeds are report-only and never become generic URL scan inputs. HTTPX launches reapply current host policy, with cross-host redirects disabled. curl ignores its default configuration and explicitly disables redirects.
 
-The corpus is scope-filtered, deduplicated, parameter-collapsed, and checked for liveness. Scope or liveness failures are fail-closed: unvalidated candidates are retained separately instead of being promoted into trusted downstream inputs.
+The corpus is scope-filtered, deduplicated, parameter-collapsed, and checked for liveness. JS and active URL consumers require a complete validation marker bound to the current policy; previous GF output is intersected with current validated URLs. Scope or liveness failures are fail-closed: unvalidated candidates are retained separately instead of being promoted into trusted downstream inputs.
 
 NullSec keeps two important URL sets:
 
 - `all-urls.txt`: refined, live, in-scope, parameter-collapsed endpoints
-- `all-urls-injectable.txt`: full-value parameterized URLs used by injection-oriented phases
+- `scoped-injectable-candidates.txt`: all scoped parameterized candidate values, retained as evidence
+- `all-urls-injectable.txt`: full-value candidates that passed current liveness validation; active consumers reapply scope
+- `unvalidated-urls.txt` / `unvalidated-js-files.txt`: evidence that was not validated
+- `validation-state.txt`: records completion and the authorization fingerprint
 
 The phase also categorizes API endpoints, JavaScript files, sensitive paths, interesting files, and gf matches.
 
 ### Phase 6 — Parameter discovery
 
-Extracts known parameter names with Unfurl and optionally runs Arjun against a limited number of status-200 hosts.
+Extracts known parameter names locally with Unfurl. Arjun requires active-enumeration authorization (`-E`), deep mode, and an approved seed; redirects are explicitly disabled. An older Arjun that rejects this option fails the stage rather than falling back to redirect following.
 
 Primary outputs:
 
@@ -420,7 +426,7 @@ phase7-vulns/exposure-findings.txt
 
 ### Phase 8 — JavaScript analysis
 
-Downloads a bounded number of in-scope JavaScript responses with per-file and aggregate size limits. When TruffleHog is installed, it runs in verified-only mode; targeted regex extraction still runs without TruffleHog. It also extracts possible in-scope API endpoints.
+Downloads a bounded number of in-scope JavaScript responses with per-file and aggregate size limits. TruffleHog defaults to local `--no-verification` detection. `-V` or its explicit environment equivalent permits verification, with `--results=verified,unknown`. Raw JSON and summaries retain verified, unknown/error, and unverified states; targeted regex extraction still runs without TruffleHog. It also extracts possible in-scope API endpoints.
 
 Primary outputs:
 
@@ -452,7 +458,7 @@ Builds investigation lists for:
 - CORS misconfiguration
 - Host-header injection
 
-When available, Dalfox and SQLMap receive deduplicated, capped injection points. CORS and host-header checks include failure-window logic that stops early when throttling or network instability is detected.
+Only with `-A`, available Dalfox and SQLMap receive deduplicated, capped, currently validated and re-scoped injection points. CORS and host-header checks include failure-window logic that stops early when throttling or network instability is detected.
 
 Primary outputs:
 
@@ -471,7 +477,7 @@ phase9-patterns/host-injection-findings.txt
 
 ### Phase 10 — Screenshots
 
-Uses Gowitness to capture visual evidence for live hosts, status-403 pages, admin-like paths, and sensitive endpoints.
+Gowitness initialization remains fixed, but screenshots are disabled: browser subresources can request third parties before any output filtering. Re-enabling this integration requires a request-policy-bound browser adapter.
 
 Primary output:
 
@@ -481,7 +487,7 @@ phase10-screenshots/
 
 ### Phase 11 — Directory and content fuzzing
 
-Uses ffuf against a limited number of in-scope status-200 hosts. It performs recursive directory discovery and a separate pass for exposed backup or configuration files.
+Uses ffuf against a limited number of in-scope status-200 hosts. It requires `-E` and deep mode; redirects and recursion are explicitly disabled. A separate bounded pass inspects backup/configuration paths on the same approved host.
 
 Primary outputs:
 
@@ -493,7 +499,7 @@ phase11-fuzzing/dirs/*.json
 
 ### Phase 12 — Active confirmation
 
-Deep mode uses Nuclei to attempt bounded confirmation of selected SSRF, redirect, LFI, 403-bypass, and GraphQL leads.
+Deep mode with `-A` uses Nuclei to attempt bounded confirmation of selected SSRF, redirect, LFI, 403-bypass, and GraphQL leads.
 
 Primary outputs:
 
@@ -520,7 +526,9 @@ NullSec stores:
 .scan-meta
 ```
 
-The metadata binds the output directory to the target and scan mode. Resume mode refuses a target mismatch. Changing the mode while resuming restarts at Phase 1 inside the same target-bound directory.
+The metadata binds the output directory to the target, scan mode and `AUTHORIZATION_SHA256`. The deterministic fingerprint covers the effective normalized include/exclude rules, approved cloud resources, and enumeration/validation/verification authorizations. Order, duplicate lines and comments do not change the policy. An explicit empty include differs from omitting an include. File paths and API secrets are not stored in this fingerprint metadata.
+
+Resume refuses a missing/ambiguous fingerprint, narrower or broader rules, changed cloud approvals, changed execution authorization, or a changed mode. Use a new output directory for any policy change. Compatible resume reuses only artifacts from the same policy; revisited validations clear current outputs first.
 
 When interrupted with `Ctrl+C`, NullSec attempts to:
 
@@ -528,7 +536,7 @@ When interrupted with `Ctrl+C`, NullSec attempts to:
 - prevent orphaned background tools from continuing;
 - clean temporary files;
 - preserve partial evidence;
-- restore missing outputs when appropriate; and
+- archive prior outputs without restoring them as current validated inputs; and
 - print a resume command.
 
 When a resumed phase replaces an existing result, prior evidence is archived under a `prior-runs/` directory instead of being silently mixed into current findings.
@@ -600,11 +608,12 @@ Environment-variable equivalents are also available:
 export NULLSEC_SCOPE_INCLUDE_FILE=approved-hosts.txt
 export NULLSEC_SCOPE_EXCLUDE_FILE=excluded-hosts.txt
 export NULLSEC_CLOUD_APPROVAL_FILE=approved-cloud.txt
+export NULLSEC_ALLOW_ACTIVE_ENUMERATION=false
 export NULLSEC_ALLOW_ACTIVE_VALIDATION=false
 export NULLSEC_ALLOW_SECRET_VERIFICATION=false
 ```
 
-Use `-A` only when the program explicitly permits active vulnerability validation/fuzzing. Use `-V` only when you are explicitly authorized to test whether discovered credentials are valid against their provider APIs.
+Use `-E` only for permitted active enumeration and `-A` only for permitted vulnerability validation. Use `-V` only when you are explicitly authorized to test whether discovered credentials are valid against their provider APIs.
 
 ### Amass selection
 
@@ -701,7 +710,7 @@ A zero result from one source does not necessarily mean the whole scan failed. C
 
 ### A scan was interrupted
 
-Resume with the same target and mode:
+Resume with the same target, mode, policy contents and authorization flags:
 
 ```bash
 ./nullsec.sh -d example.com -m normal -c <existing-output-directory>
@@ -783,3 +792,36 @@ By using NullSec, you agree that you are solely responsible for obtaining permis
 ---
 
 Created by Jonaski for bug bounty reconnaissance and security research.
+
+
+## Execution authorization and current limits
+
+| Class | Control | Activities |
+|---|---|---|
+| Baseline reconnaissance | Target and host policy | Passive sources, approved-host DNS resolution, ordinary HTTP service/liveness discovery, local analysis |
+| Active enumeration | `-E` / `NULLSEC_ALLOW_ACTIVE_ENUMERATION=true` | Mode-permitted generated DNS enumeration, port scanning, Arjun, non-recursive directory/content fuzzing |
+| Vulnerability validation | `-A` / `NULLSEC_ALLOW_ACTIVE_VALIDATION=true` | Nuclei/takeover checks, Dalfox, SQLMap, CORS/Host-header manipulation, Phase 12 |
+| Credential verification | `-V` / `NULLSEC_ALLOW_SECRET_VERIFICATION=true` | TruffleHog provider/API verification |
+| Cloud resource inspection | `-C` / `NULLSEC_CLOUD_APPROVAL_FILE` | Exact approved resources also corroborated by discovery evidence; no upload/write tests |
+
+Scope never expands because a more intrusive class is enabled. Cloud files require exactly `provider:name`, with `s3`, `gcs`, or `azure`; unknown providers, missing/extra colons and empty/invalid names are errors. Surrounding whitespace and provider case are normalized; resource names must satisfy lowercase provider-specific syntax. This adapter supports S3 general-purpose bucket names, GCS bucket names, and Azure storage account names (3–24 lowercase alphanumeric characters). Unsupported legacy/special S3 resource forms are rejected. Empty cloud files approve nothing. Discovery evidence alone never authorizes provider requests.
+
+The script rechecks approved seeds at tool launch. This is not a general network sandbox: arbitrary Nuclei templates, tool plugins/configuration and verification providers need independent egress review. External crawlers, virtual-host fuzzing and browser screenshots remain deliberately disabled pending suitable adapters. No new exploitation behavior is introduced by these safety changes.
+
+Tool-specific limits and phase delays are not a shared/global traffic limiter. Phases 8–11 still have independent watchdogs and can overlap. A strict aggregate request budget remains unresolved; do not describe `-r` as providing one.
+
+### dnsx compatibility contract
+
+Compatibility targets are upstream dnsx v1.2.3 (manual `-wd`) and v1.3.0/v1.3.1 (automatic wildcard option), using default plain-text output. Runtime feature detection reads the complete successful help response before selecting a branch and requires recognizable list/output/silent flags. Failed or malformed help is an error. The offline fixtures cover these CLI shapes; real released binaries have not been executed by this change's tests. Older versions and modified output/configuration contracts are unsupported until independently verified. Wildcard counts are unavailable, and explicit host policies disable generated-name wildcard detection.
+
+### Offline regression tests
+
+Run from a full checkout (keep `lib/authorization.sh` alongside the script):
+
+```bash
+bash -n nullsec.sh
+bash -n lib/authorization.sh
+python3 -m unittest discover -s tests -v
+```
+
+The suite replaces all network/scanner executables with local stubs; it does not scan public targets. It covers scope, cloud parsing, resume fingerprints, authorization classes, launch boundaries, validation failures, stale feeds/JS, dnsx help branches, curl options and TruffleHog result labels. Python 3 and jq are required for these tests. An unprivileged reader tests permission denial when run as root with `runuser` available.
