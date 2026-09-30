@@ -139,9 +139,9 @@ in_scope() {
         {
             line=$0; gsub(/^[[:space:]]+|[[:space:]]+$/,"",line)
             if(line=="" || line ~ /[[:space:]]/) next
-            url=(line ~ /^https?:\/\//)
+            url=(tolower(line) ~ /^https?:\/\//)
             h=line
-            if(url) {sub(/^https?:\/\//,"",h); sub(/[\/?#].*$/,"",h)}
+            if(url) {sub(/^[^:]+:\/\//,"",h); sub(/[\/?#].*$/,"",h)}
             if(h ~ /@/ || h ~ /[\[\]]/) next
             if(h ~ /:/) {
                 if(!url || h !~ /:[0-9]+$/) next

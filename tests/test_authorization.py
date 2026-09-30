@@ -113,8 +113,8 @@ info() { :; }; warn() { :; }; error() { :; }; success() { :; }; print_phase() { 
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def test_scope_omitted_and_malformed_candidates(self):
-        result = self.run_shell("printf '%s\\n' example.com a.example.com evil.invalid bad..example.com https://a.example.com:443/x https://a.example.com:99999/x https://a.example.com@evil.invalid/x | in_scope")
-        self.assertEqual(result.stdout.splitlines(), ['example.com','a.example.com','https://a.example.com:443/x'])
+        result = self.run_shell("printf '%s\\n' example.com a.example.com evil.invalid bad..example.com https://a.example.com:443/x HTTPS://A.EXAMPLE.COM/x https://a.example.com:99999/x https://a.example.com@evil.invalid/x | in_scope")
+        self.assertEqual(result.stdout.splitlines(), ['example.com','a.example.com','https://a.example.com:443/x','HTTPS://A.EXAMPLE.COM/x'])
 
     def test_explicit_empty_rules_deny_all(self):
         for contents in ('', '\n  # only comments\n  \n'):
