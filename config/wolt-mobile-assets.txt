@@ -1,4 +1,0 @@
-com.wolt.courierapp
-com.wolt.android
-943905271
-1477299281
