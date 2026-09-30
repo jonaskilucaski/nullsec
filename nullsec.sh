@@ -1752,7 +1752,6 @@ phase2_5_cloud_enum() {
             esac
             _approved="$cdir/.approved-${_provider}.txt"
             awk -F: -v p="$_provider" '
-                BEGIN { IGNORECASE=1 }
                 /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
                 {
                     key=$1; sub(/^[[:space:]]+|[[:space:]]+$/, "", key)
@@ -1779,10 +1778,10 @@ phase2_5_cloud_enum() {
         if [ -s "$ownership_names" ]; then
             grep -Fvx -f "$ownership_names" "$candidates_file" 2>/dev/null \
                 | sed 's/$/  # NOT PROBED: no provider-specific target ownership evidence/' \
-                > "$unverified_candidates" || true
+                >> "$unverified_candidates" || true
         else
             sed 's/$/  # NOT PROBED: no provider-specific target ownership evidence/' \
-                "$candidates_file" > "$unverified_candidates"
+                "$candidates_file" >> "$unverified_candidates"
         fi
     fi
 
@@ -2402,13 +2401,17 @@ phase5_url_discovery() {
     # 304) and follow redirects to hashed filenames, so real assets aren't lost.
     if [ -s "$p5dir/all-js-files.txt" ]; then
         if check_command "httpx-toolkit"; then
-            httpx-toolkit -l "$p5dir/all-js-files.txt" \
+            if ! httpx-toolkit -l "$p5dir/all-js-files.txt" \
                 -silent -mc 200,304 \
                 -follow-host-redirects \
                 -random-agent \
                 -rl 50 \
-                -o "$p5dir/live-js-files.txt" 2>/dev/null
-            if [ ! -s "$p5dir/live-js-files.txt" ]; then
+                -o "$p5dir/live-js-files.txt" 2>/dev/null; then
+                warn "  JS liveness validation failed — candidates preserved separately and not downloaded."
+                cp "$p5dir/all-js-files.txt" "$p5dir/unvalidated-js-files.txt"
+                : > "$p5dir/live-js-files.txt"
+                phase_errors=$(( phase_errors + 1 ))
+            elif [ ! -s "$p5dir/live-js-files.txt" ]; then
                 info "  JS liveness returned 0; no candidates are promoted without validation."
             fi
         else
@@ -3340,7 +3343,7 @@ phase8_javascript_analysis() {
     p8_total=$(( p8_secrets + p8_aws + p8_privkeys ))
     if [ "$p8_total" -gt 0 ]; then
         notify "🔑 JS Secrets Found — Phase 8" \
-            "Secrets extracted from JavaScript files:\nTruffleHog verified: *${p8_secrets}*\nAWS keys: *${p8_aws}*\nPrivate keys: *${p8_privkeys}*\nDir: \`${p8dir}\`"
+            "Secrets extracted from JavaScript files:\nTruffleHog results: *${p8_secrets}*\nAWS keys: *${p8_aws}*\nPrivate keys: *${p8_privkeys}*\nDir: \`${p8dir}\`"
     fi
 
     return "$phase_status"
@@ -3545,7 +3548,11 @@ phase9_pattern_hunting() {
     # 9.7 CORS misconfiguration testing (improved over v1)
     # v1 only checked for evil.nullsec.com in ACAO, missed the critical ACAC: true + ACAO: * case
     # Distinguishes CORS-CRITICAL (reflected origin) from CORS-HIGH (* + credentials)
-    info "Testing CORS misconfigurations (up to $MAX_CORS_HOSTS hosts)..."
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ]; then
+        info "Testing CORS misconfigurations (up to $MAX_CORS_HOSTS hosts)..."
+    else
+        info "CORS active validation skipped — requires explicit -A authorization."
+    fi
     local cors_count=0
     local cors_failures=0
     # BUG-7 FIX: Track a sliding window of the last N attempts so the throttle
@@ -3633,7 +3640,11 @@ phase9_pattern_hunting() {
     [ "$cors_failures" -gt 0 ] && warn "CORS scan: $cors_failures/$cors_count requests failed (timeouts/resets)."
 
     # 9.8 Host Header Injection testing
-    info "Testing for Host Header Injection..."
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ]; then
+        info "Testing for Host Header Injection..."
+    else
+        info "Host-header active validation skipped — requires explicit -A authorization."
+    fi
     local hhi_count=0
     local hhi_failures=0
     # BUG-7 FIX: Sliding-window throttle detection (see CORS loop above).
@@ -4064,7 +4075,7 @@ CLOUD STORAGE:
   Total Exposed          : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/exposed/all-exposed-buckets.txt")
 
 JAVASCRIPT SECRETS:
-  TruffleHog Verified: $(count_lines "$OUTPUT_DIR/phase8-javascript/trufflehog-summary.txt")
+  TruffleHog Results : $(count_lines "$OUTPUT_DIR/phase8-javascript/trufflehog-summary.txt")
   AWS Access Keys    : $(count_lines "$OUTPUT_DIR/phase8-javascript/aws-access-keys.txt")
   Google API Keys    : $(count_lines "$OUTPUT_DIR/phase8-javascript/google-api-keys.txt")
   GitHub Tokens      : $(count_lines "$OUTPUT_DIR/phase8-javascript/github-tokens.txt")

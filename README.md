@@ -106,7 +106,7 @@ NullSec continues when optional tools are unavailable, but the related checks ar
 | dig | DNS ownership evidence collection |
 | cloud_enum | Detected but intentionally not used for ungated global-name mutation |
 | S3Scanner | Optional cloud tooling |
-| TruffleHog | Verified JavaScript secret detection; regex extraction still runs without it |
+| TruffleHog | Local JavaScript secret detection by default; live credential verification requires explicit `-V` authorization |
 
 ### Wordlists
 
@@ -258,12 +258,21 @@ Usage: ./nullsec.sh -d <target-domain> [options]
   -s            Skip the dependency check
   -u            Update Nuclei templates before scanning
   -r            Add polite delays between phases
+  -i <file>     Approved host scope (exact hosts or *.suffix patterns)
+  -x <file>     Excluded host scope (exact hosts or *.suffix patterns)
+  -C <file>     Approved cloud resources (provider:name; exact names only)
+  -A            Explicitly authorize active vulnerability validation/fuzzing
+  -V            Explicitly authorize TruffleHog credential verification
   -c <dir>      Resume from an existing NullSec output directory
   --version     Show NullSec version and author
   -h            Show help
 ```
 
 The target must be a plain DNS domain such as `example.com`. Do not pass a URL, path, wildcard, IP address, CIDR range, or labels with leading/trailing hyphens.
+
+For programs with narrower authorization boundaries, provide an explicit include file with `-i` and an exclusion file with `-x`. Scope files accept exact hostnames and leading-wildcard suffixes such as `*.api.example.com`; exclusions override inclusions. When `-i` is omitted, NullSec defaults to the target apex plus its subdomains.
+
+Active vulnerability confirmation and directory fuzzing are disabled unless `-A` is supplied. TruffleHog credential/API verification is disabled unless `-V` is supplied.
 
 `-o` and `-c` cannot be used together. A new `-o` directory must be empty. Resume mode verifies the stored target before continuing.
 
@@ -308,9 +317,17 @@ phase2-validation/takeover-findings.txt
 
 ### Phase 2.5 — Cloud storage enumeration
 
-Builds possible S3, Google Cloud Storage, and Azure names, but probes only names supported by provider-specific ownership evidence found in target-controlled DNS or web content.
+Builds possible S3, Google Cloud Storage, and Azure names and records provider-specific ownership evidence found in target-controlled DNS or web content.
 
-Uncorroborated global namespace guesses are stored as **not probed**. Public-write detection is based on anonymous ACL, policy, or IAM inspection rather than uploading a test object.
+**Cloud references are discovery evidence, not authorization.** Provider requests are disabled unless the operator supplies `-C <file>`. The approval file contains exact resources in `provider:name` form, for example:
+
+```text
+s3:example-assets
+gcs:example-public
+azure:examplestorage
+```
+
+Only names that are both corroborated by target-controlled evidence and present in this explicit approval file may be probed. Other candidates are retained as **not probed**. Public-write detection uses anonymous ACL, policy, or IAM inspection rather than uploading a test object.
 
 Primary outputs:
 
@@ -350,7 +367,9 @@ phase4-portscan/services-on-ports.txt
 
 ### Phase 5 — URL discovery and crawling
 
-Combines Katana, Hakrawler, Cariddi, Waybackurls, GAU, cloud URLs, and alternate-port services. The corpus is scope-filtered, deduplicated, parameter-collapsed, and checked for liveness.
+Combines Katana, Hakrawler, Cariddi, Waybackurls, GAU, explicitly approved cloud URLs, and alternate-port services. Katana is constrained to each seed FQDN, redirects used by HTTP validation are limited to the same host, and JavaScript downloads do not automatically follow redirects.
+
+The corpus is scope-filtered, deduplicated, parameter-collapsed, and checked for liveness. Scope or liveness failures are fail-closed: unvalidated candidates are retained separately instead of being promoted into trusted downstream inputs.
 
 NullSec keeps two important URL sets:
 
@@ -564,6 +583,28 @@ MAX_BUCKET_MUTATIONS=200
 ```
 
 Phase 8 through 11 also have wall-clock timeouts, while Dalfox, SQLMap, and ffuf have dedicated execution limits and candidate caps.
+
+### Authorization controls
+
+The safest way to run NullSec against a bug-bounty program is to encode the program boundary instead of relying on the target domain alone:
+
+```bash
+./nullsec.sh -d example.com -m normal \
+  -i approved-hosts.txt \
+  -x excluded-hosts.txt
+```
+
+Environment-variable equivalents are also available:
+
+```bash
+export NULLSEC_SCOPE_INCLUDE_FILE=approved-hosts.txt
+export NULLSEC_SCOPE_EXCLUDE_FILE=excluded-hosts.txt
+export NULLSEC_CLOUD_APPROVAL_FILE=approved-cloud.txt
+export NULLSEC_ALLOW_ACTIVE_VALIDATION=false
+export NULLSEC_ALLOW_SECRET_VERIFICATION=false
+```
+
+Use `-A` only when the program explicitly permits active vulnerability validation/fuzzing. Use `-V` only when you are explicitly authorized to test whether discovered credentials are valid against their provider APIs.
 
 ### Amass selection
 
