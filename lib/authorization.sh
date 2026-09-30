@@ -160,3 +160,120 @@ in_scope() {
     '
 }
 
+require_authorized_request() {
+    local accepted
+    accepted=$(printf '%s\n' "$1" | in_scope) || return 1
+    [ -n "$accepted" ] || { printf 'Request blocked by host authorization.\n' >&2; return 1; }
+}
+
+require_current_url_validation() {
+    local state="$OUTPUT_DIR/phase5-urls/validation-state.txt" expected
+    expected=$(authorization_fingerprint) || return 1
+    if [ ! -f "$state" ] || ! awk -F= -v expected="$expected" '
+        $1=="status" { statuses++; complete=($2=="complete") }
+        $1=="authorization" { hashes++; matching=($2==expected) }
+        END { exit !(statuses==1 && hashes==1 && complete && matching) }
+    ' "$state"; then
+        printf 'Current URL validation is incomplete or belongs to another policy.\n' >&2
+        return 1
+    fi
+}
+
+# Kept first so ~/.curlrc cannot inject URLs, proxies, credentials or redirects.
+# Final options also override any inherited invocation-level -L.
+curl() {
+    assert_authorization_policy || return 1
+    command curl --disable "$@" --no-location --proto '=http,https' --proto-redir '=http,https'
+}
+
+# Read help completely before matching it. Failed/unrecognized help is not
+# evidence that the legacy wildcard contract is safe to use.
+dnsx_wildcard_mode() {
+    local help rc
+    help=$(dnsx -h 2>&1); rc=$?
+    [ "$rc" -eq 0 ] || { printf 'dnsx help failed (status %s)\n' "$rc" >&2; return 1; }
+    if ! [[ "$help" =~ (^|[[:space:],])-l([[:space:],]|$) &&
+            "$help" =~ (^|[[:space:],])-o([[:space:],]|$) &&
+            "$help" =~ (^|[[:space:],])-silent([[:space:],]|$) ]]; then
+        printf 'Incomplete dnsx help contract\n' >&2
+        return 1
+    fi
+    if [[ "$help" =~ (^|[[:space:],])-auto-wildcard([[:space:],]|$) ]]; then
+        printf 'auto\n'
+    elif [[ "$help" =~ (^|[[:space:],])-wd([[:space:],]|$) &&
+            "$help" =~ (^|[[:space:],])-wildcard-domain([[:space:],]|$) ]]; then
+        printf 'manual\n'
+    else
+        printf 'Unrecognized dnsx wildcard CLI contract\n' >&2
+        return 1
+    fi
+}
+
+# Scope is re-applied at tool launch, including resumed/cached list inputs.
+# This guards seeds; tool-internal template/browser egress needs its own adapter.
+run_scoped_tool() {
+    local category="$1" tool="$2"; shift 2
+    local flag file scoped tmp="" url="" same_host=false rc
+    local -a args=()
+    assert_authorization_policy || return 1
+    case "$category" in
+        enumeration) [ "$ALLOW_ACTIVE_ENUMERATION" = true ] || return 1 ;;
+        validation) [ "$ALLOW_ACTIVE_VALIDATION" = true ] || return 1 ;;
+        baseline) ;;
+        *) return 1 ;;
+    esac
+    while [ "$#" -gt 0 ]; do
+        flag="$1"; shift
+        case "$flag" in
+            -l|-list|-m)
+                [ "$#" -gt 0 ] || { [ -z "$tmp" ] || rm -f "$tmp"; return 1; }
+                file="$1"; shift
+                scoped=$(in_scope < "$file") || { [ -z "$tmp" ] || rm -f "$tmp"; return 1; }
+                if [ -z "$scoped" ]; then
+                    [ -z "$tmp" ] || rm -f "$tmp"
+                    return 0
+                fi
+                [ -z "$tmp" ] || { rm -f "$tmp"; return 1; }
+                tmp=$(mktemp "${OUTPUT_DIR:-${TMPDIR:-/tmp}}/.authorized-input.XXXXXX") || return 1
+                printf '%s\n' "$scoped" > "$tmp" || { rm -f "$tmp"; return 1; }
+                args+=("$flag" "$tmp")
+                ;;
+            -u)
+                [ "$#" -gt 0 ] || { [ -z "$tmp" ] || rm -f "$tmp"; return 1; }
+                url="$1"; shift
+                require_authorized_request "$url" || { [ -z "$tmp" ] || rm -f "$tmp"; return 1; }
+                args+=("$flag" "$url")
+                ;;
+            -follow-host-redirects|-fhr) same_host=true; args+=("$flag") ;;
+            *) args+=("$flag") ;;
+        esac
+    done
+    case "$tool" in
+        httpx-toolkit) args+=(-fr=false "-fhr=$same_host") ;;
+        ffuf) args+=(-r=false -recursion=false) ;;
+        arjun) args+=(--disable-redirects) ;;
+        sqlmap) args+=(--ignore-redirects) ;;
+    esac
+    case "$tool" in
+        ffuf) command timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" "$tool" "${args[@]}" ;;
+        sqlmap) command timeout --kill-after=30 "$SQLMAP_TIMEOUT" "$tool" "${args[@]}" ;;
+        *) command "$tool" "${args[@]}" ;;
+    esac
+    rc=$?
+    [ -z "$tmp" ] || rm -f "$tmp"
+    return "$rc"
+}
+
+httpx-toolkit() { run_scoped_tool baseline httpx-toolkit "$@"; }
+naabu() { run_scoped_tool enumeration naabu "$@"; }
+arjun() { run_scoped_tool enumeration arjun "$@"; }
+ffuf() { run_scoped_tool enumeration ffuf "$@"; }
+sqlmap() { run_scoped_tool validation sqlmap "$@"; }
+nuclei() { run_scoped_tool validation nuclei "$@"; }
+dalfox() {
+    local scoped
+    [ "$ALLOW_ACTIVE_VALIDATION" = true ] || return 1
+    scoped=$(in_scope) || return 1
+    [ -n "$scoped" ] || return 0
+    printf '%s\n' "$scoped" | command timeout --kill-after=30 "$DALFOX_TIMEOUT" dalfox "$@"
+}

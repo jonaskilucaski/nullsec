@@ -367,11 +367,11 @@ _nullsec_cleanup() {
               "${OUTPUT_DIR}/phase2.5-cloud/.candidates.txt" \
               "${OUTPUT_DIR}/phase5-urls/.urls-scoped.txt" \
               "${OUTPUT_DIR}/phase5-urls/.urls-collapsed.txt" \
-              "${OUTPUT_DIR}"/.parallel-start.* 2>/dev/null
+              "${OUTPUT_DIR}"/.parallel-start.* "${OUTPUT_DIR}"/.authorized-input.* 2>/dev/null
         rm -rf "${OUTPUT_DIR}/asset-scoring/.tmp" \
                "${OUTPUT_DIR}/asset-scoring/.host-universe.txt" 2>/dev/null
 
-        finalize_all_output_backups true 2>/dev/null || true
+        finalize_all_output_backups false 2>/dev/null || true
     fi
 
     warn "Cleanup complete. Re-run with -c '$OUTPUT_DIR' to resume from the last checkpoint."
@@ -431,7 +431,7 @@ warn()    { echo -e "${YELLOW}[$(date +%H:%M)][WARNING]${NC} $1"; }
 error()   { echo -e "${RED}[$(date +%H:%M)][ERROR]${NC} $1"; }
 
 check_command() {
-    command -v "$1" &>/dev/null
+    type -P "$1" &>/dev/null
 }
 
 # Safe line count — handles missing or empty files gracefully
@@ -882,6 +882,8 @@ apply_scan_mode() {
     esac
 
     # Vulnerability confirmation/fuzzing is never enabled solely by scan mode.
+    # Browser subresources lack complete request-policy enforcement.
+    RUN_SCREENSHOTS=false
     # Enumeration and vulnerability validation have separate opt-ins.
     if [ "$ALLOW_ACTIVE_ENUMERATION" != true ]; then
         RUN_DNS_BRUTEFORCE=false
@@ -912,7 +914,8 @@ check_tools() {
     # needs it. Optional validators/crawlers remain optional and are reported
     # without blocking the scan.
     local required_tools=("subfinder" "assetfinder" "dnsx" "httpx-toolkit"
-        "katana" "waybackurls" "gau" "unfurl" "nuclei" "jq" "curl")
+        "waybackurls" "gau" "unfurl" "jq" "curl" "awk" "sort" "sha256sum")
+    [ "$ALLOW_ACTIVE_VALIDATION" != true ] || required_tools+=("nuclei")
 
     if [ "$RUN_DNS_BRUTEFORCE" = true ] || [ "$RUN_PERMUTATIONS" = true ]; then
         required_tools+=("puredns")
@@ -923,7 +926,7 @@ check_tools() {
     if [ "$RUN_PARAM_DISCOVERY" = true ]; then
         required_tools+=("arjun")
     fi
-    if [ "$RUN_VHOST_DISCOVERY" = true ] || [ "$RUN_FUZZING" = true ]; then
+    if [ "$RUN_FUZZING" = true ]; then
         required_tools+=("ffuf")
     fi
 
@@ -951,7 +954,9 @@ check_tools() {
     if check_command "$AMASS_V4_BIN"; then
         amass_v4_version=$("$AMASS_V4_BIN" -version 2>&1 | head -n 1 || true)
     fi
-    if [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_v4_version" == v4.* ]]; then
+    if [ "$ALLOW_ACTIVE_ENUMERATION" != true ] || [ -n "$SCOPE_INCLUDE_FILE$SCOPE_EXCLUDE_FILE" ]; then
+        echo "  Amass not required: active discovery is disabled for this policy."
+    elif [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_v4_version" == v4.* ]]; then
         echo -e "  ${GREEN}✓${NC} $AMASS_V4_BIN ($amass_v4_version; preferred colored graph engine)"
     elif check_command "amass"; then
         echo -e "  ${YELLOW}✓${NC} amass (fallback; usable Amass v4 binary not selected)"
@@ -1065,7 +1070,7 @@ usage() {
     echo "  -m <mode>         Scan mode: fast | normal | deep  (default: normal)"
     echo "  -s                Skip tool checking"
     echo "  -u                Update Nuclei templates before scanning"
-    echo "  -r                Enable rate limiting / polite delays between phases"
+    echo "  -r                Add polite phase delays (not an aggregate traffic limiter)"
     echo "  -i <file>         Approved host scope (exact hosts or *.suffix patterns)"
     echo "  -x <file>         Excluded host scope (exact hosts or *.suffix patterns)"
     echo "  -C <file>         Approved cloud resources (provider:name; exact names only)"
@@ -1081,22 +1086,18 @@ usage() {
     echo "  NullSec prefers 'amass-v4' for colored FQDN/IP/DNS relationship output"
     echo "  and falls back to 'amass'. Set AMASS_PREFER_V4=false to force fallback."
     echo ""
-    echo "Scan Modes:"
-    echo "  fast    Passive subdomain sources only, critical Nuclei, no bruteforce/fuzzing"
-    echo "          Skips: DNS bruteforce, port scan, JS analysis, fuzzing, active confirm"
-    echo "          Runtime: ~5-15 min  |  Good for: hourly scheduled runs"
-    echo ""
-    echo "  normal  Full discovery + JS analysis + pattern hunting, no heavy active steps"
-    echo "          Skips: permutations, Arjun, directory fuzzing, active confirmation"
-    echo "          Runtime: ~30-60 min  |  Good for: daily scheduled runs"
-    echo ""
-    echo "  deep    Full 12-phase pipeline — everything enabled, all caps raised"
-    echo "          Runtime: 1-4+ hours  |  Good for: weekly runs, new target onboarding"
+    echo "Scan Modes (authorization is independent of mode):"
+    echo "  fast    Passive sources and scoped DNS/HTTP discovery; Nuclei requires -A"
+    echo "  normal  Adds JS analysis and local classification; enumeration requires -E"
+    echo "  deep    Adds mode-permitted enumeration (-E) and confirmation (-A)"
+    echo "  -V independently authorizes credential verification. Environment equivalents exist."
+    echo "  Crawlers, vhost discovery and browser screenshots are paused pending egress enforcement."
+    echo "  Resume requires identical target, mode and normalized authorization policy."
     echo ""
     echo "Examples:"
     echo "  $0 -d example.com"
     echo "  $0 -d example.com -m fast"
-    echo "  $0 -d example.com -m deep -u -r"
+    echo "  $0 -d example.com -m deep -r"
     echo "  $0 -d example.com -m normal -i approved.txt -x excluded.txt"
     echo "  $0 -d example.com -m deep -A -C approved-cloud.txt"
     echo "  $0 -d example.com -m normal -o /path/to/output"
@@ -1192,7 +1193,11 @@ phase1_subdomain_discovery() {
         amass_version=$("$AMASS_V4_BIN" -version 2>&1 | head -n 1 || true)
     fi
 
-    if [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_version" == v4.* ]]; then
+    if [ "$ALLOW_ACTIVE_ENUMERATION" != true ] || [ -n "$SCOPE_INCLUDE_FILE$SCOPE_EXCLUDE_FILE" ]; then
+        info "Amass active modes skipped: require -E and cannot enforce explicit host rules before discovery."
+        : > "$amass_clean"
+        rc=0
+    elif [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_version" == v4.* ]]; then
         _nullsec_run_amass_v4 "$(command -v "$AMASS_V4_BIN")"
 
     elif check_command "amass"; then
@@ -1326,26 +1331,8 @@ phase1_subdomain_discovery() {
     fi
     success "Unique passive subdomains: $(count_lines "$p1dir/all-subdomains-passive.txt")"
 
-    if check_command "hakrawler" && [ -s "$p1dir/all-subdomains-passive.txt" ]; then
-        info "Running Hakrawler for response-based subdomain discovery..."
-        local target_escaped hakrawler_raw
-        target_escaped=$(printf '%s' "$TARGET" | sed 's/\./\\./g')
-        hakrawler_raw="$p1dir/.hakrawler-raw.tmp.$$"
-        if sed 's|^|https://|' "$p1dir/all-subdomains-passive.txt" \
-            | httpx-toolkit -silent 2>/dev/null \
-            | hakrawler -subs -d 2 -timeout 10 -u 2>/dev/null > "$hakrawler_raw"; then
-            grep -oE "[a-zA-Z0-9._-]+\.$target_escaped" "$hakrawler_raw" 2>/dev/null \
-                | sort -u > "$p1dir/hakrawler.txt" || : > "$p1dir/hakrawler.txt"
-        else
-            warn "Hakrawler pipeline failed."
-            : > "$p1dir/hakrawler.txt"
-            phase_errors=$(( phase_errors + 1 ))
-        fi
-        rm -f "$hakrawler_raw"
-        success "Hakrawler: $(count_lines "$p1dir/hakrawler.txt") subdomains"
-    else
-        : > "$p1dir/hakrawler.txt"
-    fi
+    : > "$p1dir/hakrawler.txt"
+    info "Hakrawler discovery disabled: its request scope does not enforce the complete authorization policy."
 
     if [ "$RUN_DNS_BRUTEFORCE" = true ]; then
         if [ -s "$DNS_WORDLIST" ] && [ -r "$DNS_WORDLIST" ] && [ -s "$RESOLVERS" ] && [ -r "$RESOLVERS" ]; then
@@ -1461,19 +1448,40 @@ phase2_validation() {
     # single-domain wildcard mode with TARGET. Downstream logic only requires
     # the resolved hostname in field 1, so the manual-mode fallback remains
     # compatible even though dnsx ignores record-display flags with -wd.
-    local -a dnsx_args=(-l "$p1dir/all-subdomains.txt" -r "$resolvers_file"
+    local dns_input="$p2dir/scoped-dns-candidates.txt" wildcard_mode
+    if ! in_scope < "$p1dir/all-subdomains.txt" > "$dns_input"; then
+        : > "$dns_input"
+        return 1
+    fi
+    if [ ! -s "$dns_input" ]; then
+        info "No approved DNS candidates; no resolver requests will be sent."
+        save_checkpoint 2
+        return 0
+    fi
+    wildcard_mode=$(dnsx_wildcard_mode) || return 1
+    if [ -n "$SCOPE_INCLUDE_FILE$SCOPE_EXCLUDE_FILE" ]; then
+        # Wildcard detection synthesizes additional DNS names. Resolve only the
+        # explicitly scoped candidates when the operator supplied host rules.
+        wildcard_mode=none
+    fi
+    local -a dnsx_args=(-l "$dns_input" -r "$resolvers_file"
         -o "$p2dir/resolved.txt" -silent -rl 100)
-    if dnsx -h 2>&1 | grep -q -- '-auto-wildcard'; then
+    if [ "$wildcard_mode" = auto ]; then
         dnsx_args+=(-auto-wildcard -a -resp)
         info "dnsx wildcard handling: automatic filtering"
-    else
+    elif [ "$wildcard_mode" = manual ]; then
         dnsx_args+=(-wd "$TARGET")
         info "dnsx wildcard handling: manual filtering for $TARGET"
+    else
+        dnsx_args+=(-a -resp)
+        info "dnsx wildcard filtering disabled: explicit host rules prohibit generated-name queries."
     fi
 
     if ! dnsx "${dnsx_args[@]}" 2>"$p2dir/dnsx-error.log"; then
-        warn "dnsx failed; see $p2dir/dnsx-error.log. Partial output was preserved."
-        phase_errors=$(( phase_errors + 1 ))
+        warn "dnsx failed; partial output preserved as unvalidated DNS evidence."
+        cp "$p2dir/resolved.txt" "$p2dir/unvalidated-dns.txt" || return 1
+        : > "$p2dir/resolved.txt"
+        return 1
     fi
 
     # 2.2 Extract clean subdomain list. dnsx output begins with the hostname.
@@ -1487,7 +1495,8 @@ phase2_validation() {
 
     info "Total enumerated  : $total_enum"
     info "Actually resolved : $valid"
-    info "Wildcard filtering: handled internally by dnsx (filtered names are not emitted separately)"
+    printf '%s\n' "$wildcard_mode" > "$p2dir/wildcard-mode.txt" || return 1
+    info "Wildcard mode: $wildcard_mode (filtered names are not counted separately)"
 
     if [ "$valid" -eq 0 ]; then
         warn "Phase 2 produced 0 valid subdomains. Later web phases will be skipped or empty."
@@ -1495,7 +1504,7 @@ phase2_validation() {
 
     # 2.3 Subdomain takeover scanning
     : > "$p2dir/takeover-findings.txt"
-    if [ -s "$p2dir/valid-subdomains.txt" ]; then
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && [ -s "$p2dir/valid-subdomains.txt" ]; then
         if [ -d "$NUCLEI_TEMPLATES/http/takeovers" ] || [ -d "$NUCLEI_TEMPLATES/http/takeovers/" ]; then
             info "Scanning for subdomain takeover vulnerabilities..."
             if ! nuclei -l "$p2dir/valid-subdomains.txt" \
@@ -1631,6 +1640,7 @@ phase2_5_cloud_enum() {
 
     if check_command "dig" && [ -s "$p2dir/valid-subdomains.txt" ]; then
         while IFS= read -r host; do
+            require_authorized_request "$host" || return 1
             while IFS= read -r cname; do
                 [ -n "$cname" ] && printf 'DNS %s CNAME %s\n' "$host" "$cname" >> "$ownership_evidence"
             done < <(dig +short CNAME "$host" 2>/dev/null | sed 's/\.$//')
@@ -1640,7 +1650,8 @@ phase2_5_cloud_enum() {
     {
         printf '%s\n' "$TARGET"
         [ -s "$p2dir/valid-subdomains.txt" ] && head -20 "$p2dir/valid-subdomains.txt"
-    } | sort -u | while IFS= read -r host; do
+    } | sort -u | in_scope | while IFS= read -r host; do
+        require_authorized_request "$host" || return 1
         local body="" scheme
         for scheme in https http; do
             body=$(curl -fsS --max-time 8 --max-filesize 1048576 \
@@ -1698,24 +1709,16 @@ phase2_5_cloud_enum() {
                 azure) _candidate="$azure_candidates" ;;
             esac
             _approved="$cdir/.approved-${_provider}.txt"
-            awk -F: -v p="$_provider" '
-                /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-                {
-                    key=$1; sub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-                    if (tolower(key) != p) next
-                    sub(/^[^:]*:/, "")
-                    sub(/[[:space:]]*#.*/, "")
-                    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-                    print tolower($0)
-                }
-            ' "$CLOUD_APPROVAL_FILE" | sort -u > "$_approved"
+            local _cloud_rules
+            _cloud_rules=$(normalize_authorization_file cloud "$CLOUD_APPROVAL_FILE") || return 1
+            printf '%s\n' "$_cloud_rules" | awk -F: -v p="$_provider" '$1==p {print $2}' > "$_approved" || return 1
             if [ -s "$_candidate" ]; then
                 grep -Fxf "$_approved" "$_candidate" > "${_candidate}.approved" 2>/dev/null || true
                 grep -Fvx -f "$_approved" "$_candidate" 2>/dev/null \
                     | sed "s/^/${_provider}:/" \
                     | sed 's/$/  # NOT PROBED: not present in explicit cloud approval file/' \
                     >> "$unverified_candidates" || true
-                mv -f "${_candidate}.approved" "$_candidate"
+                mv -f "${_candidate}.approved" "$_candidate" || return 1
             fi
             rm -f "$_approved"
         done
@@ -1753,6 +1756,13 @@ phase2_5_cloud_enum() {
     : > "$s3_exists"; : > "$s3_readable"; : > "$s3_writable"
     : > "$gcs_exists"; : > "$gcs_readable"; : > "$gcs_writable"; : > "$gcs_unverified"
     : > "$az_exists"; : > "$az_readable"; : > "$az_cdn_refs"; : > "$cloud_enum_open"
+
+    # Worker shells inherit the same fail-closed curl policy and immutable
+    # startup fingerprint; exporting only the bucket helper would bypass it.
+    assert_authorization_policy || return 1
+    export TARGET SCOPE_INCLUDE_FILE SCOPE_EXCLUDE_FILE CLOUD_APPROVAL_FILE
+    export ALLOW_ACTIVE_ENUMERATION ALLOW_ACTIVE_VALIDATION ALLOW_SECRET_VERIFICATION AUTHORIZATION_FINGERPRINT
+    export -f normalize_authorization_file authorization_manifest authorization_fingerprint assert_authorization_policy curl
 
     if [ "$s3_verified_count" -gt 0 ]; then
         info "Testing ownership-corroborated AWS S3 buckets..."
@@ -1913,6 +1923,7 @@ phase2_5_cloud_enum() {
     fi
 
     rm -f "$token_file" "$candidates_file" "$s3_candidates" "$gcs_candidates" "$azure_candidates"
+    assert_authorization_policy || return 1
     merge_phase_backup "$cdir"
     success "Phase 2.5 complete!"
     polite_sleep
@@ -1974,55 +1985,8 @@ phase3_probing() {
 
     : > "$p3dir/discovered-vhosts.txt"
     : > "$p3dir/vhost-findings.txt"
-    if [ "$RUN_VHOST_DISCOVERY" = true ] && check_command "ffuf" && check_command "dig" \
-       && [ -s "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" ] \
-       && [ -r "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" ]; then
-        info "Running virtual host discovery via Host header injection (top 5 live hosts)..."
-        local vhost_count=0 vhost_ffuf_log="$p3dir/.vhost-ffuf-errors.log"
-        : > "$vhost_ffuf_log"
-        while IFS= read -r host && [ "$vhost_count" -lt 5 ]; do
-            local safe_name scheme hostname target_ip output_json ffuf_rc
-            safe_name=$(safe_artifact_name "$host")
-            scheme=$(printf '%s' "$host" | grep -oE '^https?' || true)
-            hostname=$(printf '%s' "$host" | sed -E 's|https?://||; s|/.*||; s|:[0-9]+$||')
-            target_ip=$(dig +short "$hostname" A 2>/dev/null \
-                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-            if [ -z "$target_ip" ] || [ -z "$scheme" ]; then
-                warn "  Could not resolve or parse $host — skipping vhost scan."
-                vhost_count=$(( vhost_count + 1 ))
-                continue
-            fi
-
-            output_json="$OUTPUT_DIR/phase11-fuzzing/vhosts/vhost-$safe_name.json"
-            info "  Vhost fuzzing: $hostname ($target_ip)"
-            timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
-                ffuf -u "${scheme}://${target_ip}/" -H "Host: FUZZ.$TARGET" \
-                -w "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" \
-                -mc 200,301,302,401,403 -t "$FFUF_THREADS" -rate 50 \
-                -o "$output_json" -of json -fs 0 -ac -s \
-                >/dev/null 2>>"$vhost_ffuf_log"
-            ffuf_rc=$?
-            if [ "$ffuf_rc" -eq 124 ] || [ "$ffuf_rc" -eq 137 ]; then
-                warn "  Vhost ffuf timed out for $hostname; partial JSON was preserved."
-                phase_errors=$(( phase_errors + 1 ))
-            elif [ "$ffuf_rc" -ne 0 ]; then
-                warn "  Vhost ffuf failed for $hostname with code $ffuf_rc."
-                phase_errors=$(( phase_errors + 1 ))
-            fi
-
-            if [ -s "$output_json" ]; then
-                jq -r '.results[]?.input.FUZZ // empty' "$output_json" 2>/dev/null \
-                    | sed "s/$/.$TARGET/" | in_scope >> "$p3dir/discovered-vhosts.txt" || true
-                jq -r --arg scheme "$scheme" --arg ip "$target_ip" --arg target "$TARGET" \
-                    '.results[]? | select(.input.FUZZ != null) | "\($scheme)://\($ip)/  Host: \(.input.FUZZ).\($target)  Status: \(.status)  Length: \(.length)"' \
-                    "$output_json" 2>/dev/null >> "$p3dir/vhost-findings.txt" || true
-            fi
-            vhost_count=$(( vhost_count + 1 ))
-        done < "$p3dir/status-200.txt"
-        sort -u -o "$p3dir/discovered-vhosts.txt" "$p3dir/discovered-vhosts.txt"
-        sort -u -o "$p3dir/vhost-findings.txt" "$p3dir/vhost-findings.txt"
-        success "Virtual host discovery complete: $(count_lines "$p3dir/discovered-vhosts.txt") candidate vhost(s)"
-        [ -s "$vhost_ffuf_log" ] && info "vhost ffuf stderr preserved at: $vhost_ffuf_log"
+    if [ "$RUN_VHOST_DISCOVERY" = true ]; then
+        info "Virtual-host fuzzing disabled: direct-IP/generated Host requests need a verified request-boundary adapter."
     fi
 
     merge_phase_backup "$p3dir"
@@ -2140,47 +2104,18 @@ phase5_url_discovery() {
     : > "$p5dir/all-urls.txt"
     : > "$p5dir/all-urls-injectable.txt"
     : > "$p5dir/unvalidated-js-files.txt"
+    : > "$p5dir/unvalidated-urls.txt"
+    : > "$p5dir/live-js-files.txt"
+    : > "$p5dir/validation-state.txt"
+    local _gf_pattern
+    for _gf_pattern in ssrf redirect xss sqli lfi idor; do
+        : > "$p5dir/gf-${_gf_pattern}.txt"
+    done
 
-    # 5.1 Active crawling with Katana (JS-aware, finds modern SPA endpoints)
-    if [ -s "$p3dir/live-hosts.txt" ]; then
-        info "Crawling with Katana (depth 3, JS-aware)..."
-        if ! katana -list "$p3dir/live-hosts.txt" \
-            -depth "$KATANA_DEPTH" \
-            -js-crawl \
-            -known-files all \
-            -fs fqdn \
-            -silent \
-            -rl 50 \
-            -o "$p5dir/katana-urls.txt" 2>"$p5dir/katana-error.log"; then
-            warn "Katana failed; see $p5dir/katana-error.log. Partial output was preserved."
-            phase_errors=$(( phase_errors + 1 ))
-        fi
-        success "Katana: $(count_lines "$p5dir/katana-urls.txt") URLs"
-    else
-        touch "$p5dir/katana-urls.txt"
-    fi
-
-    # 5.2 Hakrawler — lightweight spider for additional coverage
-    if check_command "hakrawler" && [ -s "$p3dir/live-hosts.txt" ]; then
-        info "Running Hakrawler..."
-        cat "$p3dir/live-hosts.txt" \
-            | hakrawler -d 2 -timeout 10 -u 2>/dev/null \
-            > "$p5dir/hakrawler-urls.txt"
-        success "Hakrawler: $(count_lines "$p5dir/hakrawler-urls.txt") URLs"
-    else
-        touch "$p5dir/hakrawler-urls.txt"
-    fi
-
-    # 5.3 Cariddi — full crawler with built-in secrets/endpoint detection
-    if check_command "cariddi" && [ -s "$p3dir/live-hosts.txt" ]; then
-        info "Running Cariddi (secrets + endpoint mode)..."
-        cat "$p3dir/live-hosts.txt" \
-            | cariddi -s -e -intensive 1 \
-            > "$p5dir/cariddi-urls.txt" 2>/dev/null
-        success "Cariddi: $(count_lines "$p5dir/cariddi-urls.txt") items"
-    else
-        touch "$p5dir/cariddi-urls.txt"
-    fi
+    # FQDN/output filters do not prove request-boundary enforcement. Keep
+    # external crawler paths disabled until their full egress behavior is bound
+    # to this policy; passive URL sources and scoped liveness remain available.
+    info "Katana, Hakrawler and Cariddi disabled: complete request-policy enforcement is not established."
 
     # 5.4 Historical URL mining — Waybackurls
     if [ -s "$p3dir/live-hosts.txt" ]; then
@@ -2216,13 +2151,11 @@ phase5_url_discovery() {
     # permutations — so the raw set is mostly noise.  We refine it in 5.6b before
     # anything downstream (categorisation, params, gf, vuln phases) consumes it.
     info "Merging and deduplicating all URL sources..."
-    local cloud_p5_feed="$OUTPUT_DIR/phase2.5-cloud/exposed/cloud-urls-for-phase5.txt"
     cat "$p5dir/katana-urls.txt" \
         "$p5dir/hakrawler-urls.txt" \
         "$p5dir/cariddi-urls.txt" \
         "$p5dir/wayback-urls.txt" \
         "$p5dir/gau-urls.txt" \
-        "${cloud_p5_feed:-/dev/null}" \
         2>/dev/null | sort -u > "$p5dir/all-urls-raw.txt"
     local raw_count
     raw_count=$(count_lines "$p5dir/all-urls-raw.txt")
@@ -2236,22 +2169,9 @@ phase5_url_discovery() {
     #                                    For categorisation, parameter mining,
     #                                    reporting, screenshots.  Low noise.
     #
-    #   all-urls-injectable.txt (FULL)   scoped → parametered-only.  NOT collapsed,
-    #                                    NOT liveness-filtered.  Every distinct
-    #                                    param=value pair is preserved because
-    #                                    injection testing (gf, sqlmap, dalfox,
-    #                                    IDOR) needs concrete distinct values and
-    #                                    must see endpoints whose BASELINE status
-    #                                    is 404/500/etc (those are often the most
-    #                                    injectable).  Collapsing or liveness-
-    #                                    gating this set is what starved SQLi/XSS.
-    #
-    # Rationale for the split: param-collapse and a fixed liveness whitelist are
-    # correct for building a tidy endpoint inventory, but actively harmful for
-    # vuln testing — ?id=1/?id=2/?id=947 collapse to one URL, and an endpoint
-    # that 500s on a probe gets dropped though it is a prime SQLi target.  We
-    # therefore optimise each corpus for its job instead of forcing one to serve
-    # both.
+    #   scoped-injectable-candidates.txt retains all scoped parameter values.
+    #   all-urls-injectable.txt is the separately liveness-validated subset.
+    #   Empty/failed validation never promotes candidate evidence.
     info "Refining URL corpus (scope → dedup → liveness; + full injectable set)..."
 
     # Stage 1 — SCOPE (shared by both corpora). Scope failure is fail-closed:
@@ -2266,7 +2186,7 @@ phase5_url_discovery() {
 
     # ── FULL injectable corpus: every scoped URL that carries a query parameter,
     #    de-duplicated EXACTLY (not by signature) so distinct values survive.
-    #    This is the source of truth for Phase 9 injection tools and Phase 8 JS.
+    #    Preserve candidate evidence, then validate separately before Phase 9.
     local injectable="$p5dir/all-urls-injectable.txt"
     grep -E '\?[^[:space:]]*=' "$scoped" 2>/dev/null | sort -u > "$injectable" || touch "$injectable"
     info "  Injectable corpus (parametered, full-value): $(count_lines "$injectable") URLs"
@@ -2311,11 +2231,28 @@ phase5_url_discovery() {
         : > "$clean"
     fi
 
-    # Re-attach the cloud bucket feed (scope-exempt) to the CLEAN corpus only.
-    if [ -n "${cloud_p5_feed:-}" ] && [ -s "$cloud_p5_feed" ]; then
-        cat "$cloud_p5_feed" >> "$clean"
-    fi
+    # Cloud evidence is report-only. Retained provider feeds are never scan input.
     sort -u -o "$clean" "$clean"
+
+    cp "$injectable" "$p5dir/scoped-injectable-candidates.txt" || return 1
+    : > "$injectable"
+    if [ "$phase_errors" -eq 0 ] && [ -s "$p5dir/scoped-injectable-candidates.txt" ]; then
+        if check_command "httpx-toolkit" && httpx-toolkit \
+            -l "$p5dir/scoped-injectable-candidates.txt" -silent \
+            -mc 200,201,202,204,301,302,307,308,401,403,405,500 -rl 50 \
+            -o "$injectable" 2>/dev/null; then
+            local injectable_scoped="$p5dir/.injectable-current.txt"
+            if ! in_scope < "$injectable" | sort -u > "$injectable_scoped"; then
+                : > "$injectable"
+                return 1
+            fi
+            mv -f "$injectable_scoped" "$injectable" || return 1
+        else
+            : > "$injectable"
+            phase_errors=$(( phase_errors + 1 ))
+        fi
+    fi
+    printf 'clean=%s\ninjectable=%s\n' "$(count_lines "$clean")" "$(count_lines "$injectable")" > "$p5dir/validation-state.txt"
 
     success "Refined URL corpus: $(count_lines "$clean") clean endpoints / $(count_lines "$injectable") injectable URLs (from $raw_count raw)"
 
@@ -2362,7 +2299,8 @@ phase5_url_discovery() {
                 : > "$p5dir/live-js-files.txt"
                 phase_errors=$(( phase_errors + 1 ))
             elif [ ! -s "$p5dir/live-js-files.txt" ]; then
-                info "  JS liveness returned 0; no candidates are promoted without validation."
+                cp "$p5dir/all-js-files.txt" "$p5dir/unvalidated-js-files.txt" || return 1
+                info "  JS liveness returned 0; candidates remain evidence only."
             fi
         else
             warn "  httpx-toolkit unavailable — JS candidates preserved separately and not downloaded."
@@ -2372,7 +2310,7 @@ phase5_url_discovery() {
         fi
         success "Live JS files: $(count_lines "$p5dir/live-js-files.txt")"
     else
-        touch "$p5dir/live-js-files.txt"
+        : > "$p5dir/live-js-files.txt"
         info "No .js URLs discovered in corpus."
     fi
 
@@ -2410,6 +2348,10 @@ phase5_url_discovery() {
         warn "Phase 5 completed with $phase_errors error(s); checkpoint was not advanced."
         return 1
     fi
+    local validated_policy
+    assert_authorization_policy || return 1
+    validated_policy=$(authorization_fingerprint) || return 1
+    printf 'status=complete\nauthorization=%s\n' "$validated_policy" >> "$p5dir/validation-state.txt" || return 1
     save_checkpoint 5
     polite_sleep
     return 0
@@ -2452,8 +2394,9 @@ phase6_parameters() {
         info "Running Arjun on up to $MAX_ARJUN_HOSTS hosts..."
         local count=0
         while IFS= read -r url && [ "$count" -lt "$MAX_ARJUN_HOSTS" ]; do
+        require_authorized_request "$url" || return 1
             info "  Arjun → $url"
-            if ! arjun -u "$url" \
+            if ! arjun -u "$url" --disable-redirects \
                 -t "$ARJUN_THREADS" \
                 -oT "$p6dir/arjun-params-$count.txt" \
                 -d 500 2>>"$p6dir/arjun-error.log"; then
@@ -2792,6 +2735,11 @@ phase7_vulnerability_scanning() {
     assert_authorization_policy || return 1
     phase_done 7 && { polite_sleep; return; }
     print_phase "🛡️  PHASE 7: VULNERABILITY SCANNING (NUCLEI)"
+    if [ "$ALLOW_ACTIVE_VALIDATION" != true ]; then
+        info "Nuclei vulnerability scanning skipped: requires -A."
+        save_checkpoint 7
+        return 0
+    fi
 
     local p7dir="$OUTPUT_DIR/phase7-vulns"
     local p3dir="$OUTPUT_DIR/phase3-probing"
@@ -3163,6 +3111,7 @@ phase8_javascript_analysis() {
     fi
 
     local p5dir="$OUTPUT_DIR/phase5-urls"
+    require_current_url_validation || return 1
     local p8dir="$OUTPUT_DIR/phase8-javascript"
     local phase_status=0
 
@@ -3187,13 +3136,14 @@ phase8_javascript_analysis() {
     info "Downloading up to $MAX_JS_FILES JavaScript files..."
     local js_count=0 js_attempts=0 js_failures=0 total_bytes=0
     while IFS= read -r js_url && [ "$js_count" -lt "$MAX_JS_FILES" ]; do
-        local filename tmp_file file_bytes
+        require_authorized_request "$js_url" || return 1
+        local filename tmp_file file_bytes download_status
         filename=$(printf '%s' "$js_url" | sha256sum | awk '{print $1}')
         tmp_file="$p8dir/js-files/.${filename}.tmp.$$"
         js_attempts=$(( js_attempts + 1 ))
-        if curl -fsk --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
+        if download_status=$(curl -fsk --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "$js_url" -o "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
+            "$js_url" -o "$tmp_file" -w '%{http_code}' 2>/dev/null) && [ "$download_status" = 200 ] && [ -s "$tmp_file" ]; then
             file_bytes=$(wc -c < "$tmp_file")
             if [ $(( total_bytes + file_bytes )) -gt "$MAX_JS_TOTAL_BYTES" ]; then
                 warn "Aggregate JavaScript download limit reached (${MAX_JS_TOTAL_BYTES} bytes); stopping."
@@ -3232,7 +3182,7 @@ phase8_javascript_analysis() {
         if trufflehog "${trufflehog_args[@]}" \
             > "$p8dir/trufflehog-secrets.json" 2>/dev/null; then
             jq -r 'select(.SourceMetadata != null) |
-                "[" + .DetectorName + "] " + (.SourceMetadata.Data.Filesystem.file // "unknown")' \
+                "[" + (if .Verified == true then "verified" elif .VerificationError != null and .VerificationError != "" then "unknown" else "unverified" end) + "] [" + .DetectorName + "] " + (.SourceMetadata.Data.Filesystem.file // "unknown")' \
                 "$p8dir/trufflehog-secrets.json" 2>/dev/null \
                 | sort -u > "$p8dir/trufflehog-summary.txt" || true
         else
@@ -3250,7 +3200,7 @@ phase8_javascript_analysis() {
     grep -i 'BEGIN.*PRIVATE KEY' "$p8dir/all-js-content.txt" | sort -u > "$p8dir/private-keys.txt" 2>/dev/null || : > "$p8dir/private-keys.txt"
 
     info "Secret extraction results:"
-    echo "  TruffleHog verified : $(count_lines "$p8dir/trufflehog-summary.txt")"
+    echo "  TruffleHog detections: $(count_lines "$p8dir/trufflehog-summary.txt")"
     echo "  AWS Access Keys     : $(count_lines "$p8dir/aws-access-keys.txt")"
     echo "  Google API Keys     : $(count_lines "$p8dir/google-api-keys.txt")"
     echo "  GitHub Tokens       : $(count_lines "$p8dir/github-tokens.txt")"
@@ -3326,19 +3276,23 @@ phase9_pattern_hunting() {
     mkdir -p "$p9dir_backup/sqlmap-results"
 
     local p5dir="$OUTPUT_DIR/phase5-urls"
+    require_current_url_validation || return 1
     local p9dir="$OUTPUT_DIR/phase9-patterns"
     local p3dir="$OUTPUT_DIR/phase3-probing"
-    # Injection candidate sourcing: prefer the FULL injectable corpus (all
-    # distinct param=value pairs, not liveness-gated) so SQLi/XSS/SSRF/LFI/IDOR
-    # grep fallbacks see every testable value.  Fall back to the clean corpus
-    # only if the injectable set is empty (e.g. target had no parametered URLs).
+    # Only the current liveness-validated corpora may supply active candidates.
     local url_source="$p5dir/all-urls-injectable.txt"
     [ -s "$url_source" ] || url_source="$p5dir/all-urls.txt"
+    local current_injectable="$p9dir/current-authorized-input.txt"
+    if ! in_scope < "$url_source" | sort -u > "$current_injectable"; then
+        : > "$current_injectable"
+        return 1
+    fi
+    url_source="$current_injectable"
 
     # 9.1 SSRF candidates — prefer gf output (higher signal) over grep
     info "Finding SSRF candidates..."
     if [ -s "$p5dir/gf-ssrf.txt" ]; then
-        cp "$p5dir/gf-ssrf.txt" "$p9dir/ssrf-candidates.txt"
+        grep -Fxf "$url_source" "$p5dir/gf-ssrf.txt" > "$p9dir/ssrf-candidates.txt" || : > "$p9dir/ssrf-candidates.txt"
     else
         grep -iE '(url|uri|path|dest|redirect|proxy|continue|view|target|load|fetch|host|ping)=' \
             "$url_source" > "$p9dir/ssrf-candidates.txt" 2>/dev/null || touch "$p9dir/ssrf-candidates.txt"
@@ -3348,7 +3302,7 @@ phase9_pattern_hunting() {
     # 9.2 Open Redirect candidates
     info "Finding Open Redirect candidates..."
     if [ -s "$p5dir/gf-redirect.txt" ]; then
-        cp "$p5dir/gf-redirect.txt" "$p9dir/redirect-candidates.txt"
+        grep -Fxf "$url_source" "$p5dir/gf-redirect.txt" > "$p9dir/redirect-candidates.txt" || : > "$p9dir/redirect-candidates.txt"
     else
         grep -iE '(redirect|url|next|return|redir|goto|continue|dest|forward|location)=' \
             "$url_source" > "$p9dir/redirect-candidates.txt" 2>/dev/null || touch "$p9dir/redirect-candidates.txt"
@@ -3358,7 +3312,7 @@ phase9_pattern_hunting() {
     # 9.3 XSS candidates + Dalfox automated testing
     info "Finding XSS candidates..."
     if [ -s "$p5dir/gf-xss.txt" ]; then
-        cp "$p5dir/gf-xss.txt" "$p9dir/xss-candidates.txt"
+        grep -Fxf "$url_source" "$p5dir/gf-xss.txt" > "$p9dir/xss-candidates.txt" || : > "$p9dir/xss-candidates.txt"
     else
         grep -iE '(q|search|query|keyword|s|name|p|callback|input|text|term|v)=' \
             "$url_source" > "$p9dir/xss-candidates.txt" 2>/dev/null || touch "$p9dir/xss-candidates.txt"
@@ -3387,8 +3341,7 @@ phase9_pattern_hunting() {
         # eating the whole budget.  dalfox writes findings incrementally, so a
         # timeout still preserves partial confirmed output.
         head -"${XSS_CANDIDATE_CAP}" "$p9dir/xss-candidates-dedup.txt" \
-            | timeout --kill-after=30 "${DALFOX_TIMEOUT}" \
-                dalfox pipe \
+            | dalfox pipe \
                 --silence \
                 --no-color \
                 --skip-bav \
@@ -3420,7 +3373,7 @@ phase9_pattern_hunting() {
     # 9.4 SQL Injection candidates + SQLMap
     info "Finding SQLi candidates..."
     if [ -s "$p5dir/gf-sqli.txt" ]; then
-        cp "$p5dir/gf-sqli.txt" "$p9dir/sqli-candidates.txt"
+        grep -Fxf "$url_source" "$p5dir/gf-sqli.txt" > "$p9dir/sqli-candidates.txt" || : > "$p9dir/sqli-candidates.txt"
     else
         grep -iE '(id|select|report|role|update|query|user|sort|where|order|group|cat)=' \
             "$url_source" > "$p9dir/sqli-candidates.txt" 2>/dev/null || touch "$p9dir/sqli-candidates.txt"
@@ -3452,8 +3405,7 @@ phase9_pattern_hunting() {
         # territory — appropriate for a VDP.  --threads parallelises within a
         # target; per-request --timeout + capped --retries keep a throttling WAF
         # from stalling the whole batch into the wall-clock timeout.
-        timeout --kill-after=30 "${SQLMAP_TIMEOUT}" \
-            sqlmap -m "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt" \
+        sqlmap -m "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt" \
                 --batch \
                 --smart \
                 --level=2 \
@@ -3482,7 +3434,7 @@ phase9_pattern_hunting() {
     # 9.5 LFI candidates
     info "Finding LFI candidates..."
     if [ -s "$p5dir/gf-lfi.txt" ]; then
-        cp "$p5dir/gf-lfi.txt" "$p9dir/lfi-candidates.txt"
+        grep -Fxf "$url_source" "$p5dir/gf-lfi.txt" > "$p9dir/lfi-candidates.txt" || : > "$p9dir/lfi-candidates.txt"
     else
         grep -iE '(file|path|folder|include|doc|page|archive|download|template|dir)=' \
             "$url_source" > "$p9dir/lfi-candidates.txt" 2>/dev/null || touch "$p9dir/lfi-candidates.txt"
@@ -3492,7 +3444,7 @@ phase9_pattern_hunting() {
     # 9.6 IDOR candidates — numeric IDs in parameters are prime IDOR targets
     info "Finding IDOR candidates (numeric param values)..."
     if [ -s "$p5dir/gf-idor.txt" ]; then
-        cp "$p5dir/gf-idor.txt" "$p9dir/idor-candidates.txt"
+        grep -Fxf "$url_source" "$p5dir/gf-idor.txt" > "$p9dir/idor-candidates.txt" || : > "$p9dir/idor-candidates.txt"
     else
         grep -iE '(id|user_id|account|profile|order|invoice|ticket|record|member)=[0-9]+' \
             "$url_source" | sort -u > "$p9dir/idor-candidates.txt" 2>/dev/null \
@@ -3521,6 +3473,7 @@ phase9_pattern_hunting() {
     local cors_window_size=20
     if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $cors_count -lt $MAX_CORS_HOSTS ]; do
+        require_authorized_request "$url" || return 1
             local headers acao acac
             headers=$(curl -sk --max-time 5 \
                 -H 'Origin: https://evil.nullsec.com' \
@@ -3607,6 +3560,7 @@ phase9_pattern_hunting() {
     local hhi_window_size=10
     if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $hhi_count -lt 30 ]; do
+        require_authorized_request "$url" || return 1
             local resp
             resp=$(curl -sk --max-time 5 \
                 -H 'Host: evil.nullsec.com' \
@@ -3684,7 +3638,7 @@ phase10_screenshots() {
     print_phase "📸 PHASE 10: SCREENSHOTS & VISUAL RECONNAISSANCE"
 
     if [ "$RUN_SCREENSHOTS" = false ]; then
-        info "Screenshots skipped (mode: $SCAN_MODE)."
+        info "Screenshots disabled: browser subresource requests are not policy-bound."
         return 0
     fi
 
@@ -3783,18 +3737,18 @@ phase11_fuzzing() {
     : > "$p11dir/dirs/all-found-paths.txt"
     : > "$p11dir/dirs/all-found-backups.txt"
 
-    info "Running recursive directory fuzzing on top 10 in-scope live hosts..."
+    info "Running non-recursive directory fuzzing on top 10 in-scope live hosts..."
     local fuzz_count=0
     while IFS= read -r url && [ "$fuzz_count" -lt 10 ]; do
+        require_authorized_request "$url" || return 1
         local safe_name output_json ffuf_rc
         safe_name=$(safe_artifact_name "$url")
         output_json="$p11dir/dirs/ffuf-$safe_name.json"
         info "  Fuzzing: $url"
-        timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
-            ffuf -u "${url%/}/FUZZ" -w "$WEB_WORDLIST" \
+        ffuf -u "${url%/}/FUZZ" -w "$WEB_WORDLIST" \
             -mc 200,201,204,301,302,307,401,403,405 \
             -t "$FFUF_THREADS" -rate 100 -o "$output_json" -of json \
-            -recursion -recursion-depth 2 -ac -timeout 10 \
+            -r=false -recursion=false -ac -timeout 10 \
             >/dev/null 2>>"$ffuf_log"
         ffuf_rc=$?
         if [ "$ffuf_rc" -eq 124 ] || [ "$ffuf_rc" -eq 137 ]; then
@@ -3818,13 +3772,13 @@ phase11_fuzzing() {
         info "Scanning for exposed backup and config files..."
         local backup_count=0
         while IFS= read -r url && [ "$backup_count" -lt 5 ]; do
+            require_authorized_request "$url" || return 1
             local safe_name output_json ffuf_rc
             safe_name=$(safe_artifact_name "$url")
             output_json="$p11dir/dirs/backups-$safe_name.json"
-            timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
-                ffuf -u "${url%/}/FUZZ" -w "$backup_wordlist" -mc 200 \
+            ffuf -u "${url%/}/FUZZ" -w "$backup_wordlist" -mc 200 \
                 -t "$FFUF_THREADS" -rate 100 -o "$output_json" -of json \
-                -ac -timeout 10 >/dev/null 2>>"$ffuf_log"
+                -r=false -recursion=false -ac -timeout 10 >/dev/null 2>>"$ffuf_log"
             ffuf_rc=$?
             if [ "$ffuf_rc" -eq 124 ] || [ "$ffuf_rc" -eq 137 ]; then
                 warn "Backup ffuf timed out on $url after ${FFUF_TIMEOUT}s."
@@ -3873,6 +3827,7 @@ phase12_active_vulns() {
 
     local p9dir="$OUTPUT_DIR/phase9-patterns"
     local p5dir="$OUTPUT_DIR/phase5-urls"
+    require_current_url_validation || return 1
     local p12dir="$OUTPUT_DIR/phase12-active-vulns"
     local phase_status=0
     backup_phase_outputs "$p12dir"
@@ -3989,7 +3944,7 @@ SCAN DURATION  : ${elapsed_mins}m ${elapsed_secs}s
 SUBDOMAIN DISCOVERY:
   Total Enumerated   : $(count_lines "$OUTPUT_DIR/phase1-subdomains/all-subdomains.txt")
   Resolved / Valid   : $(count_lines "$OUTPUT_DIR/phase2-validation/valid-subdomains.txt")
-  Wildcards Filtered : $(count_lines "$OUTPUT_DIR/phase2-validation/wildcards.txt")
+  Wildcard filtering : $(if [ -f "$OUTPUT_DIR/phase2-validation/wildcard-mode.txt" ] && [ "$(cat "$OUTPUT_DIR/phase2-validation/wildcard-mode.txt")" = none ]; then printf 'disabled for explicit host rules'; else printf 'handled by dnsx when resolution runs (count unavailable)'; fi)
 
 LIVE WEB SERVICES:
   Live Hosts         : $(count_lines "$OUTPUT_DIR/phase3-probing/live-hosts.txt")
@@ -4158,7 +4113,7 @@ main() {
             ;;
     esac
 
-    local RESUME_DIR="" OUTPUT_EXPLICIT=false MODE_CHANGED=false
+    local RESUME_DIR="" OUTPUT_EXPLICIT=false
     while getopts "d:o:m:suri:x:C:EAVc:h" opt; do
         case $opt in
             d) TARGET="$OPTARG" ;;
@@ -4167,9 +4122,9 @@ main() {
             s) SKIP_TOOL_CHECK=true ;;
             u) UPDATE_NUCLEI=true ;;
             r) RATE_LIMIT=true ;;
-            i) SCOPE_INCLUDE_FILE="$OPTARG" ;;
-            x) SCOPE_EXCLUDE_FILE="$OPTARG" ;;
-            C) CLOUD_APPROVAL_FILE="$OPTARG" ;;
+            i) [ -n "$OPTARG" ] || { error "-i requires a non-empty file path"; return 1; }; SCOPE_INCLUDE_FILE="$OPTARG" ;;
+            x) [ -n "$OPTARG" ] || { error "-x requires a non-empty file path"; return 1; }; SCOPE_EXCLUDE_FILE="$OPTARG" ;;
+            C) [ -n "$OPTARG" ] || { error "-C requires a non-empty file path"; return 1; }; CLOUD_APPROVAL_FILE="$OPTARG" ;;
             E) ALLOW_ACTIVE_ENUMERATION=true ;;
             A) ALLOW_ACTIVE_VALIDATION=true ;;
             V) ALLOW_SECRET_VERIFICATION=true ;;
@@ -4184,7 +4139,7 @@ main() {
         error "Target domain is required!"
         usage
     fi
-    if ! [[ "$TARGET" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    if [ "${#TARGET}" -gt 253 ] || [[ "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ "$TARGET" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
         error "Target must be a plain DNS domain name with no URL, wildcard, path, IP, CIDR, or leading/trailing hyphen labels."
         exit 1
     fi
@@ -4219,9 +4174,8 @@ main() {
             exit 1
         fi
         if [ -n "$stored_mode" ] && [ "$stored_mode" != "$SCAN_MODE" ]; then
-            warn "Scan mode changed from '$stored_mode' to '$SCAN_MODE'; restarting at Phase 1 inside the same target-bound directory."
-            RESUME_FROM=0
-            MODE_CHANGED=true
+            error "Resume mode differs; use a new output directory."
+            return 1
         elif [ -f "$early_checkpoint" ]; then
             RESUME_FROM=$(tr -cd '0-9.\n' < "$early_checkpoint" | head -1)
             [[ "${RESUME_FROM:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] || RESUME_FROM=0
@@ -4266,18 +4220,13 @@ main() {
 
     [ "$SKIP_TOOL_CHECK" = false ] && check_tools
 
-    info "Checking internet connectivity..."
-    if ! curl -fsS --max-time 5 -o /dev/null https://1.1.1.1/cdn-cgi/trace; then
-        error "No internet connectivity detected. Check your network/VPN and try again."
-        exit 1
-    fi
-    success "Internet connectivity OK"
+    info "No third-party connectivity probe is sent; network errors are handled by their phases."
 
     create_structure
     CHECKPOINT_FILE="$OUTPUT_DIR/.checkpoint"
     SCAN_META_FILE="$OUTPUT_DIR/.scan-meta"
 
-    # A resumed run may revisit any earlier phase after a mode change or an
+    # A resumed run may revisit any earlier phase after an
     # incomplete checkpoint. Snapshot every output type before direct redirects
     # or tool -o flags can replace prior evidence.
     if [ -n "$RESUME_DIR" ]; then
@@ -4288,10 +4237,6 @@ main() {
     printf 'TARGET=%s\nSCAN_MODE=%s\nAUTHORIZATION_SHA256=%s\n' \
         "$TARGET" "$SCAN_MODE" "$AUTHORIZATION_FINGERPRINT" > "$meta_tmp" || return 1
     mv -f "$meta_tmp" "$SCAN_META_FILE" || return 1
-    if [ "$MODE_CHANGED" = true ]; then
-        printf '0\n' > "$CHECKPOINT_FILE"
-        RESUME_FROM=0
-    fi
 
     local scan_failed=false
     _run_sequential_phase() {
@@ -4305,15 +4250,15 @@ main() {
         return 0
     }
 
-    _run_sequential_phase "Phase 1" phase1_subdomain_discovery || true
-    _run_sequential_phase "Phase 2" phase2_validation || true
-    _run_sequential_phase "Phase 2.5" phase2_5_cloud_enum || true
-    _run_sequential_phase "Phase 3" phase3_probing || true
-    _run_sequential_phase "Phase 4" phase4_portscan || true
-    _run_sequential_phase "Phase 5" phase5_url_discovery || true
-    _run_sequential_phase "Phase 6" phase6_parameters || true
-    _run_sequential_phase "Asset scoring" phase_asset_scoring || true
-    _run_sequential_phase "Phase 7" phase7_vulnerability_scanning || true
+    _run_sequential_phase "Phase 1" phase1_subdomain_discovery || return 1
+    _run_sequential_phase "Phase 2" phase2_validation || return 1
+    _run_sequential_phase "Phase 2.5" phase2_5_cloud_enum || return 1
+    _run_sequential_phase "Phase 3" phase3_probing || return 1
+    _run_sequential_phase "Phase 4" phase4_portscan || return 1
+    _run_sequential_phase "Phase 5" phase5_url_discovery || return 1
+    _run_sequential_phase "Phase 6" phase6_parameters || return 1
+    _run_sequential_phase "Asset scoring" phase_asset_scoring || return 1
+    _run_sequential_phase "Phase 7" phase7_vulnerability_scanning || return 1
     unset -f _run_sequential_phase
 
     local -a parallel_pids=() parallel_names=() watchdog_pids=()
@@ -4378,7 +4323,7 @@ main() {
         _terminate_process_tree "$watchdog" 1
     done
     _PARALLEL_PIDS=()
-    rm -f "$OUTPUT_DIR"/.parallel-start.* 2>/dev/null || true
+    rm -f "$OUTPUT_DIR"/.parallel-start.* "$OUTPUT_DIR"/.authorized-input.* 2>/dev/null || true
 
     if [ "$parallel_failed" = false ]; then
         success "Phases 8–11 completed in parallel."
