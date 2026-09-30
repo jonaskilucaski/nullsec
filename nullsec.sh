@@ -113,6 +113,14 @@ SKIP_TOOL_CHECK=false
 UPDATE_NUCLEI=false     # use -u flag to enable nuclei template updates
 RATE_LIMIT=false        # use -r flag to enable rate limiting between phases
 
+# Explicit authorization controls. Safe defaults do not expand program scope or
+# perform credential/API verification merely because a tool is installed.
+SCOPE_INCLUDE_FILE="${NULLSEC_SCOPE_INCLUDE_FILE:-}"   # exact hosts or *.suffix patterns
+SCOPE_EXCLUDE_FILE="${NULLSEC_SCOPE_EXCLUDE_FILE:-}"   # exact hosts or *.suffix patterns
+CLOUD_APPROVAL_FILE="${NULLSEC_CLOUD_APPROVAL_FILE:-}" # provider:name, e.g. s3:example-assets
+ALLOW_ACTIVE_VALIDATION="${NULLSEC_ALLOW_ACTIVE_VALIDATION:-false}"
+ALLOW_SECRET_VERIFICATION="${NULLSEC_ALLOW_SECRET_VERIFICATION:-false}"
+
 # ── Telegram Notifications ─────────────────────────────────────────────────────
 # Fill in your bot token and personal chat ID to receive real-time alerts.
 # Leave both empty (default) to run silently with no notifications.
@@ -495,14 +503,16 @@ in_scope() {
         warn "in_scope: TARGET is unset — refusing to filter (pass-through disabled)"
         return 1
     fi
-    awk -v target="$TARGET" '
-        BEGIN { tlow = tolower(target); sub(/\.$/, "", tlow) }
-        {
-            line = $0
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-            if (line == "") next
 
-            is_url = (line ~ /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
+    awk -v target="$TARGET" \
+        -v include_file="${SCOPE_INCLUDE_FILE:-}" \
+        -v exclude_file="${SCOPE_EXCLUDE_FILE:-}" '
+        function lower(s) { return tolower(s) }
+        function trim(s) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+            return s
+        }
+        function host_from_line(line, host) {
             host = line
             sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", host)
             sub(/[\/?#].*$/, "", host)
@@ -514,10 +524,60 @@ in_scope() {
                 sub(/:[0-9]+$/, "", host)
             }
             sub(/\.$/, "", host)
-            hlow = tolower(host)
-            suffix = "." tlow
-            if (hlow == tlow || (length(hlow) > length(suffix) && substr(hlow, length(hlow)-length(suffix)+1) == suffix)) {
-                print is_url ? line : hlow
+            return lower(host)
+        }
+        function rule_matches(host, rule, suffix) {
+            sub(/[[:space:]]*#.*/, "", rule)
+            rule = lower(trim(rule))
+            sub(/\.$/, "", rule)
+            if (rule == "") return 0
+            if (substr(rule,1,2) == "*.") {
+                suffix = substr(rule,2)
+                return length(host) > length(suffix) &&
+                    substr(host,length(host)-length(suffix)+1) == suffix
+            }
+            return host == rule
+        }
+        function any_rule_matches(host, rules, count, i) {
+            for (i=1; i<=count; i++) if (rule_matches(host, rules[i])) return 1
+            return 0
+        }
+        BEGIN {
+            tlow = lower(target)
+            sub(/\.$/, "", tlow)
+            inc = exc = 0
+            if (include_file != "") {
+                while ((getline rule < include_file) > 0) includes[++inc] = rule
+                close(include_file)
+            }
+            if (exclude_file != "") {
+                while ((getline rule < exclude_file) > 0) excludes[++exc] = rule
+                close(exclude_file)
+            }
+        }
+        {
+            line = $0
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            if (line == "") next
+            host = host_from_line(line)
+            if (host == "") next
+
+            if (inc > 0) {
+                allowed = any_rule_matches(host, includes, inc)
+            } else {
+                suffix = "." tlow
+                allowed = (host == tlow ||
+                    (length(host) > length(suffix) &&
+                     substr(host,length(host)-length(suffix)+1) == suffix))
+            }
+
+            if (allowed && exc > 0 && any_rule_matches(host, excludes, exc)) {
+                allowed = 0
+            }
+
+            if (allowed) {
+                is_url = (line ~ /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
+                print is_url ? line : host
             }
         }
     '
@@ -899,6 +959,13 @@ apply_scan_mode() {
             exit 1
             ;;
     esac
+
+    # Vulnerability confirmation/fuzzing is never enabled solely by scan mode.
+    # The operator must explicitly attest authorization with -A.
+    if [ "$ALLOW_ACTIVE_VALIDATION" != true ]; then
+        RUN_ACTIVE_VULNS=false
+        RUN_FUZZING=false
+    fi
 }
 
 #==============================================================================#
@@ -1066,6 +1133,11 @@ usage() {
     echo "  -s                Skip tool checking"
     echo "  -u                Update Nuclei templates before scanning"
     echo "  -r                Enable rate limiting / polite delays between phases"
+    echo "  -i <file>         Approved host scope (exact hosts or *.suffix patterns)"
+    echo "  -x <file>         Excluded host scope (exact hosts or *.suffix patterns)"
+    echo "  -C <file>         Approved cloud resources (provider:name; exact names only)"
+    echo "  -A                Explicitly authorize active vulnerability validation/fuzzing"
+    echo "  -V                Explicitly authorize TruffleHog credential verification"
     echo "  -c <dir>          Resume scan from checkpoint in existing output directory"
     echo "  --version         Show NullSec version and author"
     echo "  --help            Show this help message"
@@ -1091,6 +1163,8 @@ usage() {
     echo "  $0 -d example.com"
     echo "  $0 -d example.com -m fast"
     echo "  $0 -d example.com -m deep -u -r"
+    echo "  $0 -d example.com -m normal -i approved.txt -x excluded.txt"
+    echo "  $0 -d example.com -m deep -A -C approved-cloud.txt"
     echo "  $0 -d example.com -m normal -o /path/to/output"
     exit "$exit_code"
 }
@@ -1658,6 +1732,49 @@ phase2_5_cloud_enum() {
     cat "$s3_candidates" "$gcs_candidates" "$azure_candidates" 2>/dev/null \
         | sort -u > "$ownership_names"
 
+    # A target-controlled reference is evidence, not authorization. Only exact
+    # provider:name entries supplied by the operator may proceed to provider probes.
+    if [ -z "${CLOUD_APPROVAL_FILE:-}" ]; then
+        [ -s "$ownership_names" ] && warn "Cloud references discovered, but no -C approval file was supplied; provider probing is disabled."
+        {
+            sed 's/^/s3:/' "$s3_candidates"
+            sed 's/^/gcs:/' "$gcs_candidates"
+            sed 's/^/azure:/' "$azure_candidates"
+        } 2>/dev/null | sed 's/$/  # NOT PROBED: explicit cloud approval required/' >> "$unverified_candidates"
+        : > "$s3_candidates"; : > "$gcs_candidates"; : > "$azure_candidates"
+    else
+        local _provider _candidate _approved
+        for _provider in s3 gcs azure; do
+            case "$_provider" in
+                s3) _candidate="$s3_candidates" ;;
+                gcs) _candidate="$gcs_candidates" ;;
+                azure) _candidate="$azure_candidates" ;;
+            esac
+            _approved="$cdir/.approved-${_provider}.txt"
+            awk -F: -v p="$_provider" '
+                BEGIN { IGNORECASE=1 }
+                /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+                {
+                    key=$1; sub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                    if (tolower(key) != p) next
+                    sub(/^[^:]*:/, "")
+                    sub(/[[:space:]]*#.*/, "")
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                    print tolower($0)
+                }
+            ' "$CLOUD_APPROVAL_FILE" | sort -u > "$_approved"
+            if [ -s "$_candidate" ]; then
+                grep -Fxf "$_approved" "$_candidate" > "${_candidate}.approved" 2>/dev/null || true
+                grep -Fvx -f "$_approved" "$_candidate" 2>/dev/null \
+                    | sed "s/^/${_provider}:/" \
+                    | sed 's/$/  # NOT PROBED: not present in explicit cloud approval file/' \
+                    >> "$unverified_candidates" || true
+                mv -f "${_candidate}.approved" "$_candidate"
+            fi
+            rm -f "$_approved"
+        done
+    fi
+
     if [ -s "$candidates_file" ]; then
         if [ -s "$ownership_names" ]; then
             grep -Fvx -f "$ownership_names" "$candidates_file" 2>/dev/null \
@@ -1886,7 +2003,7 @@ phase3_probing() {
     : > "$p3dir/live-hosts-detailed.txt"
     if ! httpx-toolkit -l "$p2dir/valid-subdomains.txt" \
         -title -status-code -tech-detect -content-length -web-server \
-        -follow-redirects -random-agent -timeout 15 -retries 2 \
+        -follow-host-redirects -random-agent -timeout 15 -retries 2 \
         -threads 10 -rl 10 -o "$p3dir/live-hosts-detailed.txt" 2>/dev/null; then
         warn "Detailed HTTP probing failed; partial output was preserved."
         phase_errors=$(( phase_errors + 1 ))
@@ -2073,6 +2190,7 @@ phase5_url_discovery() {
     : > "$p5dir/all-urls-raw.txt"
     : > "$p5dir/all-urls.txt"
     : > "$p5dir/all-urls-injectable.txt"
+    : > "$p5dir/unvalidated-js-files.txt"
 
     # 5.1 Active crawling with Katana (JS-aware, finds modern SPA endpoints)
     if [ -s "$p3dir/live-hosts.txt" ]; then
@@ -2081,6 +2199,7 @@ phase5_url_discovery() {
             -depth "$KATANA_DEPTH" \
             -js-crawl \
             -known-files all \
+            -fs fqdn \
             -silent \
             -rl 50 \
             -o "$p5dir/katana-urls.txt" 2>"$p5dir/katana-error.log"; then
@@ -2186,12 +2305,13 @@ phase5_url_discovery() {
     # both.
     info "Refining URL corpus (scope → dedup → liveness; + full injectable set)..."
 
-    # Stage 1 — SCOPE (shared by both corpora).
+    # Stage 1 — SCOPE (shared by both corpora). Scope failure is fail-closed:
+    # raw/unfiltered material is never promoted to downstream scan input.
     local scoped="$p5dir/.urls-scoped.txt"
-    if [ -n "${TARGET:-}" ]; then
-        in_scope < "$p5dir/all-urls-raw.txt" 2>/dev/null | sort -u > "$scoped" || cp "$p5dir/all-urls-raw.txt" "$scoped"
-    else
-        cp "$p5dir/all-urls-raw.txt" "$scoped"
+    if ! in_scope < "$p5dir/all-urls-raw.txt" 2>/dev/null | sort -u > "$scoped"; then
+        warn "  Scope filtering failed — downstream URL validation is blocked."
+        : > "$scoped"
+        phase_errors=$(( phase_errors + 1 ))
     fi
     info "  Scope filter: $(count_lines "$scoped") in-scope (from $raw_count)"
 
@@ -2220,17 +2340,26 @@ phase5_url_discovery() {
 
     # Stage 3 — LIVENESS (CLEAN corpus only).  Probe collapsed set; keep live.
     local clean="$p5dir/all-urls.txt"
+    : > "$p5dir/unvalidated-urls.txt"
     if [ -s "$collapsed" ] && check_command "httpx-toolkit"; then
-        httpx-toolkit -l "$collapsed" \
+        if ! httpx-toolkit -l "$collapsed" \
             -silent \
             -mc 200,201,202,204,301,302,307,308,401,403,405,500 \
             -random-agent \
             -rl 50 \
-            -o "$clean" 2>/dev/null || cp "$collapsed" "$clean"
-        [ -s "$clean" ] || cp "$collapsed" "$clean"
+            -o "$clean" 2>/dev/null; then
+            warn "  HTTP liveness validation failed — candidates preserved separately and not trusted."
+            cp "$collapsed" "$p5dir/unvalidated-urls.txt"
+            : > "$clean"
+            phase_errors=$(( phase_errors + 1 ))
+        fi
+    elif [ -s "$collapsed" ]; then
+        warn "  httpx-toolkit unavailable — candidates preserved as unvalidated; CLEAN corpus remains empty."
+        cp "$collapsed" "$p5dir/unvalidated-urls.txt"
+        : > "$clean"
+        phase_errors=$(( phase_errors + 1 ))
     else
-        warn "  httpx-toolkit unavailable — skipping liveness validation (corpus may contain dead URLs)."
-        cp "$collapsed" "$clean"
+        : > "$clean"
     fi
 
     # Re-attach the cloud bucket feed (scope-exempt) to the CLEAN corpus only.
@@ -2275,19 +2404,18 @@ phase5_url_discovery() {
         if check_command "httpx-toolkit"; then
             httpx-toolkit -l "$p5dir/all-js-files.txt" \
                 -silent -mc 200,304 \
-                -follow-redirects \
+                -follow-host-redirects \
                 -random-agent \
                 -rl 50 \
                 -o "$p5dir/live-js-files.txt" 2>/dev/null
-            # Fallback: if validation yields nothing but candidates exist, the
-            # origin is likely throttling/blocking httpx — keep the candidate set
-            # so Phase 8 can still attempt extraction rather than skipping.
             if [ ! -s "$p5dir/live-js-files.txt" ]; then
-                warn "  JS liveness returned 0 (possible WAF/rate-limit) — passing candidate JS through to Phase 8."
-                cp "$p5dir/all-js-files.txt" "$p5dir/live-js-files.txt"
+                info "  JS liveness returned 0; no candidates are promoted without validation."
             fi
         else
-            cp "$p5dir/all-js-files.txt" "$p5dir/live-js-files.txt"
+            warn "  httpx-toolkit unavailable — JS candidates preserved separately and not downloaded."
+            cp "$p5dir/all-js-files.txt" "$p5dir/unvalidated-js-files.txt"
+            : > "$p5dir/live-js-files.txt"
+            phase_errors=$(( phase_errors + 1 ))
         fi
         success "Live JS files: $(count_lines "$p5dir/live-js-files.txt")"
     else
@@ -3106,7 +3234,7 @@ phase8_javascript_analysis() {
         filename=$(printf '%s' "$js_url" | sha256sum | awk '{print $1}')
         tmp_file="$p8dir/js-files/.${filename}.tmp.$$"
         js_attempts=$(( js_attempts + 1 ))
-        if curl -fskL --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
+        if curl -fsk --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "$js_url" -o "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
             file_bytes=$(wc -c < "$tmp_file")
@@ -3137,8 +3265,14 @@ phase8_javascript_analysis() {
     : > "$p8dir/trufflehog-secrets.json"
     : > "$p8dir/trufflehog-summary.txt"
     if check_command "trufflehog"; then
-        info "Running TruffleHog for verified secret detection..."
-        if trufflehog filesystem "$p8dir/js-files/" --only-verified --json \
+        if [ "$ALLOW_SECRET_VERIFICATION" = true ]; then
+            info "Running TruffleHog secret detection with explicit credential verification authorization..."
+            local -a trufflehog_args=(filesystem "$p8dir/js-files/" --results=verified,unknown --json)
+        else
+            info "Running TruffleHog local secret detection (credential verification disabled)..."
+            local -a trufflehog_args=(filesystem "$p8dir/js-files/" --no-verification --json)
+        fi
+        if trufflehog "${trufflehog_args[@]}" \
             > "$p8dir/trufflehog-secrets.json" 2>/dev/null; then
             jq -r 'select(.SourceMetadata != null) |
                 "[" + .DetectorName + "] " + (.SourceMetadata.Data.Filesystem.file // "unknown")' \
@@ -3273,7 +3407,7 @@ phase9_pattern_hunting() {
     fi
     success "XSS candidates: $(count_lines "$p9dir/xss-candidates.txt")"
 
-    if check_command "dalfox" && [ -s "$p9dir/xss-candidates.txt" ]; then
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && check_command "dalfox" && [ -s "$p9dir/xss-candidates.txt" ]; then
         # Dedup candidates by INJECTION-POINT signature (host+path+param-keys),
         # keeping one concrete value per signature, BEFORE applying the cap.
         # Without this, head -N wastes the budget on ?id=1, ?id=2, ?id=3 — the
@@ -3318,7 +3452,11 @@ phase9_pattern_hunting() {
             info "Dalfox: no confirmed XSS."
         fi
     else
-        ! check_command "dalfox" && warn "dalfox not installed — install hahwul/dalfox for automated XSS confirmation."
+        if [ "$ALLOW_ACTIVE_VALIDATION" != true ]; then
+            info "Dalfox validation skipped — active validation requires explicit -A authorization."
+        elif ! check_command "dalfox"; then
+            warn "dalfox not installed — install hahwul/dalfox for automated XSS confirmation."
+        fi
     fi
 
     # 9.4 SQL Injection candidates + SQLMap
@@ -3331,7 +3469,7 @@ phase9_pattern_hunting() {
     fi
     success "SQLi candidates: $(count_lines "$p9dir/sqli-candidates.txt")"
 
-    if check_command "sqlmap" && [ -s "$p9dir/sqli-candidates.txt" ]; then
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && check_command "sqlmap" && [ -s "$p9dir/sqli-candidates.txt" ]; then
         # Dedup by injection-point signature first (same rationale as dalfox):
         # without it, the cap is spent re-testing ?id=1/?id=2 instead of distinct
         # injectable endpoints.  sqlmap detects injection from the parameter, not
@@ -3419,7 +3557,7 @@ phase9_pattern_hunting() {
     # against the window only.
     local cors_window=""
     local cors_window_size=20
-    if [ -s "$p3dir/live-hosts.txt" ]; then
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $cors_count -lt $MAX_CORS_HOSTS ]; do
             local headers acao acac
             headers=$(curl -sk --max-time 5 \
@@ -3501,7 +3639,7 @@ phase9_pattern_hunting() {
     # BUG-7 FIX: Sliding-window throttle detection (see CORS loop above).
     local hhi_window=""
     local hhi_window_size=10
-    if [ -s "$p3dir/live-hosts.txt" ]; then
+    if [ "$ALLOW_ACTIVE_VALIDATION" = true ] && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $hhi_count -lt 30 ]; do
             local resp
             resp=$(curl -sk --max-time 5 \
@@ -4051,7 +4189,7 @@ main() {
     esac
 
     local RESUME_DIR="" OUTPUT_EXPLICIT=false MODE_CHANGED=false
-    while getopts "d:o:m:surc:h" opt; do
+    while getopts "d:o:m:suri:x:C:AVc:h" opt; do
         case $opt in
             d) TARGET="$OPTARG" ;;
             o) OUTPUT_DIR="$OPTARG"; OUTPUT_EXPLICIT=true ;;
@@ -4059,6 +4197,11 @@ main() {
             s) SKIP_TOOL_CHECK=true ;;
             u) UPDATE_NUCLEI=true ;;
             r) RATE_LIMIT=true ;;
+            i) SCOPE_INCLUDE_FILE="$OPTARG" ;;
+            x) SCOPE_EXCLUDE_FILE="$OPTARG" ;;
+            C) CLOUD_APPROVAL_FILE="$OPTARG" ;;
+            A) ALLOW_ACTIVE_VALIDATION=true ;;
+            V) ALLOW_SECRET_VERIFICATION=true ;;
             c) RESUME_DIR="$OPTARG" ;;
             h) usage 0 ;;
             *) usage ;;
@@ -4074,6 +4217,12 @@ main() {
         error "Target must be a plain DNS domain name with no URL, wildcard, path, IP, CIDR, or leading/trailing hyphen labels."
         exit 1
     fi
+    for _scope_file in "${SCOPE_INCLUDE_FILE:-}" "${SCOPE_EXCLUDE_FILE:-}" "${CLOUD_APPROVAL_FILE:-}"; do
+        if [ -n "$_scope_file" ] && [ ! -r "$_scope_file" ]; then
+            error "Authorization/scope file is not readable: $_scope_file"
+            exit 1
+        fi
+    done
     if [ "$OUTPUT_EXPLICIT" = true ] && [ -n "$RESUME_DIR" ]; then
         error "Use either -o for a new scan or -c to resume, not both."
         exit 1
@@ -4134,6 +4283,11 @@ main() {
     info "Scan Mode       : $SCAN_MODE"
     info "Nuclei Update   : $UPDATE_NUCLEI"
     info "Rate Limiting   : $RATE_LIMIT"
+    info "Scope Include   : ${SCOPE_INCLUDE_FILE:-target + subdomains}"
+    info "Scope Exclude   : ${SCOPE_EXCLUDE_FILE:-none}"
+    info "Cloud Approval  : ${CLOUD_APPROVAL_FILE:-none (cloud probing disabled)}"
+    info "Active Validate : $ALLOW_ACTIVE_VALIDATION"
+    info "Secret Verify   : $ALLOW_SECRET_VERIFICATION"
     info "Amass Timeout   : ${AMASS_TIMEOUT}s"
     resolve_nuclei_templates true || true
     echo ""
