@@ -140,11 +140,12 @@ in_scope() {
             line=$0; gsub(/^[[:space:]]+|[[:space:]]+$/,"",line)
             if(line=="" || line ~ /[[:space:]]/) next
             url=(tolower(line) ~ /^https?:\/\//)
+            port=""
             h=line
             if(url) {sub(/^[^:]+:\/\//,"",h); sub(/[\/?#].*$/,"",h)}
             if(h ~ /@/ || h ~ /[\[\]]/) next
             if(h ~ /:/) {
-                if(!url || h !~ /:[0-9]+$/) next
+                if(h !~ /:[0-9]+$/) next
                 port=h; sub(/^.*:/,"",port)
                 if(port+0<1 || port+0>65535) next
                 sub(/:[0-9]+$/,"",h)
@@ -155,7 +156,7 @@ in_scope() {
             if(explicit) {for(i=1;i<=ni;i++) if(matchrule(h,inc[i])) allowed=1}
             else allowed=(h==target || matchrule(h,"*." target))
             for(i=1;i<=ne;i++) if(matchrule(h,exc[i])) allowed=0
-            if(allowed) print url ? line : h
+            if(allowed) print url ? line : h (port!="" ? ":" port : "")
         }
     '
 }

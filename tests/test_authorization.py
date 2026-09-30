@@ -34,7 +34,9 @@ if name=='httpx-toolkit':
     if output: pathlib.Path(output).write_text(text)
     else: print(text,end='')
     sys.exit(1 if mode=='fail' else 0)
-if name=='dnsx':
+if name=='naabu' and arg('-o'):
+    pathlib.Path(arg('-o')).write_text(os.environ.get('NAABU_OUTPUT',''))
+elif name=='dnsx':
     pathlib.Path(arg('-o')).write_text(''.join(x+' [A] [192.0.2.1]\n' for x in targets))
 elif name=='curl':
     body=os.environ.get('CURL_BODY','const example = true;')
@@ -122,6 +124,54 @@ info() { :; }; warn() { :; }; error() { :; }; success() { :; }; print_phase() { 
                 self.file('include', contents)
                 r = self.run_shell('SCOPE_INCLUDE_FILE="$CASE_DIR/include"; printf "%s\\n" example.com a.example.com | in_scope')
                 self.assertEqual(r.stdout, '')
+
+    def test_bare_authorities_and_url_ports(self):
+        self.file('include', '*.example.com\n')
+        self.file('exclude', 'excluded.example.com\n')
+        cases = {
+            'api.example.com:443': True,
+            'api.example.com:8443': True,
+            'excluded.example.com:8443': False,
+            'external.invalid:8443': False,
+            'api.example.com:0': False,
+            'api.example.com:65536': False,
+            'api.example.com:https': False,
+            '192.0.2.1:8443': False,
+            '[2001:db8::1]:443': False,
+            '[api.example.com]:443': False,
+            'user@api.example.com:443': False,
+            'api.example.com:443:8443': False,
+            'api.example.com:8443/path': False,
+            'api.example.com': True,
+            'api.example.com:1': True,
+            'api.example.com:65535': True,
+            'http://api.example.com:8443/x': True,
+            'https://api.example.com:443/x': True,
+            'https://api.example.com:0/x': False,
+            'https://api.example.com:65536/x': False,
+            'https://user@api.example.com:443/x': False,
+            'https://[api.example.com]:443/x': False,
+        }
+        for candidate, accepted in cases.items():
+            with self.subTest(candidate=candidate):
+                result = self.run_shell('SCOPE_INCLUDE_FILE="$CASE_DIR/include"; '
+                    'SCOPE_EXCLUDE_FILE="$CASE_DIR/exclude"; '
+                    'printf "%s\\n" "$CANDIDATE" | in_scope', env={'CANDIDATE': candidate})
+                self.assertEqual(result.stdout, candidate+'\n' if accepted else '')
+
+    def test_phase4_naabu_authority_reaches_httpx_unchanged(self):
+        self.file('include', 'api.example.com\n')
+        (self.out/'phase2-validation/valid-subdomains.txt').write_text('api.example.com\n')
+        (self.out/'phase3-probing/live-hosts.txt').touch()
+        self.run_shell('SCOPE_INCLUDE_FILE="$CASE_DIR/include"; '
+            'ALLOW_ACTIVE_ENUMERATION=true; RUN_PORT_SCAN=true; '
+            'polite_sleep() { :; }; phase4_portscan',
+            env={'NAABU_OUTPUT': 'api.example.com:8443\n'})
+        calls = self.calls()
+        self.assertEqual([c['tool'] for c in calls], ['naabu', 'httpx-toolkit'])
+        self.assertEqual(calls[1]['targets'], ['api.example.com:8443'])
+        self.assertEqual((self.out/'phase4-portscan/services-on-ports.txt').read_text(),
+                         'https://api.example.com:8443\n')
 
     def test_exact_wildcard_case_and_exclusion(self):
         self.file('include', 'EXAMPLE.COM.\n*.API.EXAMPLE.COM\n')
