@@ -810,6 +810,22 @@ The script rechecks approved seeds at tool launch. This is not a general network
 
 Tool-specific limits and phase delays are not a shared/global traffic limiter. Phases 8–11 still have independent watchdogs and can overlap. A strict aggregate request budget remains unresolved; do not describe `-r` as providing one.
 
+### Nuclei redirect boundary and remaining egress
+
+The launcher filters seed lists and appends `-dr=true` (disable redirects). This CLI contract was checked against upstream Nuclei **v3.11.1**; real binary execution is not covered by the offline tests. Ordinary pooled HTTP requests therefore stop at redirects, including same-host redirects. Templates that require following redirects may produce fewer findings. `-fhr` is not used as a universal boundary: its same-host comparison can use a template-supplied Host header rather than the authorized seed hostname.
+
+Upstream source evidence:
+
+- [`http.go`, lines 381–389](https://github.com/projectdiscovery/nuclei/blob/v3.11.1/pkg/protocols/http/http.go#L381-L389): template `redirects` enables unrestricted redirect flow.
+- [`clientpool.go`, lines 432–451 and 537–557](https://github.com/projectdiscovery/nuclei/blob/v3.11.1/pkg/protocols/http/httpclientpool/clientpool.go#L432-L451): CLI disable-redirects overrides pooled-client flow; same-host comparison consults the original request's Host header.
+- [`request.go`, lines 779–821](https://github.com/projectdiscovery/nuclei/blob/v3.11.1/pkg/protocols/http/request.go#L779-L821): **unsafe/raw HTTP uses a different client and assigns `FollowRedirects` from the template directly**, without consulting CLI disable-redirects. Thus `-dr` does not guarantee redirect confinement for those templates.
+
+Complete Nuclei request confinement remains unresolved. Review templates before using `-A`; where strict confinement is required, use an independently enforced egress boundary or keep Nuclei disabled. Explicit template destinations, unsafe/raw redirects, OAST/Interactsh registration and polling, headless/JavaScript/code protocols, plugins, update checks and configuration can generate traffic beyond scoped seeds. The launcher does not sandbox these paths. This correction adds no new testing behavior or broader authorization.
+
+### Port-bearing discovery inputs
+
+Scoped launchers accept bare DNS `hostname:port` inputs from Naabu, compare only the hostname against current include/exclude policy, and preserve the port. Ports must be numeric in 1–65535. IP literals, userinfo, bracket syntax and malformed authorities are rejected. Authorization rule files still contain host rules without ports; URL parsing and exclusion precedence are unchanged.
+
 ### dnsx compatibility contract
 
 Compatibility targets are upstream dnsx v1.2.3 (manual `-wd`) and v1.3.0/v1.3.1 (automatic wildcard option), using default plain-text output. Runtime feature detection reads the complete successful help response before selecting a branch and requires recognizable list/output/silent flags. Failed or malformed help is an error. The offline fixtures cover these CLI shapes; real released binaries have not been executed by this change's tests. Older versions and modified output/configuration contracts are unsupported until independently verified. Wildcard counts are unavailable, and explicit host policies disable generated-name wildcard detection.

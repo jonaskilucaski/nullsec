@@ -281,6 +281,23 @@ info() { :; }; warn() { :; }; error() { :; }; success() { :; }; print_phase() { 
         self.run_shell('SCOPE_INCLUDE_FILE="$CASE_DIR/include"; CLOUD_APPROVAL_FILE="$CASE_DIR/cloud"; phase2_5_cloud_enum',env={'CURL_BODY':'example-assets.s3.amazonaws.com'})
         self.assertFalse(any('amazonaws.com' in a for c in self.calls() if c['tool']=='curl' for a in c['args']))
 
+    def test_nuclei_launcher_scopes_seeds_and_forces_redirect_control(self):
+        self.file('include', 'api.example.com\n')
+        self.file('targets', 'https://api.example.com:8443/x\nhttps://external.invalid/x\n')
+        self.run_shell('SCOPE_INCLUDE_FILE="$CASE_DIR/include"; ALLOW_ACTIVE_VALIDATION=true; '
+            'nuclei -l "$CASE_DIR/targets" -fr -fhr -dr=false; '
+            'nuclei -u https://api.example.com:8443/x')
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call['tool'], 'nuclei')
+            self.assertEqual(call['targets'], ['https://api.example.com:8443/x'])
+            self.assertEqual(call['args'][-1], '-dr=true')
+        self.assertGreater(calls[0]['args'].index('-dr=true'),
+                           calls[0]['args'].index('-dr=false'))
+        self.run_shell('ALLOW_ACTIVE_VALIDATION=true; nuclei -u https://external.invalid/', expected=1)
+        self.assertEqual(len(self.calls()), 2)
+
     def test_approved_cloud_workers_inherit_curl_policy(self):
         self.file('include','api.example.com\n')
         self.file('cloud','s3:example-assets\ngcs:example-public\nazure:examplestorage\n')

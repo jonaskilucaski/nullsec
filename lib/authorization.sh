@@ -254,6 +254,10 @@ run_scoped_tool() {
         ffuf) args+=(-r=false -recursion=false) ;;
         arjun) args+=(--disable-redirects) ;;
         sqlmap) args+=(--ignore-redirects) ;;
+        # Upstream v3.11.1: disable redirects in the pooled HTTP client even
+        # when a template enables them. Raw/unsafe HTTP is a separate client
+        # that does not honor this option; see README's Nuclei boundary limits.
+        nuclei) args+=(-dr=true) ;;
     esac
     case "$tool" in
         ffuf) command timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" "$tool" "${args[@]}" ;;
