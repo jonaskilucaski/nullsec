@@ -118,7 +118,9 @@ RATE_LIMIT=false        # use -r flag to enable rate limiting between phases
 SCOPE_INCLUDE_FILE="${NULLSEC_SCOPE_INCLUDE_FILE:-}"   # exact hosts or *.suffix patterns
 SCOPE_EXCLUDE_FILE="${NULLSEC_SCOPE_EXCLUDE_FILE:-}"   # exact hosts or *.suffix patterns
 CLOUD_APPROVAL_FILE="${NULLSEC_CLOUD_APPROVAL_FILE:-}" # provider:name, e.g. s3:example-assets
+ALLOW_ACTIVE_ENUMERATION="${NULLSEC_ALLOW_ACTIVE_ENUMERATION:-false}"
 ALLOW_ACTIVE_VALIDATION="${NULLSEC_ALLOW_ACTIVE_VALIDATION:-false}"
+AUTHORIZATION_FINGERPRINT=""
 ALLOW_SECRET_VERIFICATION="${NULLSEC_ALLOW_SECRET_VERIFICATION:-false}"
 
 # ── Telegram Notifications ─────────────────────────────────────────────────────
@@ -498,90 +500,9 @@ resolve_nuclei_templates() {
 # Usage:
 #   cat all-urls.txt | in_scope > in-scope-urls.txt
 #   in_scope < hosts.txt
-in_scope() {
-    if [ -z "${TARGET:-}" ]; then
-        warn "in_scope: TARGET is unset — refusing to filter (pass-through disabled)"
-        return 1
-    fi
+# Policy helpers are sourced relative to this script, never from the working directory.
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/authorization.sh" || exit 1
 
-    awk -v target="$TARGET" \
-        -v include_file="${SCOPE_INCLUDE_FILE:-}" \
-        -v exclude_file="${SCOPE_EXCLUDE_FILE:-}" '
-        function lower(s) { return tolower(s) }
-        function trim(s) {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
-            return s
-        }
-        function host_from_line(line, host) {
-            host = line
-            sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", host)
-            sub(/[\/?#].*$/, "", host)
-            sub(/^[^@]+@/, "", host)
-            if (host ~ /^\[/) {
-                sub(/^\[/, "", host)
-                sub(/\](:[0-9]+)?$/, "", host)
-            } else {
-                sub(/:[0-9]+$/, "", host)
-            }
-            sub(/\.$/, "", host)
-            return lower(host)
-        }
-        function rule_matches(host, rule, suffix) {
-            sub(/[[:space:]]*#.*/, "", rule)
-            rule = lower(trim(rule))
-            sub(/\.$/, "", rule)
-            if (rule == "") return 0
-            if (substr(rule,1,2) == "*.") {
-                suffix = substr(rule,2)
-                return length(host) > length(suffix) &&
-                    substr(host,length(host)-length(suffix)+1) == suffix
-            }
-            return host == rule
-        }
-        function any_rule_matches(host, rules, count, i) {
-            for (i=1; i<=count; i++) if (rule_matches(host, rules[i])) return 1
-            return 0
-        }
-        BEGIN {
-            tlow = lower(target)
-            sub(/\.$/, "", tlow)
-            inc = exc = 0
-            if (include_file != "") {
-                while ((getline rule < include_file) > 0) includes[++inc] = rule
-                close(include_file)
-            }
-            if (exclude_file != "") {
-                while ((getline rule < exclude_file) > 0) excludes[++exc] = rule
-                close(exclude_file)
-            }
-        }
-        {
-            line = $0
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-            if (line == "") next
-            host = host_from_line(line)
-            if (host == "") next
-
-            if (inc > 0) {
-                allowed = any_rule_matches(host, includes, inc)
-            } else {
-                suffix = "." tlow
-                allowed = (host == tlow ||
-                    (length(host) > length(suffix) &&
-                     substr(host,length(host)-length(suffix)+1) == suffix))
-            }
-
-            if (allowed && exc > 0 && any_rule_matches(host, excludes, exc)) {
-                allowed = 0
-            }
-
-            if (allowed) {
-                is_url = (line ~ /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
-                print is_url ? line : host
-            }
-        }
-    '
-}
 
 # Optional sleep between phases when -r flag is used
 polite_sleep() {
@@ -961,10 +882,22 @@ apply_scan_mode() {
     esac
 
     # Vulnerability confirmation/fuzzing is never enabled solely by scan mode.
-    # The operator must explicitly attest authorization with -A.
+    # Enumeration and vulnerability validation have separate opt-ins.
+    if [ "$ALLOW_ACTIVE_ENUMERATION" != true ]; then
+        RUN_DNS_BRUTEFORCE=false
+        RUN_PERMUTATIONS=false
+        RUN_PORT_SCAN=false
+        RUN_PARAM_DISCOVERY=false
+        RUN_VHOST_DISCOVERY=false
+        RUN_FUZZING=false
+    fi
+    # Generated DNS requests cannot enforce exclusions before resolution.
+    if [ -n "$SCOPE_INCLUDE_FILE" ] || [ -n "$SCOPE_EXCLUDE_FILE" ]; then
+        RUN_DNS_BRUTEFORCE=false
+        RUN_PERMUTATIONS=false
+    fi
     if [ "$ALLOW_ACTIVE_VALIDATION" != true ]; then
         RUN_ACTIVE_VULNS=false
-        RUN_FUZZING=false
     fi
 }
 
@@ -1136,7 +1069,8 @@ usage() {
     echo "  -i <file>         Approved host scope (exact hosts or *.suffix patterns)"
     echo "  -x <file>         Excluded host scope (exact hosts or *.suffix patterns)"
     echo "  -C <file>         Approved cloud resources (provider:name; exact names only)"
-    echo "  -A                Explicitly authorize active vulnerability validation/fuzzing"
+    echo "  -E                Explicitly authorize active enumeration (mode limits still apply)"
+    echo "  -A                Explicitly authorize vulnerability validation"
     echo "  -V                Explicitly authorize TruffleHog credential verification"
     echo "  -c <dir>          Resume scan from checkpoint in existing output directory"
     echo "  --version         Show NullSec version and author"
@@ -1177,6 +1111,7 @@ usage() {
 # PHASE 1: Subdomain Discovery
 # ─────────────────────────────────────────────────────────────────────────────
 phase1_subdomain_discovery() {
+    assert_authorization_policy || return 1
     phase_done 1 && { polite_sleep; return 0; }
     print_phase "🔍 PHASE 1: SUBDOMAIN DISCOVERY"
 
@@ -1498,6 +1433,7 @@ phase1_subdomain_discovery() {
 # PHASE 2: Validation & Resolution
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_validation() {
+    assert_authorization_policy || return 1
     phase_done 2 && { polite_sleep; return 0; }
     print_phase "✅ PHASE 2: VALIDATION & RESOLUTION"
 
@@ -1611,6 +1547,7 @@ phase2_validation() {
 #   - Report:  dedicated cloud findings section
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_5_cloud_enum() {
+    assert_authorization_policy || return 1
     # Phase 3 can only have completed after Phase 2.5 was reached. On resume from
     # checkpoint 3 or later, do not rerun cloud enumeration and append stale data.
     local resume_int="${RESUME_FROM%.*}"
@@ -1986,6 +1923,7 @@ phase2_5_cloud_enum() {
 # PHASE 3: Live Web Service Probing
 # ─────────────────────────────────────────────────────────────────────────────
 phase3_probing() {
+    assert_authorization_policy || return 1
     phase_done 3 && { polite_sleep; return 0; }
     print_phase "🌐 PHASE 3: LIVE WEB SERVICE PROBING"
 
@@ -2103,6 +2041,7 @@ phase3_probing() {
 # PHASE 4: Port Scanning
 # ─────────────────────────────────────────────────────────────────────────────
 phase4_portscan() {
+    assert_authorization_policy || return 1
     phase_done 4 && { polite_sleep; return 0; }
     print_phase "🔌 PHASE 4: PORT SCANNING"
 
@@ -2180,6 +2119,7 @@ phase4_portscan() {
 # PHASE 5: URL Discovery & Crawling
 # ─────────────────────────────────────────────────────────────────────────────
 phase5_url_discovery() {
+    assert_authorization_policy || return 1
     phase_done 5 && { polite_sleep; return 0; }
     print_phase "🔗 PHASE 5: URL DISCOVERY & CRAWLING"
 
@@ -2479,6 +2419,7 @@ phase5_url_discovery() {
 # PHASE 6: Parameter Discovery
 # ─────────────────────────────────────────────────────────────────────────────
 phase6_parameters() {
+    assert_authorization_policy || return 1
     phase_done 6 && { polite_sleep; return 0; }
     print_phase "📊 PHASE 6: PARAMETER DISCOVERY"
 
@@ -2544,6 +2485,7 @@ phase6_parameters() {
 # PHASE 6b: Asset Scoring & Prioritization
 # ─────────────────────────────────────────────────────────────────────────────
 phase_asset_scoring() {
+    assert_authorization_policy || return 1
     # NOTE: No checkpoint guard — this phase is a fast local computation (no
     # network I/O) so it always re-runs, guaranteeing scores reflect the latest
     # data even on resume.  Runs in <2s on typical scan outputs.
@@ -2847,6 +2789,7 @@ _p7_report_skips() {
 # PHASE 7: Vulnerability Scanning (Nuclei)
 # ─────────────────────────────────────────────────────────────────────────────
 phase7_vulnerability_scanning() {
+    assert_authorization_policy || return 1
     phase_done 7 && { polite_sleep; return; }
     print_phase "🛡️  PHASE 7: VULNERABILITY SCANNING (NUCLEI)"
 
@@ -3210,6 +3153,7 @@ phase7_vulnerability_scanning() {
 # PHASE 8: JavaScript Analysis & Secret Extraction
 # ─────────────────────────────────────────────────────────────────────────────
 phase8_javascript_analysis() {
+    assert_authorization_policy || return 1
     phase_done 8 && { polite_sleep; return 0; }
     print_phase "📜 PHASE 8: JAVASCRIPT ANALYSIS & SECRET EXTRACTION"
 
@@ -3363,6 +3307,7 @@ phase8_javascript_analysis() {
 # PHASE 9: Vulnerability Pattern Hunting
 # ─────────────────────────────────────────────────────────────────────────────
 phase9_pattern_hunting() {
+    assert_authorization_policy || return 1
     phase_done 9 && { polite_sleep; return; }
     print_phase "🎯 PHASE 9: VULNERABILITY PATTERN HUNTING"
 
@@ -3734,6 +3679,7 @@ phase9_pattern_hunting() {
 # PHASE 10: Screenshots & Visual Reconnaissance
 # ─────────────────────────────────────────────────────────────────────────────
 phase10_screenshots() {
+    assert_authorization_policy || return 1
     phase_done 10 && { polite_sleep; return 0; }
     print_phase "📸 PHASE 10: SCREENSHOTS & VISUAL RECONNAISSANCE"
 
@@ -3793,6 +3739,7 @@ phase10_screenshots() {
 # PHASE 11: Directory & Content Fuzzing  [NEW]
 # ─────────────────────────────────────────────────────────────────────────────
 phase11_fuzzing() {
+    assert_authorization_policy || return 1
     phase_done 11 && { polite_sleep; return 0; }
     print_phase "💥 PHASE 11: DIRECTORY & CONTENT FUZZING"
 
@@ -3914,6 +3861,7 @@ phase11_fuzzing() {
 # PHASE 12: Active Vulnerability Confirmation  [NEW]
 # ─────────────────────────────────────────────────────────────────────────────
 phase12_active_vulns() {
+    assert_authorization_policy || return 1
     phase_done 12 && { polite_sleep; return 0; }
     print_phase "🔥 PHASE 12: ACTIVE VULNERABILITY CONFIRMATION"
 
@@ -4211,7 +4159,7 @@ main() {
     esac
 
     local RESUME_DIR="" OUTPUT_EXPLICIT=false MODE_CHANGED=false
-    while getopts "d:o:m:suri:x:C:AVc:h" opt; do
+    while getopts "d:o:m:suri:x:C:EAVc:h" opt; do
         case $opt in
             d) TARGET="$OPTARG" ;;
             o) OUTPUT_DIR="$OPTARG"; OUTPUT_EXPLICIT=true ;;
@@ -4222,6 +4170,7 @@ main() {
             i) SCOPE_INCLUDE_FILE="$OPTARG" ;;
             x) SCOPE_EXCLUDE_FILE="$OPTARG" ;;
             C) CLOUD_APPROVAL_FILE="$OPTARG" ;;
+            E) ALLOW_ACTIVE_ENUMERATION=true ;;
             A) ALLOW_ACTIVE_VALIDATION=true ;;
             V) ALLOW_SECRET_VERIFICATION=true ;;
             c) RESUME_DIR="$OPTARG" ;;
@@ -4239,12 +4188,11 @@ main() {
         error "Target must be a plain DNS domain name with no URL, wildcard, path, IP, CIDR, or leading/trailing hyphen labels."
         exit 1
     fi
-    for _scope_file in "${SCOPE_INCLUDE_FILE:-}" "${SCOPE_EXCLUDE_FILE:-}" "${CLOUD_APPROVAL_FILE:-}"; do
-        if [ -n "$_scope_file" ] && [ ! -r "$_scope_file" ]; then
-            error "Authorization/scope file is not readable: $_scope_file"
-            exit 1
-        fi
-    done
+    # Parse all authorization inputs before dependency checks or any traffic.
+    AUTHORIZATION_FINGERPRINT=$(authorization_fingerprint) || {
+        error "Invalid authorization policy; no scan was started."
+        return 1
+    }
     if [ "$OUTPUT_EXPLICIT" = true ] && [ -n "$RESUME_DIR" ]; then
         error "Use either -o for a new scan or -c to resume, not both."
         exit 1
@@ -4262,6 +4210,7 @@ main() {
             error "Resume refused: $early_meta is missing, so the directory cannot be safely bound to a target."
             exit 1
         fi
+        check_resume_authorization "$early_meta" || return 1
         local stored_target stored_mode
         stored_target=$(awk -F= '$1=="TARGET" {sub(/^[^=]*=/,""); print; exit}' "$early_meta")
         stored_mode=$(awk -F= '$1=="SCAN_MODE" {sub(/^[^=]*=/,""); print; exit}' "$early_meta")
@@ -4308,6 +4257,7 @@ main() {
     info "Scope Include   : ${SCOPE_INCLUDE_FILE:-target + subdomains}"
     info "Scope Exclude   : ${SCOPE_EXCLUDE_FILE:-none}"
     info "Cloud Approval  : ${CLOUD_APPROVAL_FILE:-none (cloud probing disabled)}"
+    info "Active Enumerate: $ALLOW_ACTIVE_ENUMERATION"
     info "Active Validate : $ALLOW_ACTIVE_VALIDATION"
     info "Secret Verify   : $ALLOW_SECRET_VERIFICATION"
     info "Amass Timeout   : ${AMASS_TIMEOUT}s"
@@ -4335,8 +4285,9 @@ main() {
     fi
 
     local meta_tmp="${SCAN_META_FILE}.tmp.$$"
-    printf 'TARGET=%s\nSCAN_MODE=%s\n' "$TARGET" "$SCAN_MODE" > "$meta_tmp"
-    mv -f "$meta_tmp" "$SCAN_META_FILE"
+    printf 'TARGET=%s\nSCAN_MODE=%s\nAUTHORIZATION_SHA256=%s\n' \
+        "$TARGET" "$SCAN_MODE" "$AUTHORIZATION_FINGERPRINT" > "$meta_tmp" || return 1
+    mv -f "$meta_tmp" "$SCAN_META_FILE" || return 1
     if [ "$MODE_CHANGED" = true ]; then
         printf '0\n' > "$CHECKPOINT_FILE"
         RESUME_FROM=0
@@ -4491,3 +4442,4 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi
+
