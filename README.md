@@ -15,9 +15,9 @@ It is designed for **authorized security research only**. Use it exclusively on 
 - Passive and active subdomain discovery
 - DNS resolution and wildcard filtering
 - Subdomain takeover checks
-- Ownership-aware cloud storage enumeration
+- Exact provider/resource-approved cloud storage enumeration
 - HTTP probing, technology detection, and status-code grouping
-- Hidden virtual-host discovery
+- Host-policy enforcement (the existing direct-IP virtual-host path is disabled)
 - Port scanning and alternate web-service detection
 - Live, in-scope URL corpus generation
 - Parameter discovery and endpoint categorization
@@ -45,7 +45,7 @@ Before running NullSec:
 4. Adjust concurrency, rate limits, timeouts, and scan mode for the target.
 5. Never submit raw automated output without manual reproduction and impact analysis.
 
-NullSec enforces an apex-domain boundary for many downstream inputs, but **scope validation remains the operator's responsibility**. Wildcard program scope, third-party services, shared infrastructure, acquisitions, CDNs, and cloud resources can require additional ownership verification.
+NullSec requires an explicit host policy and separate action permissions. By default, only the exact `-d` host is approved for passive collection; target-facing enumeration, active validation, and secret verification are disabled. Exclusions override approvals. These controls authorize the inputs NullSec hands to tools; they do not sandbox requests generated inside an external tool. Operators must still check program permissions and tool behavior.
 
 ## Requirements
 
@@ -64,26 +64,26 @@ Package availability and names may differ by distribution.
 
 ### Required tools
 
-The script now performs **mode-aware** dependency checks. A tool is treated as fatal only when the selected scan mode enables a phase that truly needs it. Missing optional tools are reported clearly and the related check is skipped or reduced.
+The script now performs **mode-aware** dependency checks. A tool is treated as fatal only when the selected scan mode and authorization policy enable a phase that needs it. Missing optional tools are reported clearly and the related check is skipped or reduced.
 
 | Tool | Purpose | Required when |
 |---|---|---|
-| Amass v4 or Amass fallback | Subdomain and DNS relationship discovery | All modes |
+| Amass v4 or Amass fallback | Subdomain and DNS relationship discovery | When target-facing enumeration is authorized |
 | Subfinder | Passive subdomain enumeration | All modes |
 | Assetfinder | Passive subdomain enumeration | All modes |
-| dnsx | DNS validation and wildcard detection | All modes |
-| httpx-toolkit | HTTP probing and metadata collection | All modes |
-| Katana | Web crawling | All modes |
-| Waybackurls | Historical URL collection | All modes |
-| GAU | Historical and indexed URL collection | All modes |
-| Unfurl | URL and parameter extraction | All modes |
-| Nuclei | Template-based scanning and confirmation | All modes |
+| dnsx | DNS validation and wildcard detection | When target-facing enumeration is authorized |
+| httpx-toolkit | HTTP probing and metadata collection | When target-facing enumeration is authorized |
+| Katana | Web crawling | When target-facing enumeration is authorized |
+| Waybackurls | Historical URL collection | When target-facing enumeration is authorized |
+| GAU | Historical and indexed URL collection | When target-facing enumeration is authorized |
+| Unfurl | URL and parameter extraction | When target-facing enumeration is authorized |
+| Nuclei | Template-based scanning and confirmation | When active validation is authorized |
 | jq | JSON processing | All modes |
 | curl | HTTP requests and connectivity checks | All modes |
-| PureDNS | DNS brute force and permutation resolution | `normal` and `deep` by default |
-| Naabu | Port scanning | `normal` and `deep` by default |
-| ffuf | Virtual-host and content fuzzing | `normal` for vhost discovery; `deep` for vhost and directory fuzzing |
-| Arjun | Active parameter discovery | `deep` by default |
+| PureDNS | DNS brute force and permutation resolution | `normal` and `deep` with `-A` |
+| Naabu | Port scanning | `normal` and `deep` with `-A` |
+| ffuf | Content fuzzing | Authorized active validation in `deep`; direct-IP vhost discovery is disabled |
+| Arjun | Active parameter discovery | `deep` with `-A -V` |
 
 > [!NOTE]
 > The expected ProjectDiscovery binary name is `httpx-toolkit`. This avoids conflicts with the unrelated Python package named `httpx`.
@@ -106,7 +106,7 @@ NullSec continues when optional tools are unavailable, but the related checks ar
 | dig | DNS ownership evidence collection |
 | cloud_enum | Detected but intentionally not used for ungated global-name mutation |
 | S3Scanner | Optional cloud tooling |
-| TruffleHog | Verified JavaScript secret detection; regex extraction still runs without it |
+| TruffleHog | Secret verification requires `-K`; regex extraction remains local |
 
 ### Wordlists
 
@@ -204,7 +204,7 @@ Created by Jonaski
 
 ## Quick Start
 
-Run the default `normal` scan:
+Run passive collection with the default `normal` preset (the preset grants no permissions):
 
 ```bash
 ./nullsec.sh -d example.com
@@ -223,16 +223,16 @@ export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"
 ./nullsec.sh -d example.com
 ```
 
-Run a lightweight scan:
+Select the lightweight preset (still passive-only without `-A`):
 
 ```bash
 ./nullsec.sh -d example.com -m fast
 ```
 
-Run the full pipeline with template updates and polite inter-phase delays:
+Select the deep preset with explicit action permissions and an externally prepared approved-host policy:
 
 ```bash
-./nullsec.sh -d example.com -m deep -u -r
+./nullsec.sh -d example.com -m deep -I /tmp/approved-hosts.txt -A -V -K -u -r
 ```
 
 Write results to a specific new directory:
@@ -241,7 +241,7 @@ Write results to a specific new directory:
 ./nullsec.sh -d example.com -m normal -o ./results/example-normal
 ```
 
-Resume an interrupted scan:
+Resume an interrupted scan with the same policy files and action flags (this example assumes the default passive policy):
 
 ```bash
 ./nullsec.sh -d example.com -m normal -c ./recon-example.com-20260707-090000
@@ -255,6 +255,12 @@ Usage: ./nullsec.sh -d <target-domain> [options]
   -d <domain>   Target domain; required
   -o <dir>      New output directory
   -m <mode>     fast, normal, or deep; default: normal
+  -I <file>     Approved hosts; replaces the default exact -d host
+  -E <file>     Excluded hosts; exclusions override approvals
+  -C <file>     Exact cloud approvals: s3:name, gcs:name, azure:name
+  -A            Permit target-facing enumeration; disabled by default
+  -V            Permit active validation; also requires -A
+  -K            Permit secret verification; disabled by default
   -s            Skip the dependency check
   -u            Update Nuclei templates before scanning
   -r            Add polite delays between phases
@@ -265,15 +271,77 @@ Usage: ./nullsec.sh -d <target-domain> [options]
 
 The target must be a plain DNS domain such as `example.com`. Do not pass a URL, path, wildcard, IP address, CIDR range, or labels with leading/trailing hyphens.
 
-`-o` and `-c` cannot be used together. A new `-o` directory must be empty. Resume mode verifies the stored target before continuing.
+`-o` and `-c` cannot be used together. A new explicit `-o` directory must be empty. Resume verifies the stored target and authorization fingerprint before any network launch. Re-supply the policy options and permissions used for the original run.
+
+## Authorization policy
+
+Policy files must be prepared outside the repository. Host files contain one exact DNS hostname or `*.domain` rule per line. Empty lines and `#` comments are ignored; case, trailing dots, whitespace, line endings, ordering, and duplicate rules are normalized. Rules use dotted ASCII DNS names with an alphabetic-starting final label. URLs, ports, IP/CIDR ranges, userinfo, and wildcard forms other than `*.domain` are not policy rules.
+
+Example approved-host file:
+
+```text
+example.com
+*.example.com
+```
+
+`*.example.com` approves subdomains at any depth and does **not** approve the apex. Supply the apex separately when needed. `-I` replaces the default exact target approval; it does not silently add the target or all its subdomains.
+
+Example exclusion file:
+
+```text
+excluded.example.com
+*.restricted.example.com
+```
+
+Exact exclusions reject that exact host. Wildcard exclusions reject descendants, not their apex. Use both rules when excluding a host and its entire subtree. Exclusions always override matching approvals.
+
+Permissions are independent of modes:
+
+| Option | Permission |
+|---|---|
+| No action options | Passive Subfinder/Assetfinder/CT collection only; no target-facing activity |
+| `-A` | Target-facing DNS/Amass enumeration, probing, crawling, port discovery, JS downloads, and screenshots |
+| `-A -V` | Additionally permit Nuclei checks, Arjun, Dalfox, SQLMap, CORS/host-header checks, and content fuzzing when the preset enables them |
+| `-K` | Permit TruffleHog secret verification; the normal pipeline also needs `-A` to download JS |
+| `-C <file>` | Approve exact cloud identities; cloud probes additionally need `-A` and a cloud-enabled preset |
+
+Approved hosts cover valid ports on those hosts. Final launch inputs preserve valid hostname ports and reject malformed/ambiguous authorities. IP seeds are not approved by hostname rules. Consequently the existing direct-IP vhost implementation is disabled; no IP authorization is inferred from DNS resolution.
+
+Cloud approval files contain exact provider identities:
+
+```text
+s3:example-assets
+gcs:example-assets
+azure:exampleassets
+```
+
+Cloud references in DNS or web content are leads only. The current cloud phase probes the intersection of referenced resources and explicit exact approvals, then checks approval again in each worker/request. `s3:example-assets` grants nothing for GCS or Azure, and no naming similarity grants permission. Host exclusions also deny matching provider endpoint hosts, even when the resource is explicitly approved. Unapproved references never authorize provider requests. Cloud provider URLs are not exempted from the host policy in generic scan feeds.
+
+Example operator-approved enumeration:
+
+```bash
+./nullsec.sh -d example.com -I /tmp/approved-hosts.txt -E /tmp/excluded-hosts.txt -A
+```
+
+Add `-V`, `-K`, or `-C` only when those actions/resources are expressly permitted. A mode may disable an action; it never authorizes one. `-s`, `-u`, cached results, and checkpoints do not override authorization.
+
+Policy files are loaded as one snapshot per invocation; edits require a restart. The normalized host rules, exclusions, cloud approvals, action permissions, and target form a SHA-256 fingerprint stored in `.scan-meta`. Equivalent normalized policies have the same identity. Resume refuses changed rules/permissions and missing, duplicated, or malformed fingerprint state. Older output directories without that state cannot be resumed; choose a new output directory. A mode change may restart phases only after the current policy matches.
+
+NullSec removes its explicit httpx redirect-following options and uses curl with configuration defaults disabled and no redirects for controlled requests. Every controlled list launch receives a fresh authorized snapshot; filtering errors stop the launch and empty authorized lists skip safely.
+
+This is **seed authorization, not an external-tool sandbox**. Crawlers, scanners, browsers, resolvers, template updates, and secret verifiers can generate requests internally, including redirects, browser subresources, OAST traffic, or provider verification. NullSec does not promise to confine those internals. Decline the corresponding permission when the tool's behavior is incompatible with program scope, or apply independently verified network controls. SQLMap's existing target regex is not a guarantee that arbitrary exclusions constrain all internal requests.
+
+Passive services remain external: certificate transparency, installed passive data providers, the fixed Cloudflare connectivity check, and Telegram when configured. Secret verification may contact services outside host scope only after `-K`; exact credential/provider authorization still requires operator review.
 
 ## Scan Modes
+
+The table describes preset capabilities **after** the corresponding action permissions are supplied. Without `-A`, every mode is limited to passive collection. Vhost discovery remains disabled by the host-only policy.
 
 | Mode | Intended use | Main behavior | Approximate runtime |
 |---|---|---|---|
 | `fast` | Frequent or scheduled checks | Passive discovery, live probing, URL collection, and critical-only Nuclei scanning; skips cloud enumeration, brute force, port scanning, JavaScript analysis, screenshots, pattern hunting, fuzzing, and active confirmation | 5–15 minutes |
-| `normal` | Daily reconnaissance | Adds DNS brute force, cloud checks, port scanning, asset scoring, JavaScript analysis, pattern hunting, screenshots, and virtual-host discovery; skips permutations, Arjun, directory fuzzing, and Phase 12 confirmation | 30–60 minutes |
-| `deep` | First-time onboarding or thorough periodic scans | Enables the complete pipeline, increases selected limits, and includes permutations, Arjun, directory fuzzing, and active confirmation | 1–4+ hours |
+| `normal` | Daily reconnaissance | Adds DNS brute force, cloud checks, port scanning, asset scoring, JavaScript analysis, pattern hunting, screenshots; skips permutations, Arjun, directory fuzzing, and Phase 12 confirmation | 30–60 minutes |
+| `deep` | First-time onboarding or thorough periodic scans | Selects all otherwise supported phases subject to explicit permissions, increases selected limits, and includes permutations, Arjun, directory fuzzing, and active confirmation | 1–4+ hours |
 
 Runtime depends on the number of discovered assets, target responsiveness, network conditions, WAF behavior, tool versions, and configured limits.
 
@@ -308,9 +376,9 @@ phase2-validation/takeover-findings.txt
 
 ### Phase 2.5 — Cloud storage enumeration
 
-Builds possible S3, Google Cloud Storage, and Azure names, but probes only names supported by provider-specific ownership evidence found in target-controlled DNS or web content.
+Builds cloud leads from DNS/web references, but probes only exact provider resources also approved by `-C`, with target-facing enumeration authorized by `-A`. References do not establish ownership or permission.
 
-Uncorroborated global namespace guesses are stored as **not probed**. Public-write detection is based on anonymous ACL, policy, or IAM inspection rather than uploading a test object.
+Unapproved resources and global namespace guesses are **not probed**. Public-write detection is based on anonymous ACL, policy, or IAM inspection rather than uploading a test object.
 
 Primary outputs:
 
@@ -323,7 +391,7 @@ phase2.5-cloud/exposed/critical-writable.txt
 
 ### Phase 3 — Live web probing
 
-Uses httpx-toolkit to identify web services, collect titles and technologies, group status codes, and optionally run ffuf virtual-host discovery.
+Uses httpx-toolkit to identify web services, collect titles and technologies, and group status codes. The previous direct-IP ffuf vhost launch is disabled by the current host policy.
 
 Primary outputs:
 
@@ -401,7 +469,7 @@ phase7-vulns/exposure-findings.txt
 
 ### Phase 8 — JavaScript analysis
 
-Downloads a bounded number of in-scope JavaScript responses with per-file and aggregate size limits. When TruffleHog is installed, it runs in verified-only mode; targeted regex extraction still runs without TruffleHog. It also extracts possible in-scope API endpoints.
+Downloads a bounded number of in-scope JavaScript responses with per-file and aggregate size limits. When TruffleHog is installed and `-K` is explicitly supplied, it runs in verified-only mode; targeted regex extraction still runs without TruffleHog. It also extracts possible in-scope API endpoints.
 
 Primary outputs:
 
@@ -433,7 +501,7 @@ Builds investigation lists for:
 - CORS misconfiguration
 - Host-header injection
 
-When available, Dalfox and SQLMap receive deduplicated, capped injection points. CORS and host-header checks include failure-window logic that stops early when throttling or network instability is detected.
+When `-A -V` is supplied and the tools are available, Dalfox and SQLMap receive deduplicated, capped, currently authorized injection points. CORS and host-header checks include failure-window logic that stops early when throttling or network instability is detected.
 
 Primary outputs:
 
@@ -501,7 +569,7 @@ NullSec stores:
 .scan-meta
 ```
 
-The metadata binds the output directory to the target and scan mode. Resume mode refuses a target mismatch. Changing the mode while resuming restarts at Phase 1 inside the same target-bound directory.
+The metadata binds the output directory to the target, scan mode, and normalized authorization fingerprint. Resume refuses target or authorization mismatches and missing authorization state. Changing the mode while resuming restarts at Phase 1 only when authorization still matches.
 
 When interrupted with `Ctrl+C`, NullSec attempts to:
 

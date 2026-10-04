@@ -35,6 +35,20 @@ AUTHOR="Jonaski"
 TARGET=""
 OUTPUT_DIR=""
 
+# Authorization is explicit, independent of scan mode, and loaded once per run.
+# Policy files are operator inputs outside this three-file repository.
+INCLUDE_SCOPE_FILE=""
+EXCLUDE_SCOPE_FILE=""
+CLOUD_APPROVAL_FILE=""
+ALLOW_ACTIVE_ENUM=false
+ALLOW_ACTIVE_VALIDATION=false
+ALLOW_SECRET_VERIFICATION=false
+POLICY_READY=false
+INCLUDE_RULES=""
+EXCLUDE_RULES=""
+CLOUD_RULES=""
+POLICY_FINGERPRINT=""
+
 # Wordlist paths (modify to match your system)
 WORDLIST_DIR="/usr/share/wordlists"
 SECLISTS="$WORDLIST_DIR/seclists"
@@ -476,51 +490,313 @@ resolve_nuclei_templates() {
     return 1
 }
 
-# In-scope filter — given a stream of hosts or URLs on stdin, emit only those
-# whose hostname is the TARGET apex or a subdomain of it.  Prevents scanning
-# of third-party CDN / ad / analytics hosts (jsdelivr, googlesyndication,
-# facebook, googletagmanager, etc.) that show up in URL gathering but are
-# out-of-scope for any bug-bounty engagement against TARGET.
-#
-# Accepts both bare hostnames ("foo.example.com") and URLs
-# ("https://foo.example.com/bar"); extracts the hostname portion before
-# matching.  Match is case-insensitive and anchored: must end with
-# ".TARGET" or equal TARGET exactly.
-#
-# Usage:
-#   cat all-urls.txt | in_scope > in-scope-urls.txt
-#   in_scope < hosts.txt
-in_scope() {
-    if [ -z "${TARGET:-}" ]; then
-        warn "in_scope: TARGET is unset — refusing to filter (pass-through disabled)"
-        return 1
-    fi
-    awk -v target="$TARGET" '
-        BEGIN { tlow = tolower(target); sub(/\.$/, "", tlow) }
-        {
-            line = $0
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-            if (line == "") next
+# Host rules are exact names or *.domain (subdomains only, not the apex).
+# Exclusions override inclusions. Filtering requires a loaded current policy.
+_trim_policy_line() {
+    local line="${1%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    printf '%s\n' "$line"
+}
 
-            is_url = (line ~ /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
-            host = line
-            sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", host)
-            sub(/[\/?#].*$/, "", host)
-            sub(/^[^@]+@/, "", host)
-            if (host ~ /^\[/) {
-                sub(/^\[/, "", host)
-                sub(/\](:[0-9]+)?$/, "", host)
-            } else {
-                sub(/:[0-9]+$/, "", host)
-            }
-            sub(/\.$/, "", host)
-            hlow = tolower(host)
-            suffix = "." tlow
-            if (hlow == tlow || (length(hlow) > length(suffix) && substr(hlow, length(hlow)-length(suffix)+1) == suffix)) {
-                print is_url ? line : hlow
-            }
-        }
-    '
+_valid_policy_host() {
+    local host="$1"
+    [ "${#host}" -le 253 ] &&
+        [[ "$host" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] &&
+        [[ "${host##*.}" =~ ^[a-z] ]] &&
+        ! [[ "$host" =~ ^[0-9.]+$ ]]
+}
+
+# Strict HTTP(S)/DNS authority parsing. Userinfo, IPs, wildcard authorities,
+# backslashes, escaped authorities and ambiguous ports are rejected.
+# Paths/query values retain case; hostnames and schemes are canonicalized.
+normalize_scope_input() {
+    local line="$1" scheme="" rest authority host port="" tail=""
+    [[ -n "$line" && "$line" != *[[:space:][:cntrl:]]* && "$line" != *\\* ]] || return 1
+    if [[ "$line" == *://* ]]; then
+        scheme="${line%%://*}"; scheme="${scheme,,}"
+        [[ "$scheme" == http || "$scheme" == https ]] || return 1
+        rest="${line#*://}"
+        authority="${rest%%[/?#]*}"
+        tail="${rest#"$authority"}"
+    else
+        [[ "$line" != *[/?#]* ]] || return 1
+        authority="$line"
+    fi
+    [[ -n "$authority" && "$authority" != *[@%\[\]]* ]] || return 1
+    host="$authority"
+    if [[ "$authority" == *:* ]]; then
+        host="${authority%:*}"; port="${authority##*:}"
+        [[ "$host" != *:* && "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+        port=$((10#$port))
+        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    fi
+    host="${host,,}"; host="${host%.}"
+    _valid_policy_host "$host" || return 1
+    printf '%s%s%s%s\n' "${scheme:+$scheme://}" "$host" "${port:+:$port}" "$tail"
+}
+
+_host_rule_matches() {
+    local host="$1" rule="$2"
+    if [[ "$rule" == \*.* ]]; then
+        [[ "$host" == *."${rule#*.}" ]]
+    else
+        [ "$host" = "$rule" ]
+    fi
+}
+
+scope_host_excluded() {
+    local host="$1" rule
+    while IFS= read -r rule; do
+        [ -n "$rule" ] || continue
+        _host_rule_matches "$host" "$rule" && return 0
+    done <<< "$EXCLUDE_RULES"
+    return 1
+}
+
+scope_host_allowed() {
+    local host="$1" rule included=false
+    [ "$POLICY_READY" = true ] && [ -n "$INCLUDE_RULES" ] || return 1
+    scope_host_excluded "$host" && return 1
+    while IFS= read -r rule; do
+        [ -n "$rule" ] || continue
+        _host_rule_matches "$host" "$rule" && included=true
+    done <<< "$INCLUDE_RULES"
+    [ "$included" = true ]
+}
+
+in_scope() {
+    local line normalized authority host
+    [ "$POLICY_READY" = true ] && [ -n "$INCLUDE_RULES" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        normalized=$(normalize_scope_input "$line") || continue
+        authority="${normalized#*://}"; authority="${authority%%[/?#]*}"
+        host="${authority%%:*}"
+        scope_host_allowed "$host" || continue
+        printf '%s\n' "$normalized" || return 1
+    done
+}
+
+normalize_cloud_identity() {
+    local identity="${1,,}" provider name
+    [[ "$identity" == *:* ]] || return 1
+    provider="${identity%%:*}"; name="${identity#*:}"
+    case "$provider" in
+        s3) [[ "$name" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ && "$name" != *..* ]] || return 1 ;;
+        gcs) [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*[a-z0-9]$ && "$name" != *..* ]] || return 1 ;;
+        azure) [[ "$name" =~ ^[a-z0-9]+$ && "${#name}" -le 24 ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    [ "${#name}" -ge 3 ] && [ "${#name}" -le 63 ] || return 1
+    printf '%s:%s\n' "$provider" "$name"
+}
+
+_read_policy_rules() {
+    local file="$1" kind="$2" line rule base
+    [ -f "$file" ] && [ -r "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=$(_trim_policy_line "${line%%#*}") || return 1
+        [ -n "$line" ] || continue
+        if [ "$kind" = cloud ]; then
+            rule=$(normalize_cloud_identity "$line") || return 1
+        else
+            rule="${line,,}"; rule="${rule%.}"; base="${rule#\*.}"
+            _valid_policy_host "$base" || return 1
+            [[ "$rule" == "$base" || "$rule" == "*.$base" ]] || return 1
+        fi
+        printf '%s\n' "$rule" || return 1
+    done < "$file"
+}
+
+load_authorization_policy() {
+    POLICY_READY=false
+    if [ -n "$INCLUDE_SCOPE_FILE" ]; then
+        INCLUDE_RULES=$(_read_policy_rules "$INCLUDE_SCOPE_FILE" hosts | LC_ALL=C sort -u) || return 1
+    else
+        INCLUDE_RULES="${TARGET,,}"; INCLUDE_RULES="${INCLUDE_RULES%.}"
+        _valid_policy_host "$INCLUDE_RULES" || return 1
+    fi
+    [ -n "$INCLUDE_RULES" ] || return 1
+    EXCLUDE_RULES=""; CLOUD_RULES=""
+    if [ -n "$EXCLUDE_SCOPE_FILE" ]; then
+        EXCLUDE_RULES=$(_read_policy_rules "$EXCLUDE_SCOPE_FILE" hosts | LC_ALL=C sort -u) || return 1
+    fi
+    if [ -n "$CLOUD_APPROVAL_FILE" ]; then
+        CLOUD_RULES=$(_read_policy_rules "$CLOUD_APPROVAL_FILE" cloud | LC_ALL=C sort -u) || return 1
+    fi
+    case "$ALLOW_ACTIVE_ENUM:$ALLOW_ACTIVE_VALIDATION:$ALLOW_SECRET_VERIFICATION" in
+        true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) return 1 ;;
+    esac
+    POLICY_FINGERPRINT=$(
+        printf 'POLICY_VERSION=1\nTARGET=%s\nENUM=%s\nVALIDATE=%s\nVERIFY=%s\nINCLUDE\n%s\nEXCLUDE\n%s\nCLOUD\n%s\n' \
+            "$TARGET" "$ALLOW_ACTIVE_ENUM" "$ALLOW_ACTIVE_VALIDATION" "$ALLOW_SECRET_VERIFICATION" \
+            "$INCLUDE_RULES" "$EXCLUDE_RULES" "$CLOUD_RULES" | sha256sum
+    ) || return 1
+    POLICY_FINGERPRINT="${POLICY_FINGERPRINT%% *}"
+    [[ "$POLICY_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || return 1
+    POLICY_READY=true
+    export POLICY_READY INCLUDE_RULES EXCLUDE_RULES CLOUD_RULES POLICY_FINGERPRINT
+    export ALLOW_ACTIVE_ENUM ALLOW_ACTIVE_VALIDATION ALLOW_SECRET_VERIFICATION
+}
+
+authorization_allowed() {
+    [ "$POLICY_READY" = true ] || return 1
+    case "$1" in
+        passive) return 0 ;;
+        enumeration) [ "$ALLOW_ACTIVE_ENUM" = true ] ;;
+        validation) [ "$ALLOW_ACTIVE_ENUM" = true ] && [ "$ALLOW_ACTIVE_VALIDATION" = true ] ;;
+        verification) [ "$ALLOW_SECRET_VERIFICATION" = true ] ;;
+        *) return 1 ;;
+    esac
+}
+
+cloud_resource_allowed() {
+    local identity rule provider name host
+    authorization_allowed enumeration || return 1
+    identity=$(normalize_cloud_identity "$1") || return 1
+    provider="${identity%%:*}"; name="${identity#*:}"
+    case "$provider" in
+        s3) host="$name.s3.amazonaws.com" ;;
+        gcs) host=storage.googleapis.com ;;
+        azure) host="$name.blob.core.windows.net" ;;
+    esac
+    scope_host_excluded "$host" && return 1
+    while IFS= read -r rule; do
+        [ "$identity" = "$rule" ] && return 0
+    done <<< "$CLOUD_RULES"
+    return 1
+}
+
+cloud_approved_names() {
+    local provider="$1" name
+    [ "$POLICY_READY" = true ] || return 1
+    while IFS= read -r name || [ -n "$name" ]; do
+        cloud_resource_allowed "$provider:$name" || continue
+        printf '%s\n' "$name" || return 1
+    done
+}
+
+validate_resume_authorization() {
+    local file="$1" stored
+    [ "$POLICY_READY" = true ] && [ -r "$file" ] || return 1
+    stored=$(awk -F= '$1=="POLICY_FINGERPRINT" {n++; if(NF!=2) invalid=1; value=$2} END {if(n!=1 || invalid) exit 1; print value}' "$file") || return 1
+    [[ "$stored" =~ ^[0-9a-f]{64}$ ]] && [ "$stored" = "$POLICY_FINGERPRINT" ]
+}
+
+# Every controlled target launch uses a newly filtered snapshot or scalar.
+# @AUTHORIZED_INPUT@ is replaced only after successful authorization. This
+# controls seed inputs, not requests generated internally by external tools.
+authorized_run() (
+    local action="$1" kind="$2" input="$3" prepared="" tmp="" arg host label
+    shift 3
+    [ "$POLICY_READY" = true ] || return 1
+    if ! authorization_allowed "$action"; then
+        printf 'Authorization: skipped %s action\n' "$action" >&2
+        return 0
+    fi
+    trap '[ -z "$tmp" ] || rm -f -- "$tmp"' EXIT
+    case "$kind" in
+        host)
+            prepared=$(printf '%s\n' "$input" | in_scope) || return 1
+            [ -n "$prepared" ] || return 0 ;;
+        list|stream|dns-wordlist)
+            tmp=$(mktemp "${TMPDIR:-/tmp}/nullsec-authorized.XXXXXX") || return 1
+            if [ "$kind" = stream ]; then
+                in_scope > "$tmp" || return 1
+            elif [ "$kind" = list ]; then
+                in_scope < "$input" > "$tmp" || return 1
+            else
+                # Filter generated DNS destinations before handing labels to
+                # the brute-force tool; exclusions apply after expansion.
+                while IFS= read -r label || [ -n "$label" ]; do
+                    host="$label.$TARGET"
+                    prepared=$(printf '%s\n' "$host" | in_scope) || return 1
+                    [ -z "$prepared" ] || printf '%s\n' "$label" || return 1
+                done < "$input" > "$tmp" || return 1
+            fi
+            [ -s "$tmp" ] || return 0
+            prepared="$tmp" ;;
+        service)
+            [ "$action" = passive ] || return 1
+            case "$input" in
+                "https://crt.sh/?q=%25.$TARGET&output=json") scope_host_allowed "$TARGET" || return 0 ;;
+                https://1.1.1.1/cdn-cgi/trace|telegram) ;;
+                *) return 1 ;;
+            esac
+            prepared="$input" ;;
+        maintenance) [ "$action" = validation ] || return 1; prepared="$input" ;;
+        local-verification) [ "$action" = verification ] || return 1; prepared="$input" ;;
+        *) return 1 ;;
+    esac
+    local -a args=()
+    for arg in "$@"; do
+        case "$arg" in
+            -follow-redirects|-follow-host-redirects|-fr|-fhr|--location*|-L) return 1 ;;
+        esac
+        if [[ "$arg" == -?* && "$arg" != --* && "$arg" == *L* ]]; then return 1; fi
+        if [ "$arg" = '@AUTHORIZED_INPUT@' ]; then arg="$prepared"; fi
+        args+=("$arg")
+    done
+    if [ "$kind" = stream ]; then
+        "${args[@]}" < "$tmp"
+    else
+        "${args[@]}"
+    fi
+)
+
+# Each worker request independently checks the exact provider identity.
+# Curl config defaults and redirects are disabled for controlled downloads.
+authorized_cloud_curl() {
+    local identity="$1" provider name arg found_url=false
+    shift
+    cloud_resource_allowed "$identity" || return 0
+    identity=$(normalize_cloud_identity "$identity") || return 1
+    provider="${identity%%:*}"; name="${identity#*:}"
+    for arg in "$@"; do
+        case "$arg" in --location*|-L|--config|-K) return 1 ;; esac
+        if [[ "$arg" == -?* && "$arg" != --* && "$arg" == *L* ]]; then return 1; fi
+        if [[ "$arg" == http://* || "$arg" == https://* ]]; then
+            found_url=true
+            case "$provider:$arg" in
+                "s3:https://$name.s3.amazonaws.com"|"s3:https://$name.s3.amazonaws.com?acl"|"s3:https://$name.s3.amazonaws.com?policy") ;;
+                "gcs:https://storage.googleapis.com/$name"|"gcs:https://storage.googleapis.com/storage/v1/b/$name"|"gcs:https://storage.googleapis.com/storage/v1/b/$name/o?maxResults=10"|"gcs:https://storage.googleapis.com/storage/v1/b/$name/iam") ;;
+                "azure:https://$name.blob.core.windows.net"|"azure:https://$name.blob.core.windows.net/"*) ;;
+                *) return 1 ;;
+            esac
+        fi
+    done
+    [ "$found_url" = true ] || return 1
+    command curl -q --proto '=https' --max-redirs 0 "$@"
+}
+export -f _valid_policy_host normalize_scope_input _host_rule_matches scope_host_excluded scope_host_allowed in_scope
+export -f normalize_cloud_identity authorization_allowed cloud_resource_allowed authorized_cloud_curl
+
+apply_authorization_controls() {
+    # Modes may reduce permissions; they never grant them.
+    if ! authorization_allowed enumeration; then
+        RUN_DNS_BRUTEFORCE=false
+        RUN_PERMUTATIONS=false
+        RUN_CLOUD_ENUM=false
+        RUN_PORT_SCAN=false
+        RUN_PARAM_DISCOVERY=false
+        RUN_ASSET_SCORING=false
+        RUN_JS_ANALYSIS=false
+        RUN_PATTERN_HUNTING=false
+        RUN_SCREENSHOTS=false
+        RUN_FUZZING=false
+        RUN_ACTIVE_VULNS=false
+    fi
+    if ! authorization_allowed validation; then
+        RUN_PARAM_DISCOVERY=false
+        RUN_FUZZING=false
+        RUN_ACTIVE_VULNS=false
+    fi
+    [ -n "$CLOUD_RULES" ] || RUN_CLOUD_ENUM=false
+    # The existing vhost implementation converts authorized hostnames to direct
+    # IP seeds. This host-only policy cannot approve that transformed authority.
+    RUN_VHOST_DISCOVERY=false
 }
 
 # Optional sleep between phases when -r flag is used
@@ -544,6 +820,7 @@ polite_sleep() {
 # use in the severity label and message body.
 notify() {
     [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ] && return 0
+    [[ "$TELEGRAM_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ && "$TELEGRAM_CHAT_ID" =~ ^-?[0-9]+$ ]] || return 1
     local label="$1" body="$2" text cfg
     text=$(printf '*[NullSec]* %s
 `Target:` %s
@@ -555,7 +832,7 @@ notify() {
     chmod 600 "$cfg"
     printf 'url = "https://api.telegram.org/bot%s/sendMessage"
 ' "$TELEGRAM_TOKEN" > "$cfg"
-    curl -s -X POST --config "$cfg" \
+    authorized_run passive service telegram curl -q --proto '=https' --max-redirs 0 -s -X POST --config "$cfg" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
         --data-urlencode "text=${text}" \
         --data-urlencode "parse_mode=Markdown" \
@@ -911,8 +1188,11 @@ check_tools() {
     # Mode-aware required tools. A tool is fatal only when an enabled phase truly
     # needs it. Optional validators/crawlers remain optional and are reported
     # without blocking the scan.
-    local required_tools=("subfinder" "assetfinder" "dnsx" "httpx-toolkit"
-        "katana" "waybackurls" "gau" "unfurl" "nuclei" "jq" "curl")
+    local required_tools=("subfinder" "assetfinder" "jq" "curl")
+    if authorization_allowed enumeration; then
+        required_tools+=("dnsx" "httpx-toolkit" "katana" "waybackurls" "gau" "unfurl")
+    fi
+    if authorization_allowed validation; then required_tools+=("nuclei"); fi
 
     if [ "$RUN_DNS_BRUTEFORCE" = true ] || [ "$RUN_PERMUTATIONS" = true ]; then
         required_tools+=("puredns")
@@ -948,6 +1228,7 @@ check_tools() {
     # FQDN/IP/DNS relationship output, while retaining the maintained binary as
     # a fallback so the framework remains portable.
     local amass_v4_version=""
+    if authorization_allowed enumeration; then
     if check_command "$AMASS_V4_BIN"; then
         amass_v4_version=$("$AMASS_V4_BIN" -version 2>&1 | head -n 1 || true)
     fi
@@ -962,6 +1243,9 @@ check_tools() {
         missing_required+=("$AMASS_V4_BIN|amass")
     fi
 
+    else
+        echo "  ○ Amass target enumeration not authorized"
+    fi
     for tool in "${unique_required[@]}"; do
         if check_command "$tool"; then
             echo -e "  ${GREEN}✓${NC} $tool"
@@ -1069,6 +1353,12 @@ usage() {
     echo "  -c <dir>          Resume scan from checkpoint in existing output directory"
     echo "  --version         Show NullSec version and author"
     echo "  --help            Show this help message"
+    echo "  -I <file>         Approved hosts: exact names or *.domain; default: exact -d"
+    echo "  -E <file>         Excluded hosts; exclusions override approvals"
+    echo "  -C <file>         Exact cloud approvals: s3:name, gcs:name, azure:name"
+    echo "  -A                Authorize target-facing enumeration (off by default)"
+    echo "  -V                Authorize active validation (also requires -A)"
+    echo "  -K                Authorize secret verification (off by default)"
     echo "  -h                Show this help message"
     echo ""
     echo "Amass compatibility:"
@@ -1112,7 +1402,7 @@ phase1_subdomain_discovery() {
 
     info "Running Subfinder (passive)..."
     : > "$p1dir/subfinder.txt"
-    if ! subfinder -d "$TARGET" -all -silent -o "$p1dir/subfinder.txt" 2>/dev/null; then
+    if ! authorized_run passive host "$TARGET" subfinder -d @AUTHORIZED_INPUT@ -all -silent -o "$p1dir/subfinder.txt" 2>/dev/null; then
         warn "Subfinder failed; preserving any partial output."
         phase_errors=$(( phase_errors + 1 ))
     fi
@@ -1170,7 +1460,7 @@ phase1_subdomain_discovery() {
             amass_config_args=(-config "$AMASS_V4_CONFIG")
         fi
 
-        _run_tracked_command timeout --signal=INT --kill-after=30s "$(( AMASS_TIMEOUT + 45 ))"             "$amass_bin" enum                 "${amass_config_args[@]}"                 -timeout "$amass_minutes"                 -d "$TARGET"                 -dir "$amass_state"                 -log "$amass_log"                 -o "$amass_detailed"
+        _run_tracked_command authorized_run enumeration host "$TARGET" timeout --signal=INT --kill-after=30s "$(( AMASS_TIMEOUT + 45 ))"             "$amass_bin" enum                 "${amass_config_args[@]}"                 -timeout "$amass_minutes"                 -d @AUTHORIZED_INPUT@                 -dir "$amass_state"                 -log "$amass_log"                 -o "$amass_detailed"
         rc=$?
 
         # Export only clean, in-scope FQDNs. Keep the full graph separately for
@@ -1178,6 +1468,7 @@ phase1_subdomain_discovery() {
         _nullsec_export_clean_amass "$amass_detailed" "$amass_clean"
     }
 
+    if authorization_allowed enumeration; then
     amass_version=""
     if [ "$AMASS_PREFER_V4" = true ] && check_command "$AMASS_V4_BIN"; then
         amass_version=$("$AMASS_V4_BIN" -version 2>&1 | head -n 1 || true)
@@ -1201,7 +1492,7 @@ phase1_subdomain_discovery() {
             info "Using installed pre-v4 Amass fallback."
             amass_raw="$p1dir/.amass-raw.tmp.$$"
             : > "$amass_raw"
-            _run_tracked_command timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     -passive -src -d "$TARGET"                     -o "$amass_raw"                     2> "$p1dir/amass-error.log"
+            _run_tracked_command authorized_run enumeration host "$TARGET" timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     -passive -src -d @AUTHORIZED_INPUT@                     -o "$amass_raw"                     2> "$p1dir/amass-error.log"
             rc=$?
             _nullsec_export_clean_amass "$amass_raw" "$amass_clean"
             rm -f "$amass_raw"
@@ -1220,7 +1511,7 @@ phase1_subdomain_discovery() {
                 amass_v5_config_args=(-config "$HOME/.config/amass/config.yaml")
             fi
 
-            _run_tracked_command timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     "${amass_v5_config_args[@]}"                     -d "$TARGET"                     -nocolor                     -dir "$amass_state"                     -log amass.log                     >/dev/null 2>&1
+            _run_tracked_command authorized_run enumeration host "$TARGET" timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     "${amass_v5_config_args[@]}"                     -d @AUTHORIZED_INPUT@                     -nocolor                     -dir "$amass_state"                     -log amass.log                     >/dev/null 2>&1
             rc=$?
 
             if "$amass_bin" subs                 -names -nocolor                 -d "$TARGET"                 -dir "$amass_state"                 -o "$amass_export"                 >/dev/null 2>> "$amass_log"; then
@@ -1239,6 +1530,10 @@ phase1_subdomain_discovery() {
         phase_errors=$(( phase_errors + 1 ))
     fi
 
+    else
+        info "Amass target enumeration skipped: -A was not supplied."
+        rc=0
+    fi
     unset -f _nullsec_run_amass_v4 _nullsec_export_clean_amass
 
     # Legacy compatibility: keep amass.txt as a clean hostname-only copy, while
@@ -1268,7 +1563,7 @@ phase1_subdomain_discovery() {
 
     info "Running Assetfinder..."
     tmp="$p1dir/.assetfinder.tmp.$$"
-    if assetfinder --subs-only "$TARGET" > "$tmp" 2>/dev/null; then
+    if authorized_run passive host "$TARGET" assetfinder --subs-only @AUTHORIZED_INPUT@ > "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$p1dir/assetfinder.txt"
     else
         warn "Assetfinder failed."
@@ -1283,7 +1578,7 @@ phase1_subdomain_discovery() {
     crt_body="$p1dir/.crtsh-response.tmp.$$"
     crt_tmp="$p1dir/.crtsh-results.tmp.$$"
 
-    crt_code=$(curl -sS         --connect-timeout 10         --max-time 45         --retry 4         --retry-delay 5         --retry-max-time 180         --retry-all-errors         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"         -o "$crt_body"         -w '%{http_code}'         "https://crt.sh/?q=%25.$TARGET&output=json"         2>/dev/null || true)
+    crt_code=$(authorized_run passive service "https://crt.sh/?q=%25.$TARGET&output=json" curl -q --proto '=https' --max-redirs 0 -sS         --connect-timeout 10         --max-time 45         --retry 4         --retry-delay 5         --retry-max-time 180         --retry-all-errors         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"         -o "$crt_body"         -w '%{http_code}'         "https://crt.sh/?q=%25.$TARGET&output=json"         2>/dev/null || true)
 
     if [ "$crt_code" = "200" ]        && jq -e 'type == "array"' "$crt_body" >/dev/null 2>&1; then
 
@@ -1317,14 +1612,14 @@ phase1_subdomain_discovery() {
     fi
     success "Unique passive subdomains: $(count_lines "$p1dir/all-subdomains-passive.txt")"
 
-    if check_command "hakrawler" && [ -s "$p1dir/all-subdomains-passive.txt" ]; then
+    if authorization_allowed enumeration && check_command "hakrawler" && [ -s "$p1dir/all-subdomains-passive.txt" ]; then
         info "Running Hakrawler for response-based subdomain discovery..."
         local target_escaped hakrawler_raw
         target_escaped=$(printf '%s' "$TARGET" | sed 's/\./\\./g')
         hakrawler_raw="$p1dir/.hakrawler-raw.tmp.$$"
         if sed 's|^|https://|' "$p1dir/all-subdomains-passive.txt" \
-            | httpx-toolkit -silent 2>/dev/null \
-            | hakrawler -subs -d 2 -timeout 10 -u 2>/dev/null > "$hakrawler_raw"; then
+            | authorized_run enumeration stream "" httpx-toolkit -silent 2>/dev/null \
+            | authorized_run enumeration stream "" hakrawler -subs -d 2 -timeout 10 -u 2>/dev/null > "$hakrawler_raw"; then
             grep -oE "[a-zA-Z0-9._-]+\.$target_escaped" "$hakrawler_raw" 2>/dev/null \
                 | sort -u > "$p1dir/hakrawler.txt" || : > "$p1dir/hakrawler.txt"
         else
@@ -1342,7 +1637,7 @@ phase1_subdomain_discovery() {
         if [ -s "$DNS_WORDLIST" ] && [ -r "$DNS_WORDLIST" ] && [ -s "$RESOLVERS" ] && [ -r "$RESOLVERS" ]; then
             info "Running Puredns bruteforce..."
             : > "$p1dir/puredns.txt"
-            if ! puredns bruteforce "$DNS_WORDLIST" "$TARGET" \
+            if ! authorized_run enumeration dns-wordlist "$DNS_WORDLIST" puredns bruteforce @AUTHORIZED_INPUT@ "$TARGET" \
                 -r "$RESOLVERS" --rate-limit 200 \
                 -w "$p1dir/puredns.txt" 2>/dev/null; then
                 warn "Puredns bruteforce failed; partial output was preserved."
@@ -1375,7 +1670,7 @@ phase1_subdomain_discovery() {
 
         info "Resolving permutations with Puredns..."
         : > "$p1dir/permutations-resolved.txt"
-        if [ -s "$p1dir/permutations-raw.txt" ] && ! puredns resolve "$p1dir/permutations-raw.txt" \
+        if [ -s "$p1dir/permutations-raw.txt" ] && ! authorized_run enumeration list "$p1dir/permutations-raw.txt" puredns resolve @AUTHORIZED_INPUT@ \
             -r "$RESOLVERS" -w "$p1dir/permutations-resolved.txt" 2>/dev/null; then
             warn "Puredns permutation resolution failed; partial output was preserved."
             phase_errors=$(( phase_errors + 1 ))
@@ -1424,6 +1719,7 @@ phase1_subdomain_discovery() {
 # PHASE 2: Validation & Resolution
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_validation() {
+    authorization_allowed enumeration || { info "phase2_validation: skipped by authorization policy"; return 0; }
     phase_done 2 && { polite_sleep; return 0; }
     print_phase "✅ PHASE 2: VALIDATION & RESOLUTION"
 
@@ -1446,7 +1742,7 @@ phase2_validation() {
     local resolvers_file="$p2dir/resolvers.txt"
     printf '8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n' > "$resolvers_file"
 
-    if ! dnsx -l "$p1dir/all-subdomains.txt" \
+    if ! authorized_run enumeration list "$p1dir/all-subdomains.txt" dnsx -l @AUTHORIZED_INPUT@ \
         -r "$resolvers_file" \
         -o "$p2dir/resolved.txt" \
         -wd "$p2dir/wildcards.txt" \
@@ -1476,9 +1772,9 @@ phase2_validation() {
     # 2.3 Subdomain takeover scanning
     : > "$p2dir/takeover-findings.txt"
     if [ -s "$p2dir/valid-subdomains.txt" ]; then
-        if [ -d "$NUCLEI_TEMPLATES/http/takeovers" ] || [ -d "$NUCLEI_TEMPLATES/http/takeovers/" ]; then
+        if authorization_allowed validation && [ -d "$NUCLEI_TEMPLATES/http/takeovers" ]; then
             info "Scanning for subdomain takeover vulnerabilities..."
-            if ! nuclei -l "$p2dir/valid-subdomains.txt" \
+            if ! authorized_run validation list "$p2dir/valid-subdomains.txt" nuclei -l @AUTHORIZED_INPUT@ \
                 -t "$NUCLEI_TEMPLATES/http/takeovers/" \
                 -o "$p2dir/takeover-findings.txt" \
                 -silent 2>"$p2dir/takeover-nuclei.log"; then
@@ -1492,7 +1788,11 @@ phase2_validation() {
                 info "No takeover vulnerabilities detected."
             fi
         else
-            warn "Takeover template directory missing: $NUCLEI_TEMPLATES/http/takeovers/ — skipping takeover scan."
+            if ! authorization_allowed validation; then
+                info "Takeover scan skipped: active validation was not authorized."
+            else
+                warn "Takeover template directory missing: $NUCLEI_TEMPLATES/http/takeovers/ — skipping takeover scan."
+            fi
         fi
     fi
 
@@ -1527,6 +1827,7 @@ phase2_validation() {
 #   - Report:  dedicated cloud findings section
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_5_cloud_enum() {
+    authorization_allowed enumeration || { info "phase2_5_cloud_enum: skipped by authorization policy"; return 0; }
     # Phase 3 can only have completed after Phase 2.5 was reached. On resume from
     # checkpoint 3 or later, do not rerun cloud enumeration and append stale data.
     local resume_int="${RESUME_FROM%.*}"
@@ -1592,9 +1893,9 @@ phase2_5_cloud_enum() {
       | sort -u | head -n "$MAX_BUCKET_MUTATIONS" > "$candidates_file"
 
     # Global cloud namespaces cannot be attributed from a plausible name alone.
-    # Corroborate ownership from target-controlled CNAMEs or cloud URLs referenced
-    # by target pages, then probe only those exact names.
-    info "Collecting target-controlled cloud ownership evidence..."
+    # CNAMEs and page URLs provide reference leads only. Exact provider/resource
+    # approval is required separately and rechecked before each request.
+    info "Collecting cloud reference leads (references do not authorize probes)..."
     local ownership_evidence="$cdir/ownership-evidence.txt"
     local ownership_names="$cdir/ownership-corroborated-names.txt"
     local s3_candidates="$cdir/.verified-s3.txt"
@@ -1612,7 +1913,7 @@ phase2_5_cloud_enum() {
         while IFS= read -r host; do
             while IFS= read -r cname; do
                 [ -n "$cname" ] && printf 'DNS %s CNAME %s\n' "$host" "$cname" >> "$ownership_evidence"
-            done < <(dig +short CNAME "$host" 2>/dev/null | sed 's/\.$//')
+            done < <(authorized_run enumeration host "$host" dig +short CNAME @AUTHORIZED_INPUT@ 2>/dev/null | sed 's/\.$//')
         done < <(head -50 "$p2dir/valid-subdomains.txt")
     fi
 
@@ -1622,15 +1923,15 @@ phase2_5_cloud_enum() {
     } | sort -u | while IFS= read -r host; do
         local body="" scheme
         for scheme in https http; do
-            body=$(curl -fsS --max-time 8 --max-filesize 1048576 \
+            body=$(authorized_run enumeration host "$scheme://$host/" curl -q --proto '=http,https' --max-redirs 0 -fsS --max-time 8 --max-filesize 1048576 \
                 -A "Mozilla/5.0 (compatible; NullSec/ownership-check)" \
-                "$scheme://$host/" 2>/dev/null) && break
+                @AUTHORIZED_INPUT@ 2>/dev/null) && break
         done
         [ -n "$body" ] && printf 'HTTP %s\n%s\n' "$host" "$body" >> "$ownership_evidence"
     done
 
-    # Attribution remains provider-specific. A target reference to an Azure
-    # account name does not authorize probing an identically named S3/GCS bucket.
+    # References remain provider-specific and never grant authorization.
+    # Keep legacy evidence filenames for compatibility with current reports.
     {
         grep -Eoi '[a-z0-9][a-z0-9.-]{2,61}[a-z0-9]\.s3([.-][a-z0-9-]+)?\.amazonaws\.com' "$ownership_evidence" 2>/dev/null \
             | sed -E 's/\.s3([.-][a-z0-9-]+)?\.amazonaws\.com$//I'
@@ -1658,6 +1959,21 @@ phase2_5_cloud_enum() {
     cat "$s3_candidates" "$gcs_candidates" "$azure_candidates" 2>/dev/null \
         | sort -u > "$ownership_names"
 
+    local approval_tmp provider candidate_file
+    for provider in s3 gcs azure; do
+        case "$provider" in
+            s3) candidate_file="$s3_candidates" ;;
+            gcs) candidate_file="$gcs_candidates" ;;
+            azure) candidate_file="$azure_candidates" ;;
+        esac
+        approval_tmp=$(mktemp "${TMPDIR:-/tmp}/nullsec-cloud-approved.XXXXXX") || return 1
+        if ! cloud_approved_names "$provider" < "$candidate_file" > "$approval_tmp" \
+           || ! mv -f "$approval_tmp" "$candidate_file"; then
+            rm -f "$approval_tmp"
+            return 1
+        fi
+    done
+
     if [ -s "$candidates_file" ]; then
         if [ -s "$ownership_names" ]; then
             grep -Fvx -f "$ownership_names" "$candidates_file" 2>/dev/null \
@@ -1674,7 +1990,7 @@ phase2_5_cloud_enum() {
     gcs_verified_count=$(count_lines "$gcs_candidates")
     azure_verified_count=$(count_lines "$azure_candidates")
     verified_count=$(( s3_verified_count + gcs_verified_count + azure_verified_count ))
-    info "Ownership-corroborated cloud resources: S3=$s3_verified_count GCS=$gcs_verified_count Azure=$azure_verified_count"
+    info "Explicitly approved, referenced cloud resources: S3=$s3_verified_count GCS=$gcs_verified_count Azure=$azure_verified_count"
 
     local s3_exists="$cdir/s3/exists.txt"
     local s3_readable="$cdir/s3/readable.txt"
@@ -1692,11 +2008,12 @@ phase2_5_cloud_enum() {
     : > "$az_exists"; : > "$az_readable"; : > "$az_cdn_refs"; : > "$cloud_enum_open"
 
     if [ "$s3_verified_count" -gt 0 ]; then
-        info "Testing ownership-corroborated AWS S3 buckets..."
+        info "Testing explicitly approved, referenced AWS S3 buckets..."
         _check_s3_bucket() {
             local name="$1" exists_file="$2" readable_file="$3" writable_file="$4"
+            cloud_resource_allowed "s3:$name" || return 0
             local url="https://${name}.s3.amazonaws.com" rc acl_resp policy_resp
-            rc=$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || printf '000')
+            rc=$(authorized_cloud_curl "s3:$name" -sS --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || printf '000')
             case "$rc" in
                 200) printf '%s\n' "$url" >> "$exists_file"; printf '%s\n' "$url" >> "$readable_file" ;;
                 301|307|401|403) printf '%s\n' "$url" >> "$exists_file" ;;
@@ -1704,7 +2021,7 @@ phase2_5_cloud_enum() {
             esac
 
             # ACL and policy checks are independent of anonymous object listing.
-            acl_resp=$(curl -sS --max-time 5 "${url}?acl" 2>/dev/null || true)
+            acl_resp=$(authorized_cloud_curl "s3:$name" -sS --max-time 5 "${url}?acl" 2>/dev/null || true)
             if printf '%s' "$acl_resp" | awk '
                 BEGIN { RS="</Grant>"; found=0 }
                 /acs\.amazonaws\.com\/groups\/global\/AllUsers/ \
@@ -1715,7 +2032,7 @@ phase2_5_cloud_enum() {
                 return 0
             fi
 
-            policy_resp=$(curl -sS --max-time 5 "${url}?policy" 2>/dev/null || true)
+            policy_resp=$(authorized_cloud_curl "s3:$name" -sS --max-time 5 "${url}?policy" 2>/dev/null || true)
             if command -v jq >/dev/null 2>&1 && printf '%s' "$policy_resp" | jq -e '
                 def public_principal:
                     . == "*"
@@ -1742,18 +2059,19 @@ phase2_5_cloud_enum() {
     fi
 
     if [ "$gcs_verified_count" -gt 0 ]; then
-        info "Testing ownership-corroborated Google Cloud Storage buckets..."
+        info "Testing explicitly approved, referenced Google Cloud Storage buckets..."
         _check_gcs_bucket() {
             local name="$1" exists_file="$2" readable_file="$3" writable_file="$4"
+            cloud_resource_allowed "gcs:$name" || return 0
             local url="https://storage.googleapis.com/${name}" meta_rc list_resp iam_resp
-            meta_rc=$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' \
+            meta_rc=$(authorized_cloud_curl "gcs:$name" -sS --max-time 8 -o /dev/null -w '%{http_code}' \
                 "https://storage.googleapis.com/storage/v1/b/${name}" 2>/dev/null || printf '000')
             case "$meta_rc" in
                 200|401|403) printf '%s\n' "$url" >> "$exists_file" ;;
                 *) return 0 ;;
             esac
 
-            list_resp=$(curl -sS --max-time 8 \
+            list_resp=$(authorized_cloud_curl "gcs:$name" -sS --max-time 8 \
                 "https://storage.googleapis.com/storage/v1/b/${name}/o?maxResults=10" 2>/dev/null || true)
             if command -v jq >/dev/null 2>&1 \
                && printf '%s' "$list_resp" | jq -e 'select(.kind == "storage#objects" and (.error? | not))' >/dev/null 2>&1; then
@@ -1761,7 +2079,7 @@ phase2_5_cloud_enum() {
             fi
 
             # Evaluate public write IAM even when object listing is denied.
-            iam_resp=$(curl -sS --max-time 5 \
+            iam_resp=$(authorized_cloud_curl "gcs:$name" -sS --max-time 5 \
                 "https://storage.googleapis.com/storage/v1/b/${name}/iam" 2>/dev/null || true)
             if command -v jq >/dev/null 2>&1 && printf '%s' "$iam_resp" | jq -e '
                 .bindings[]?
@@ -1785,15 +2103,16 @@ phase2_5_cloud_enum() {
     fi
 
     if [ "$azure_verified_count" -gt 0 ]; then
-        info "Testing ownership-corroborated Azure Blob accounts..."
+        info "Testing explicitly approved, referenced Azure Blob accounts..."
         _check_azure_bucket() {
             local name="$1" exists_file="$2" readable_file="$3"
+            cloud_resource_allowed "azure:$name" || return 0
             local url="https://${name}.blob.core.windows.net" rc container body_file crc
-            rc=$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || printf '000')
+            rc=$(authorized_cloud_curl "azure:$name" -sS --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || printf '000')
             case "$rc" in 200|400|401|403) printf '%s\n' "$url" >> "$exists_file" ;; *) return 0 ;; esac
             for container in public '$web' assets backup data uploads media; do
                 body_file=$(mktemp)
-                crc=$(curl -sS --max-time 5 -o "$body_file" -w '%{http_code}' \
+                crc=$(authorized_cloud_curl "azure:$name" -sS --max-time 5 -o "$body_file" -w '%{http_code}' \
                     "${url}/${container}?restype=container&comp=list" 2>/dev/null || printf '000')
                 if [ "$crc" = 200 ] && grep -q '<EnumerationResults' "$body_file"; then
                     printf '%s/%s?restype=container&comp=list\n' "$url" "$container" >> "$readable_file"
@@ -1811,7 +2130,7 @@ phase2_5_cloud_enum() {
     fi
 
     if [ "$verified_count" -eq 0 ]; then
-        warn "No provider-specific cloud resources were corroborated from target-controlled references; mutation candidates were not probed."
+        warn "No referenced cloud resources had exact provider/resource approval; no provider probes were launched."
     fi
 
     # cloud_enum mutates globally unique names and cannot enforce ownership before
@@ -1860,6 +2179,7 @@ phase2_5_cloud_enum() {
 # PHASE 3: Live Web Service Probing
 # ─────────────────────────────────────────────────────────────────────────────
 phase3_probing() {
+    authorization_allowed enumeration || { info "phase3_probing: skipped by authorization policy"; return 0; }
     phase_done 3 && { polite_sleep; return 0; }
     print_phase "🌐 PHASE 3: LIVE WEB SERVICE PROBING"
 
@@ -1875,7 +2195,7 @@ phase3_probing() {
 
     info "Probing for live web hosts..."
     : > "$p3dir/live-hosts.txt"
-    if ! httpx-toolkit -l "$p2dir/valid-subdomains.txt" -silent -random-agent \
+    if ! authorized_run enumeration list "$p2dir/valid-subdomains.txt" httpx-toolkit -l @AUTHORIZED_INPUT@ -silent -random-agent \
         -timeout 15 -retries 2 -rl 10 -o "$p3dir/live-hosts.txt" 2>/dev/null; then
         warn "Basic HTTP probing failed; partial output was preserved."
         phase_errors=$(( phase_errors + 1 ))
@@ -1884,9 +2204,9 @@ phase3_probing() {
 
     info "Collecting detailed metadata..."
     : > "$p3dir/live-hosts-detailed.txt"
-    if ! httpx-toolkit -l "$p2dir/valid-subdomains.txt" \
+    if ! authorized_run enumeration list "$p2dir/valid-subdomains.txt" httpx-toolkit -l @AUTHORIZED_INPUT@ \
         -title -status-code -tech-detect -content-length -web-server \
-        -follow-redirects -random-agent -timeout 15 -retries 2 \
+        -random-agent -timeout 15 -retries 2 \
         -threads 10 -rl 10 -o "$p3dir/live-hosts-detailed.txt" 2>/dev/null; then
         warn "Detailed HTTP probing failed; partial output was preserved."
         phase_errors=$(( phase_errors + 1 ))
@@ -1921,7 +2241,7 @@ phase3_probing() {
             safe_name=$(safe_artifact_name "$host")
             scheme=$(printf '%s' "$host" | grep -oE '^https?' || true)
             hostname=$(printf '%s' "$host" | sed -E 's|https?://||; s|/.*||; s|:[0-9]+$||')
-            target_ip=$(dig +short "$hostname" A 2>/dev/null \
+            target_ip=$(authorized_run enumeration host "$hostname" dig +short @AUTHORIZED_INPUT@ A 2>/dev/null \
                 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
             if [ -z "$target_ip" ] || [ -z "$scheme" ]; then
                 warn "  Could not resolve or parse $host — skipping vhost scan."
@@ -1931,8 +2251,8 @@ phase3_probing() {
 
             output_json="$OUTPUT_DIR/phase11-fuzzing/vhosts/vhost-$safe_name.json"
             info "  Vhost fuzzing: $hostname ($target_ip)"
-            timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
-                ffuf -u "${scheme}://${target_ip}/" -H "Host: FUZZ.$TARGET" \
+            authorized_run validation host "${scheme}://${target_ip}/" timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
+                ffuf -u @AUTHORIZED_INPUT@ -H "Host: FUZZ.$TARGET" \
                 -w "$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt" \
                 -mc 200,301,302,401,403 -t "$FFUF_THREADS" -rate 50 \
                 -o "$output_json" -of json -fs 0 -ac -s \
@@ -1977,6 +2297,7 @@ phase3_probing() {
 # PHASE 4: Port Scanning
 # ─────────────────────────────────────────────────────────────────────────────
 phase4_portscan() {
+    authorization_allowed enumeration || { info "phase4_portscan: skipped by authorization policy"; return 0; }
     phase_done 4 && { polite_sleep; return 0; }
     print_phase "🔌 PHASE 4: PORT SCANNING"
 
@@ -2003,7 +2324,7 @@ phase4_portscan() {
     # 4.1 Scan top 1000 ports with Naabu
     info "Scanning top 1000 ports with Naabu..."
     : > "$p4dir/open-ports.txt"
-    if ! naabu -list "$p2dir/valid-subdomains.txt" \
+    if ! authorized_run enumeration list "$p2dir/valid-subdomains.txt" naabu -list @AUTHORIZED_INPUT@ \
         -top-ports 1000 \
         -silent \
         -rate 300 \
@@ -2017,7 +2338,7 @@ phase4_portscan() {
     : > "$p4dir/services-on-ports.txt"
     if [ -s "$p4dir/open-ports.txt" ]; then
         info "Probing open ports for HTTP/HTTPS services..."
-        if ! httpx-toolkit -l "$p4dir/open-ports.txt" \
+        if ! authorized_run enumeration list "$p4dir/open-ports.txt" httpx-toolkit -l @AUTHORIZED_INPUT@ \
             -silent \
             -random-agent \
             -rl 50 \
@@ -2054,6 +2375,7 @@ phase4_portscan() {
 # PHASE 5: URL Discovery & Crawling
 # ─────────────────────────────────────────────────────────────────────────────
 phase5_url_discovery() {
+    authorization_allowed enumeration || { info "phase5_url_discovery: skipped by authorization policy"; return 0; }
     phase_done 5 && { polite_sleep; return 0; }
     print_phase "🔗 PHASE 5: URL DISCOVERY & CRAWLING"
 
@@ -2077,7 +2399,7 @@ phase5_url_discovery() {
     # 5.1 Active crawling with Katana (JS-aware, finds modern SPA endpoints)
     if [ -s "$p3dir/live-hosts.txt" ]; then
         info "Crawling with Katana (depth 3, JS-aware)..."
-        if ! katana -list "$p3dir/live-hosts.txt" \
+        if ! authorized_run enumeration list "$p3dir/live-hosts.txt" katana -list @AUTHORIZED_INPUT@ \
             -depth "$KATANA_DEPTH" \
             -js-crawl \
             -known-files all \
@@ -2096,7 +2418,7 @@ phase5_url_discovery() {
     if check_command "hakrawler" && [ -s "$p3dir/live-hosts.txt" ]; then
         info "Running Hakrawler..."
         cat "$p3dir/live-hosts.txt" \
-            | hakrawler -d 2 -timeout 10 -u 2>/dev/null \
+            | authorized_run enumeration stream "" hakrawler -d 2 -timeout 10 -u 2>/dev/null \
             > "$p5dir/hakrawler-urls.txt"
         success "Hakrawler: $(count_lines "$p5dir/hakrawler-urls.txt") URLs"
     else
@@ -2107,7 +2429,7 @@ phase5_url_discovery() {
     if check_command "cariddi" && [ -s "$p3dir/live-hosts.txt" ]; then
         info "Running Cariddi (secrets + endpoint mode)..."
         cat "$p3dir/live-hosts.txt" \
-            | cariddi -s -e -intensive 1 \
+            | authorized_run enumeration stream "" cariddi -s -e -intensive 1 \
             > "$p5dir/cariddi-urls.txt" 2>/dev/null
         success "Cariddi: $(count_lines "$p5dir/cariddi-urls.txt") items"
     else
@@ -2117,7 +2439,7 @@ phase5_url_discovery() {
     # 5.4 Historical URL mining — Waybackurls
     if [ -s "$p3dir/live-hosts.txt" ]; then
         info "Mining Wayback Machine for historical URLs..."
-        if ! waybackurls < "$p3dir/live-hosts.txt" \
+        if ! authorized_run passive stream "" waybackurls < "$p3dir/live-hosts.txt" \
             > "$p5dir/wayback-urls.txt" 2>"$p5dir/wayback-error.log"; then
             warn "Waybackurls failed; see $p5dir/wayback-error.log. Partial output was preserved."
             phase_errors=$(( phase_errors + 1 ))
@@ -2131,7 +2453,7 @@ phase5_url_discovery() {
     # 5.5 Historical URL mining — GAU (Common Crawl + Wayback + OTX)
     if [ -s "$p2dir/valid-subdomains.txt" ]; then
         info "Running GAU for additional historical URLs..."
-        if ! timeout 5m gau --threads "$GAU_THREADS" < "$p2dir/valid-subdomains.txt" \
+        if ! authorized_run passive stream "" timeout 5m gau --threads "$GAU_THREADS" < "$p2dir/valid-subdomains.txt" \
             > "$p5dir/gau-urls.txt" 2>"$p5dir/gau-error.log"; then
             warn "GAU failed or timed out; see $p5dir/gau-error.log. Partial output was preserved."
             phase_errors=$(( phase_errors + 1 ))
@@ -2188,10 +2510,10 @@ phase5_url_discovery() {
 
     # Stage 1 — SCOPE (shared by both corpora).
     local scoped="$p5dir/.urls-scoped.txt"
-    if [ -n "${TARGET:-}" ]; then
-        in_scope < "$p5dir/all-urls-raw.txt" 2>/dev/null | sort -u > "$scoped" || cp "$p5dir/all-urls-raw.txt" "$scoped"
-    else
-        cp "$p5dir/all-urls-raw.txt" "$scoped"
+    if ! in_scope < "$p5dir/all-urls-raw.txt" | sort -u > "$scoped"; then
+        : > "$scoped"
+        error "Scope filtering failed; raw URLs will not be used."
+        return 1
     fi
     info "  Scope filter: $(count_lines "$scoped") in-scope (from $raw_count)"
 
@@ -2221,22 +2543,22 @@ phase5_url_discovery() {
     # Stage 3 — LIVENESS (CLEAN corpus only).  Probe collapsed set; keep live.
     local clean="$p5dir/all-urls.txt"
     if [ -s "$collapsed" ] && check_command "httpx-toolkit"; then
-        httpx-toolkit -l "$collapsed" \
+        if ! authorized_run enumeration list "$collapsed" httpx-toolkit -l @AUTHORIZED_INPUT@ \
             -silent \
             -mc 200,201,202,204,301,302,307,308,401,403,405,500 \
             -random-agent \
             -rl 50 \
-            -o "$clean" 2>/dev/null || cp "$collapsed" "$clean"
-        [ -s "$clean" ] || cp "$collapsed" "$clean"
+            -o "$clean" 2>/dev/null; then
+            : > "$clean"
+            error "Authorized URL probing failed; input will not be restored."
+            return 1
+        fi
     else
         warn "  httpx-toolkit unavailable — skipping liveness validation (corpus may contain dead URLs)."
-        cp "$collapsed" "$clean"
+        in_scope < "$collapsed" > "$clean" || { : > "$clean"; return 1; }
     fi
 
-    # Re-attach the cloud bucket feed (scope-exempt) to the CLEAN corpus only.
-    if [ -n "${cloud_p5_feed:-}" ] && [ -s "$cloud_p5_feed" ]; then
-        cat "$cloud_p5_feed" >> "$clean"
-    fi
+    # Provider resources never bypass host policy through a stored cloud feed.
     sort -u -o "$clean" "$clean"
 
     success "Refined URL corpus: $(count_lines "$clean") clean endpoints / $(count_lines "$injectable") injectable URLs (from $raw_count raw)"
@@ -2269,25 +2591,21 @@ phase5_url_discovery() {
         > "$p5dir/all-js-files.txt" 2>/dev/null || touch "$p5dir/all-js-files.txt"
     info "  Candidate JS files (pre-validation): $(count_lines "$p5dir/all-js-files.txt")"
 
-    # Validate live JS — accept 200 and 304 (CDNs answer conditional GETs with
-    # 304) and follow redirects to hashed filenames, so real assets aren't lost.
+    # Validate JS seeds without enabling redirects to a different destination.
     if [ -s "$p5dir/all-js-files.txt" ]; then
         if check_command "httpx-toolkit"; then
-            httpx-toolkit -l "$p5dir/all-js-files.txt" \
+            if ! authorized_run enumeration list "$p5dir/all-js-files.txt" httpx-toolkit -l @AUTHORIZED_INPUT@ \
                 -silent -mc 200,304 \
-                -follow-redirects \
                 -random-agent \
                 -rl 50 \
-                -o "$p5dir/live-js-files.txt" 2>/dev/null
-            # Fallback: if validation yields nothing but candidates exist, the
-            # origin is likely throttling/blocking httpx — keep the candidate set
-            # so Phase 8 can still attempt extraction rather than skipping.
-            if [ ! -s "$p5dir/live-js-files.txt" ]; then
-                warn "  JS liveness returned 0 (possible WAF/rate-limit) — passing candidate JS through to Phase 8."
-                cp "$p5dir/all-js-files.txt" "$p5dir/live-js-files.txt"
+                -o "$p5dir/live-js-files.txt" 2>/dev/null; then
+                : > "$p5dir/live-js-files.txt"
+                error "Authorized JS probing failed; candidates will not be restored."
+                return 1
             fi
         else
-            cp "$p5dir/all-js-files.txt" "$p5dir/live-js-files.txt"
+            in_scope < "$p5dir/all-js-files.txt" > "$p5dir/live-js-files.txt" \
+                || { : > "$p5dir/live-js-files.txt"; return 1; }
         fi
         success "Live JS files: $(count_lines "$p5dir/live-js-files.txt")"
     else
@@ -2338,6 +2656,7 @@ phase5_url_discovery() {
 # PHASE 6: Parameter Discovery
 # ─────────────────────────────────────────────────────────────────────────────
 phase6_parameters() {
+    authorization_allowed enumeration || { info "phase6_parameters: skipped by authorization policy"; return 0; }
     phase_done 6 && { polite_sleep; return 0; }
     print_phase "📊 PHASE 6: PARAMETER DISCOVERY"
 
@@ -2371,7 +2690,7 @@ phase6_parameters() {
         local count=0
         while IFS= read -r url && [ "$count" -lt "$MAX_ARJUN_HOSTS" ]; do
             info "  Arjun → $url"
-            if ! arjun -u "$url" \
+            if ! authorized_run validation host "$url" arjun -u @AUTHORIZED_INPUT@ \
                 -t "$ARJUN_THREADS" \
                 -oT "$p6dir/arjun-params-$count.txt" \
                 -d 500 2>>"$p6dir/arjun-error.log"; then
@@ -2706,6 +3025,7 @@ _p7_report_skips() {
 # PHASE 7: Vulnerability Scanning (Nuclei)
 # ─────────────────────────────────────────────────────────────────────────────
 phase7_vulnerability_scanning() {
+    authorization_allowed validation || { info "phase7_vulnerability_scanning: skipped by authorization policy"; return 0; }
     phase_done 7 && { polite_sleep; return; }
     print_phase "🛡️  PHASE 7: VULNERABILITY SCANNING (NUCLEI)"
 
@@ -2747,7 +3067,7 @@ phase7_vulnerability_scanning() {
 
     if [ "$needs_update" = true ]; then
         info "Updating Nuclei templates..."
-        if nuclei -ut 2>/dev/null; then
+        if authorized_run validation maintenance "" nuclei -ut 2>/dev/null; then
             touch "$nuclei_stamp"
             success "Nuclei templates updated."
         else
@@ -2877,7 +3197,7 @@ phase7_vulnerability_scanning() {
     # always ≥ the worker count, eliminating the "[WRN] concurrency > max-host-
     # error" warning and preventing mid-scan host skips on fragile targets.
     info "Running consolidated Nuclei scan ($NUCLEI_SEVERITY severity)..."
-    nuclei -l "$host_targets" \
+    authorized_run validation list "$host_targets" nuclei -l @AUTHORIZED_INPUT@ \
         -severity "$NUCLEI_SEVERITY" \
         -exclude-tags headers,cookie-flags,info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
@@ -2913,7 +3233,7 @@ phase7_vulnerability_scanning() {
     local _p7_url_conc=$(( NUCLEI_CONCURRENCY / 2 ))
     [ "$_p7_url_conc" -lt 10 ] && _p7_url_conc=10
     info "Scanning for exposures and misconfigurations..."
-    nuclei -l "$combined_targets" \
+    authorized_run validation list "$combined_targets" nuclei -l @AUTHORIZED_INPUT@ \
         -tags exposure,config,misconfig \
         -exclude-tags headers,cookie-flags \
         -exclude-severity info \
@@ -3069,6 +3389,7 @@ phase7_vulnerability_scanning() {
 # PHASE 8: JavaScript Analysis & Secret Extraction
 # ─────────────────────────────────────────────────────────────────────────────
 phase8_javascript_analysis() {
+    authorization_allowed enumeration || { info "phase8_javascript_analysis: skipped by authorization policy"; return 0; }
     phase_done 8 && { polite_sleep; return 0; }
     print_phase "📜 PHASE 8: JAVASCRIPT ANALYSIS & SECRET EXTRACTION"
 
@@ -3106,9 +3427,9 @@ phase8_javascript_analysis() {
         filename=$(printf '%s' "$js_url" | sha256sum | awk '{print $1}')
         tmp_file="$p8dir/js-files/.${filename}.tmp.$$"
         js_attempts=$(( js_attempts + 1 ))
-        if curl -fskL --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
+        if authorized_run enumeration host "$js_url" curl -q --proto '=http,https' --max-redirs 0 -fsk --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "$js_url" -o "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
+            @AUTHORIZED_INPUT@ -o "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
             file_bytes=$(wc -c < "$tmp_file")
             if [ $(( total_bytes + file_bytes )) -gt "$MAX_JS_TOTAL_BYTES" ]; then
                 warn "Aggregate JavaScript download limit reached (${MAX_JS_TOTAL_BYTES} bytes); stopping."
@@ -3136,9 +3457,9 @@ phase8_javascript_analysis() {
 
     : > "$p8dir/trufflehog-secrets.json"
     : > "$p8dir/trufflehog-summary.txt"
-    if check_command "trufflehog"; then
+    if authorization_allowed verification && check_command "trufflehog"; then
         info "Running TruffleHog for verified secret detection..."
-        if trufflehog filesystem "$p8dir/js-files/" --only-verified --json \
+        if authorized_run verification local-verification "$p8dir/js-files/" trufflehog filesystem @AUTHORIZED_INPUT@ --only-verified --json \
             > "$p8dir/trufflehog-secrets.json" 2>/dev/null; then
             jq -r 'select(.SourceMetadata != null) |
                 "[" + .DetectorName + "] " + (.SourceMetadata.Data.Filesystem.file // "unknown")' \
@@ -3188,7 +3509,7 @@ phase8_javascript_analysis() {
 
     : > "$p8dir/live-js-endpoints.txt"
     if [ -s "$p8dir/js-endpoints.txt" ]; then
-        if ! httpx-toolkit -l "$p8dir/js-endpoints.txt" -silent -random-agent \
+        if ! authorized_run enumeration list "$p8dir/js-endpoints.txt" httpx-toolkit -l @AUTHORIZED_INPUT@ -silent -random-agent \
             -o "$p8dir/live-js-endpoints.txt" 2>/dev/null; then
             warn "HTTP probing of JS-derived endpoints failed; partial output was preserved."
             phase_status=1
@@ -3216,6 +3537,7 @@ phase8_javascript_analysis() {
 # PHASE 9: Vulnerability Pattern Hunting
 # ─────────────────────────────────────────────────────────────────────────────
 phase9_pattern_hunting() {
+    authorization_allowed enumeration || { info "phase9_pattern_hunting: skipped by authorization policy"; return 0; }
     phase_done 9 && { polite_sleep; return; }
     print_phase "🎯 PHASE 9: VULNERABILITY PATTERN HUNTING"
 
@@ -3273,7 +3595,7 @@ phase9_pattern_hunting() {
     fi
     success "XSS candidates: $(count_lines "$p9dir/xss-candidates.txt")"
 
-    if check_command "dalfox" && [ -s "$p9dir/xss-candidates.txt" ]; then
+    if authorization_allowed validation && check_command "dalfox" && [ -s "$p9dir/xss-candidates.txt" ]; then
         # Dedup candidates by INJECTION-POINT signature (host+path+param-keys),
         # keeping one concrete value per signature, BEFORE applying the cap.
         # Without this, head -N wastes the budget on ?id=1, ?id=2, ?id=3 — the
@@ -3295,7 +3617,7 @@ phase9_pattern_hunting() {
         # eating the whole budget.  dalfox writes findings incrementally, so a
         # timeout still preserves partial confirmed output.
         head -"${XSS_CANDIDATE_CAP}" "$p9dir/xss-candidates-dedup.txt" \
-            | timeout --kill-after=30 "${DALFOX_TIMEOUT}" \
+            | authorized_run validation stream "" timeout --kill-after=30 "${DALFOX_TIMEOUT}" \
                 dalfox pipe \
                 --silence \
                 --no-color \
@@ -3331,7 +3653,7 @@ phase9_pattern_hunting() {
     fi
     success "SQLi candidates: $(count_lines "$p9dir/sqli-candidates.txt")"
 
-    if check_command "sqlmap" && [ -s "$p9dir/sqli-candidates.txt" ]; then
+    if authorization_allowed validation && check_command "sqlmap" && [ -s "$p9dir/sqli-candidates.txt" ]; then
         # Dedup by injection-point signature first (same rationale as dalfox):
         # without it, the cap is spent re-testing ?id=1/?id=2 instead of distinct
         # injectable endpoints.  sqlmap detects injection from the parameter, not
@@ -3346,8 +3668,8 @@ phase9_pattern_hunting() {
         head -"${SQLI_CANDIDATE_CAP}" "$p9dir/sqli-candidates-dedup.txt" \
             > "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt"
 
-        # Build a regex scope pattern from the target domain so SQLMap
-        # never follows redirects to out-of-scope domains.
+        # Retain the existing SQLMap target regex as a tool-specific hint.
+        # It is not a sandbox for redirects, exclusions, or internal requests.
         local escaped_target
         escaped_target=$(echo "$TARGET" | sed 's/\./\\./g')
 
@@ -3356,8 +3678,8 @@ phase9_pattern_hunting() {
         # territory — appropriate for a VDP.  --threads parallelises within a
         # target; per-request --timeout + capped --retries keep a throttling WAF
         # from stalling the whole batch into the wall-clock timeout.
-        timeout --kill-after=30 "${SQLMAP_TIMEOUT}" \
-            sqlmap -m "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt" \
+        authorized_run validation list "$p9dir/sqli-top${SQLI_CANDIDATE_CAP}.txt" timeout --kill-after=30 "${SQLMAP_TIMEOUT}" \
+            sqlmap -m @AUTHORIZED_INPUT@ \
                 --batch \
                 --smart \
                 --level=2 \
@@ -3419,13 +3741,13 @@ phase9_pattern_hunting() {
     # against the window only.
     local cors_window=""
     local cors_window_size=20
-    if [ -s "$p3dir/live-hosts.txt" ]; then
+    if authorization_allowed validation && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $cors_count -lt $MAX_CORS_HOSTS ]; do
             local headers acao acac
-            headers=$(curl -sk --max-time 5 \
+            headers=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
                 -H 'Origin: https://evil.nullsec.com' \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -I "$url" 2>/dev/null)
+                -I @AUTHORIZED_INPUT@ 2>/dev/null)
 
             # Update sliding window — append result, trim to window_size
             local _result
@@ -3501,14 +3823,14 @@ phase9_pattern_hunting() {
     # BUG-7 FIX: Sliding-window throttle detection (see CORS loop above).
     local hhi_window=""
     local hhi_window_size=10
-    if [ -s "$p3dir/live-hosts.txt" ]; then
+    if authorization_allowed validation && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $hhi_count -lt 30 ]; do
             local resp
-            resp=$(curl -sk --max-time 5 \
+            resp=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
                 -H 'Host: evil.nullsec.com' \
                 -H 'X-Forwarded-Host: evil.nullsec.com' \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                "$url" 2>/dev/null)
+                @AUTHORIZED_INPUT@ 2>/dev/null)
 
             local _result
             if [ -z "$resp" ]; then
@@ -3575,6 +3897,7 @@ phase9_pattern_hunting() {
 # PHASE 10: Screenshots & Visual Reconnaissance
 # ─────────────────────────────────────────────────────────────────────────────
 phase10_screenshots() {
+    authorization_allowed enumeration || { info "phase10_screenshots: skipped by authorization policy"; return 0; }
     phase_done 10 && { polite_sleep; return 0; }
     print_phase "📸 PHASE 10: SCREENSHOTS & VISUAL RECONNAISSANCE"
 
@@ -3603,7 +3926,7 @@ phase10_screenshots() {
         head -"$MAX_SCREENSHOTS" "$input" | in_scope > "$targets"
         [ -s "$targets" ] || return 0
         info "Capturing $label screenshots (batch)..."
-        if ! gowitness scan file -f "$targets" --screenshot-path "$output_dir/" \
+        if ! authorized_run enumeration list "$targets" gowitness scan file -f @AUTHORIZED_INPUT@ --screenshot-path "$output_dir/" \
             --threads "$GOWITNESS_THREADS" 2>/dev/null; then
             warn "Gowitness failed while capturing $label screenshots."
             return 1
@@ -3633,6 +3956,7 @@ phase10_screenshots() {
 # PHASE 11: Directory & Content Fuzzing  [NEW]
 # ─────────────────────────────────────────────────────────────────────────────
 phase11_fuzzing() {
+    authorization_allowed validation || { info "phase11_fuzzing: skipped by authorization policy"; return 0; }
     phase_done 11 && { polite_sleep; return 0; }
     print_phase "💥 PHASE 11: DIRECTORY & CONTENT FUZZING"
 
@@ -3683,8 +4007,8 @@ phase11_fuzzing() {
         safe_name=$(safe_artifact_name "$url")
         output_json="$p11dir/dirs/ffuf-$safe_name.json"
         info "  Fuzzing: $url"
-        timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
-            ffuf -u "${url%/}/FUZZ" -w "$WEB_WORDLIST" \
+        authorized_run validation host "${url%/}/FUZZ" timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
+            ffuf -u @AUTHORIZED_INPUT@ -w "$WEB_WORDLIST" \
             -mc 200,201,204,301,302,307,401,403,405 \
             -t "$FFUF_THREADS" -rate 100 -o "$output_json" -of json \
             -recursion -recursion-depth 2 -ac -timeout 10 \
@@ -3714,8 +4038,8 @@ phase11_fuzzing() {
             local safe_name output_json ffuf_rc
             safe_name=$(safe_artifact_name "$url")
             output_json="$p11dir/dirs/backups-$safe_name.json"
-            timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
-                ffuf -u "${url%/}/FUZZ" -w "$backup_wordlist" -mc 200 \
+            authorized_run validation host "${url%/}/FUZZ" timeout --signal=TERM --kill-after=10 "$FFUF_TIMEOUT" \
+                ffuf -u @AUTHORIZED_INPUT@ -w "$backup_wordlist" -mc 200 \
                 -t "$FFUF_THREADS" -rate 100 -o "$output_json" -of json \
                 -ac -timeout 10 >/dev/null 2>>"$ffuf_log"
             ffuf_rc=$?
@@ -3754,6 +4078,7 @@ phase11_fuzzing() {
 # PHASE 12: Active Vulnerability Confirmation  [NEW]
 # ─────────────────────────────────────────────────────────────────────────────
 phase12_active_vulns() {
+    authorization_allowed validation || { info "phase12_active_vulns: skipped by authorization policy"; return 0; }
     phase_done 12 && { polite_sleep; return 0; }
     print_phase "🔥 PHASE 12: ACTIVE VULNERABILITY CONFIRMATION"
 
@@ -3777,7 +4102,7 @@ phase12_active_vulns() {
 
     if [ -s "$p9dir/ssrf-candidates.txt" ]; then
         info "Testing SSRF candidates with Nuclei OAST templates..."
-        if ! nuclei -l "$p9dir/ssrf-candidates.txt" -tags ssrf \
+        if ! authorized_run validation list "$p9dir/ssrf-candidates.txt" nuclei -l @AUTHORIZED_INPUT@ -tags ssrf \
             -severity medium,high,critical -rate-limit "$NUCLEI_RATE_LIMIT" \
             -timeout 10 -o "$p12dir/ssrf-confirmed.txt" -silent 2>/dev/null; then
             warn "SSRF confirmation scan failed; partial output was preserved."
@@ -3788,7 +4113,7 @@ phase12_active_vulns() {
 
     if [ -s "$p9dir/redirect-candidates.txt" ]; then
         info "Confirming Open Redirect candidates with Nuclei..."
-        if ! nuclei -l "$p9dir/redirect-candidates.txt" -tags redirect \
+        if ! authorized_run validation list "$p9dir/redirect-candidates.txt" nuclei -l @AUTHORIZED_INPUT@ -tags redirect \
             -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
             -o "$p12dir/redirect-confirmed.txt" -silent 2>/dev/null; then
             warn "Open-redirect confirmation scan failed; partial output was preserved."
@@ -3799,7 +4124,7 @@ phase12_active_vulns() {
 
     if [ -s "$p9dir/lfi-candidates.txt" ]; then
         info "Confirming LFI candidates with Nuclei..."
-        if ! nuclei -l "$p9dir/lfi-candidates.txt" -tags lfi \
+        if ! authorized_run validation list "$p9dir/lfi-candidates.txt" nuclei -l @AUTHORIZED_INPUT@ -tags lfi \
             -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
             -o "$p12dir/lfi-confirmed.txt" -silent 2>/dev/null; then
             warn "LFI confirmation scan failed; partial output was preserved."
@@ -3812,7 +4137,7 @@ phase12_active_vulns() {
         local bypass_template="$NUCLEI_TEMPLATES/http/fuzzing/403-bypass.yaml"
         if [ -f "$bypass_template" ]; then
             info "Attempting 403 Forbidden bypass techniques..."
-            if ! nuclei -l "$OUTPUT_DIR/phase3-probing/status-403.txt" \
+            if ! authorized_run validation list "$OUTPUT_DIR/phase3-probing/status-403.txt" nuclei -l @AUTHORIZED_INPUT@ \
                 -t "$bypass_template" \
                 -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
                 -o "$p12dir/403-bypass-confirmed.txt" -silent 2>/dev/null; then
@@ -3830,7 +4155,7 @@ phase12_active_vulns() {
             | head -20 > "$p12dir/graphql-targets.txt" 2>/dev/null || : > "$p12dir/graphql-targets.txt"
         if [ -s "$p12dir/graphql-targets.txt" ]; then
             info "Testing GraphQL endpoints for introspection..."
-            if ! nuclei -l "$p12dir/graphql-targets.txt" -tags graphql \
+            if ! authorized_run validation list "$p12dir/graphql-targets.txt" nuclei -l @AUTHORIZED_INPUT@ -tags graphql \
                 -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
                 -o "$p12dir/graphql-findings.txt" -silent 2>/dev/null; then
                 warn "GraphQL confirmation scan failed; partial output was preserved."
@@ -4051,7 +4376,7 @@ main() {
     esac
 
     local RESUME_DIR="" OUTPUT_EXPLICIT=false MODE_CHANGED=false
-    while getopts "d:o:m:surc:h" opt; do
+    while getopts "d:o:m:surc:hI:E:C:AVK" opt; do
         case $opt in
             d) TARGET="$OPTARG" ;;
             o) OUTPUT_DIR="$OPTARG"; OUTPUT_EXPLICIT=true ;;
@@ -4060,6 +4385,12 @@ main() {
             u) UPDATE_NUCLEI=true ;;
             r) RATE_LIMIT=true ;;
             c) RESUME_DIR="$OPTARG" ;;
+            I) [ -n "$OPTARG" ] || { error "-I requires a nonempty policy path"; exit 1; }; INCLUDE_SCOPE_FILE="$OPTARG" ;;
+            E) [ -n "$OPTARG" ] || { error "-E requires a nonempty policy path"; exit 1; }; EXCLUDE_SCOPE_FILE="$OPTARG" ;;
+            C) [ -n "$OPTARG" ] || { error "-C requires a nonempty policy path"; exit 1; }; CLOUD_APPROVAL_FILE="$OPTARG" ;;
+            A) ALLOW_ACTIVE_ENUM=true ;;
+            V) ALLOW_ACTIVE_VALIDATION=true ;;
+            K) ALLOW_SECRET_VERIFICATION=true ;;
             h) usage 0 ;;
             *) usage ;;
         esac
@@ -4079,6 +4410,10 @@ main() {
         exit 1
     fi
 
+    if ! load_authorization_policy; then
+        error "Invalid authorization policy; refusing all launches."
+        exit 1
+    fi
     if [ -n "$RESUME_DIR" ]; then
         if [ ! -d "$RESUME_DIR" ]; then
             error "Resume directory not found: $RESUME_DIR"
@@ -4089,6 +4424,10 @@ main() {
         local early_checkpoint="$OUTPUT_DIR/.checkpoint"
         if [ ! -f "$early_meta" ]; then
             error "Resume refused: $early_meta is missing, so the directory cannot be safely bound to a target."
+            exit 1
+        fi
+        if ! validate_resume_authorization "$early_meta"; then
+            error "Resume refused: authorization fingerprint is missing, malformed, or differs from the current policy. Use a new output directory."
             exit 1
         fi
         local stored_target stored_mode
@@ -4127,11 +4466,14 @@ main() {
     local START_TIME
     START_TIME=$(date +%s)
     apply_scan_mode
+    apply_authorization_controls
     print_banner
 
     info "Target          : $TARGET"
     info "Output Directory: $OUTPUT_DIR"
     info "Scan Mode       : $SCAN_MODE"
+    info "Authorization   : enum=$ALLOW_ACTIVE_ENUM validation=$ALLOW_ACTIVE_VALIDATION secrets=$ALLOW_SECRET_VERIFICATION"
+    info "Policy identity : $POLICY_FINGERPRINT"
     info "Nuclei Update   : $UPDATE_NUCLEI"
     info "Rate Limiting   : $RATE_LIMIT"
     info "Amass Timeout   : ${AMASS_TIMEOUT}s"
@@ -4141,7 +4483,7 @@ main() {
     [ "$SKIP_TOOL_CHECK" = false ] && check_tools
 
     info "Checking internet connectivity..."
-    if ! curl -fsS --max-time 5 -o /dev/null https://1.1.1.1/cdn-cgi/trace; then
+    if ! authorized_run passive service https://1.1.1.1/cdn-cgi/trace curl -q --proto '=https' --max-redirs 0 -fsS --max-time 5 -o /dev/null @AUTHORIZED_INPUT@; then
         error "No internet connectivity detected. Check your network/VPN and try again."
         exit 1
     fi
@@ -4159,8 +4501,11 @@ main() {
     fi
 
     local meta_tmp="${SCAN_META_FILE}.tmp.$$"
-    printf 'TARGET=%s\nSCAN_MODE=%s\n' "$TARGET" "$SCAN_MODE" > "$meta_tmp"
-    mv -f "$meta_tmp" "$SCAN_META_FILE"
+    if ! printf 'TARGET=%s\nSCAN_MODE=%s\nPOLICY_FINGERPRINT=%s\n' "$TARGET" "$SCAN_MODE" "$POLICY_FINGERPRINT" > "$meta_tmp" \
+       || ! mv -f "$meta_tmp" "$SCAN_META_FILE"; then
+        error "Could not bind output metadata to the authorization policy."
+        exit 1
+    fi
     if [ "$MODE_CHANGED" = true ]; then
         printf '0\n' > "$CHECKPOINT_FILE"
         RESUME_FROM=0
