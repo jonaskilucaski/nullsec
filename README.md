@@ -53,6 +53,8 @@ NullSec requires an explicit host policy and separate action permissions. By def
 
 NullSec is intended for Linux systems with Bash and GNU command-line utilities. Kali Linux or another Debian-based penetration-testing environment is recommended.
 
+Output ownership requires `flock` (normally provided by Linux's `util-linux` package) and readable `/proc/self/fd` and `/proc/self/mountinfo`. If ownership or filesystem validation is unavailable or fails, NullSec refuses execution, including with `-s`.
+
 Basic system dependencies include:
 
 ```bash
@@ -571,16 +573,28 @@ NullSec stores:
 
 The metadata binds the output directory to the target, scan mode, and normalized authorization fingerprint. Resume refuses target or authorization mismatches and missing authorization state. Changing the mode while resuming restarts at Phase 1 only when authorization still matches.
 
+New scans atomically reserve a fresh output directory. An existing directory, including an empty one, is refused; choose a new child path or use `-c` for an existing scan. A default name collision fails safely. Absolute paths, relative paths, spaces, and symlinked ancestors outside the output tree are supported after resolving the physical parent. Output names containing newlines or carriage returns are refused.
+
+The physical root must belong to the current user and have private permissions (normally `700`). Managed state rejects symlinks, hard-linked files, foreign-owned objects, special files, writable shared directories, and nested filesystem mounts. The root's device/inode identity and path boundaries are checked before managed operations. New state uses `umask 077`.
+
+One process owns the output state through an exclusive nonblocking lock on `.nullsec.lock`, acquired before resume reads, snapshots, or state changes. The lock file remains in place after completion: do not delete or replace it. Ownership is released by closing the descriptor, including on handled termination. Children inherit the descriptor, so surviving children continue to prevent another run from taking ownership until they exit. There is no PID-based stale-lock takeover.
+
+Checkpoints, metadata, and reports use private temporary files and checked renames. A failed checkpoint write leaves the previous checkpoint and in-memory resume position intact. A mode-change reset is persisted before new metadata. Failed persistence prevents success announcements and produces a failing scan status.
+
 When interrupted with `Ctrl+C`, NullSec attempts to:
 
 - terminate registered scanner process trees;
 - prevent orphaned background tools from continuing;
-- clean temporary files;
+- retain evidence from unfinished state writes;
 - preserve partial evidence;
 - restore missing outputs when appropriate; and
 - print a resume command.
 
 When a resumed phase replaces an existing result, prior evidence is archived under a `prior-runs/` directory instead of being silently mixed into current findings.
+
+Backups under `.phase-backups/` become active only after every copy succeeds and is compared with its source. Finalization checks archive copies and any interruption restoration before deleting the source backup. Failures retain the source and return an error; retrying completed finalization preserves archived evidence. Unfinished snapshots without `.active` are refused on retry and require manual review/recovery of the preserved files before their incomplete directory is removed. Failed temporary writes may also remain for inspection.
+
+These checks protect cooperative NullSec runs and reject unsafe existing trees. Bash pathname checks and external tools' output paths cannot eliminate check-then-use races against a hostile process running as the same user, or privileged filesystem replacement. Keep the tree private, do not modify it during a scan, and treat scanner processes as trusted filesystem writers. Atomic renames provide process-level persistence; power-loss durability (`fsync`) is not guaranteed. The separate legacy recursive `.bak` traversal behavior is unchanged.
 
 ## Output Structure
 

@@ -364,19 +364,12 @@ _nullsec_cleanup() {
         _terminate_process_tree "$_cpid" 3 TERM
     done
 
-    if [ -n "${OUTPUT_DIR:-}" ]; then
-        rm -f "${OUTPUT_DIR}/phase7-vulns/.combined-targets.txt" \
-              "${OUTPUT_DIR}/phase7-vulns/.host-targets.txt" \
-              "${OUTPUT_DIR}/phase2.5-cloud/.tokens.txt" \
-              "${OUTPUT_DIR}/phase2.5-cloud/.candidates.txt" \
-              "${OUTPUT_DIR}/phase5-urls/.urls-scoped.txt" \
-              "${OUTPUT_DIR}/phase5-urls/.urls-collapsed.txt" \
-              "${OUTPUT_DIR}"/.parallel-start.* 2>/dev/null
-        rm -rf "${OUTPUT_DIR}/asset-scoring/.tmp" \
-               "${OUTPUT_DIR}/asset-scoring/.host-universe.txt" 2>/dev/null
-
-        finalize_all_output_backups true 2>/dev/null || true
+    if [ "$OUTPUT_OWNER" = "$BASHPID" ] && validate_output_tree; then
+        if ! finalize_all_output_backups true; then
+            warn "Interruption preservation failed; retained backups require recovery."
+        fi
     fi
+    release_output_ownership
 
     warn "Cleanup complete. Re-run with -c '$OUTPUT_DIR' to resume from the last checkpoint."
     exit 130
@@ -845,17 +838,233 @@ RESUME_FROM=0
 SCAN_META_FILE=""
 CHECKPOINT_FROZEN=false
 
+# Cooperative ownership plus fail-closed pathname checks. Bash cannot make
+# pathname operations atomic against a hostile process running as this UID.
+OUTPUT_ROOT=""
+OUTPUT_ID=""
+OUTPUT_LOCK_FD=""
+OUTPUT_OWNER=""
+STATE_FAILED=false
+
+state_error() {
+    STATE_FAILED=true
+    error "$1" >&2
+    return 1
+}
+
+_root_identity() {
+    [ -n "$OUTPUT_ROOT" ] && [ "$OUTPUT_DIR" = "$OUTPUT_ROOT" ] \
+        && [ ! -L "$OUTPUT_ROOT" ] && [ -d "$OUTPUT_ROOT" ] \
+        && [ -O "$OUTPUT_ROOT" ] || return 1
+    local identity mode
+    identity=$(stat -c '%d:%i' -- "$OUTPUT_ROOT") || return 1
+    mode=$(stat -c '%a' -- "$OUTPUT_ROOT") || return 1
+    [ "$identity" = "$OUTPUT_ID" ] && (( (8#$mode & 077) == 0 ))
+}
+
+_output_owned() {
+    _root_identity && [ -n "$OUTPUT_LOCK_FD" ] && [ -n "$OUTPUT_OWNER" ] || return 1
+    local path_id fd_id
+    [ ! -L "$OUTPUT_ROOT/.nullsec.lock" ] && [ -f "$OUTPUT_ROOT/.nullsec.lock" ] || return 1
+    path_id=$(stat -c '%d:%i' -- "$OUTPUT_ROOT/.nullsec.lock") || return 1
+    fd_id=$(stat -Lc '%d:%i' -- "/proc/self/fd/$OUTPUT_LOCK_FD") || return 1
+    [ "$path_id" = "$fd_id" ]
+}
+
+# Walk components without following symlinks; containment uses a slash boundary.
+# Missing components are allowed only for paths about to be created.
+_validate_output_components() {
+    local path="$1" kind="${2:-any}" rel component current
+    case "$path" in "$OUTPUT_ROOT"/*) rel="${path#"$OUTPUT_ROOT"/}" ;; *)
+        state_error "Path is outside the owned output root: $path"; return 1 ;; esac
+    current="$OUTPUT_ROOT"
+    while :; do
+        component="${rel%%/*}"
+        case "$component" in ''|.|..) state_error "Invalid managed path: $path"; return 1 ;; esac
+        current="$current/$component"
+        [ ! -L "$current" ] || { state_error "Managed symlink refused: $current"; return 1; }
+        if [ -e "$current" ]; then
+            [ -O "$current" ] && { [ -d "$current" ] || [ -f "$current" ]; } \
+                || { state_error "Unexpected managed object: $current"; return 1; }
+            if [ -f "$current" ]; then
+                local links
+                links=$(stat -c '%h' -- "$current") || { state_error "Cannot inspect managed file: $current"; return 1; }
+                [ "$links" = 1 ] || { state_error "Managed hard link refused: $current"; return 1; }
+            fi
+        fi
+        if [[ "$rel" != */* ]]; then break; fi
+        [ ! -e "$current" ] || [ -d "$current" ] || { state_error "Non-directory managed parent: $current"; return 1; }
+        rel="${rel#*/}"
+    done
+    if [ -e "$path" ]; then
+        case "$kind" in
+            file) [ -f "$path" ] || { state_error "Expected regular file: $path"; return 1; } ;;
+            dir) [ -d "$path" ] || { state_error "Expected directory: $path"; return 1; } ;;
+            any) ;;
+            *) return 1 ;;
+        esac
+    fi
+}
+
+validate_output_path() {
+    _output_owned || { state_error "Output ownership or root identity lost."; return 1; }
+    _validate_output_components "$@"
+}
+
+_output_mounts_safe() {
+    # Reject descendant mounts, including bind mounts on the same device.
+    # mountinfo escapes whitespace/backslashes; compare its literal encoding.
+    local encoded="$1" table="${2:-/proc/self/mountinfo}"
+    encoded="${encoded//\\/\\134}"
+    encoded="${encoded// /\\040}"
+    encoded="${encoded//$'\t'/\\011}"
+    encoded="${encoded//$'\n'/\\012}"
+    NULLSEC_MOUNT_ROOT="$encoded" awk '
+        BEGIN { root=ENVIRON["NULLSEC_MOUNT_ROOT"] }
+        index($5, root "/")==1 { found=1 }
+        END { exit found ? 1 : 0 }
+    ' "$table"
+}
+
+# GNU find emits NUL records. Its status is checked before inspecting records;
+# process substitution alone would hide traversal errors.
+validate_output_tree() {
+    _output_owned || { state_error "Output is not exclusively owned."; return 1; }
+    _validate_existing_output_tree
+}
+
+# Read-only validation is also used before the lock file is opened on resume.
+_validate_existing_output_tree() {
+    _root_identity || { state_error "Physical output root identity lost."; return 1; }
+    _output_mounts_safe "$OUTPUT_ROOT" || { state_error "Cannot validate mounts, or descendant mount found."; return 1; }
+    local bad dir file devices
+    bad=$(find "$OUTPUT_ROOT" -ignore_readdir_race -xdev -mindepth 1 \
+        \( -type l -o \( ! -type f ! -type d \) -o ! -uid "$UID" \
+        -o \( -type f -links +1 \) -o \( -type d -perm /022 \) \) -printf x) \
+        || { state_error "Cannot inspect output tree."; return 1; }
+    [ -z "$bad" ] || { state_error "Unsafe object in output tree; refusing mutation."; return 1; }
+    # NullSec's text/result/temporary names are files, never directories.
+    # Tool-created opaque state subdirectories remain supported.
+    bad=$(find "$OUTPUT_ROOT" -ignore_readdir_race -xdev -mindepth 1 -type d \
+        \( -name '*.txt' -o -name '*.json' -o -name '*.jsonl' -o -name '*.log' \
+        -o -name '*.js' -o -name '*.tmp.*' -o -name '.active' \
+        -o -name '.listing.*' -o -name '.report.*' -o -name '.parallel-start.*' \) -printf x) \
+        || { state_error "Cannot inspect managed file types."; return 1; }
+    [ -z "$bad" ] || { state_error "Directory occupies a managed file path."; return 1; }
+    bad=$(find "$OUTPUT_ROOT" -ignore_readdir_race -xdev -mindepth 1 -name prior-runs ! -type d -printf x) \
+        || { state_error "Cannot inspect archive directory types."; return 1; }
+    [ -z "$bad" ] || { state_error "Invalid archive directory type."; return 1; }
+    devices=$(find "$OUTPUT_ROOT" -ignore_readdir_race -xdev -type d -printf '%D\n' | LC_ALL=C sort -u) \
+        || { state_error "Cannot inspect managed filesystem devices."; return 1; }
+    [ "$devices" = "${OUTPUT_ID%%:*}" ] || { state_error "Managed tree crosses a filesystem boundary."; return 1; }
+    while IFS= read -r dir; do _validate_output_components "$dir" dir || return 1; done < <(_all_output_dirs)
+    for dir in .phase-backups phase10-screenshots/{403,admin,interesting,all} \
+        phase8-javascript/js-files phase11-fuzzing/{dirs,vhosts} phase2.5-cloud/{s3,gcs,azure,exposed} \
+        phase1-subdomains/{.amass-state,.amass-v4-state} asset-scoring/.tmp phase9-patterns/sqlmap-results; do
+        _validate_output_components "$OUTPUT_ROOT/$dir" dir || return 1
+    done
+    for file in .nullsec.lock .scan-meta .checkpoint reports/recon-report.txt; do
+        _validate_output_components "$OUTPUT_ROOT/$file" file || return 1
+    done
+}
+
+release_output_ownership() {
+    # Close only this shell's descriptor. Never unlink the stable lock inode or
+    # issue LOCK_UN: inherited descriptors keep ownership while children live.
+    [ "$OUTPUT_OWNER" = "$BASHPID" ] || return 0
+    if [ -n "$OUTPUT_LOCK_FD" ]; then
+        exec {OUTPUT_LOCK_FD}>&-
+    fi
+    OUTPUT_LOCK_FD=""; OUTPUT_OWNER=""
+}
+
+_claim_output_root() {
+    local path="$1" resume="${2:-false}" parent leaf physical mode
+    [ -z "$OUTPUT_LOCK_FD" ] || { state_error "Output already owned."; return 1; }
+    command -v flock >/dev/null 2>&1 || { state_error "flock is required for output ownership."; return 1; }
+    case "$path" in ''|*$'\n'*|*$'\r'*) state_error "Invalid output directory name."; return 1 ;; esac
+    while [[ "$path" == */ && "$path" != / ]]; do path="${path%/}"; done
+    [ ! -L "$path" ] || { state_error "Output root symlink refused: $path"; return 1; }
+    parent=$(dirname -- "$path") && leaf=$(basename -- "$path") || return 1
+    case "$leaf" in /|.|..) state_error "Output root must have a directory name."; return 1 ;; esac
+    if [ "$resume" = false ]; then
+        mkdir -p -- "$parent" || { state_error "Cannot create output parent: $parent"; return 1; }
+    fi
+    # A sentinel preserves trailing newlines in pwd's result, so they can be
+    # rejected rather than silently changing the destination during capture.
+    physical=$(cd -P -- "$parent" && pwd -P && printf '.') \
+        || { state_error "Cannot resolve output parent: $parent"; return 1; }
+    physical="${physical%.}"; physical="${physical%$'\n'}"
+    case "$physical" in ''|*$'\n'*|*$'\r'*) state_error "Invalid physical output parent."; return 1 ;; esac
+    path="${physical%/}/$leaf"
+    [ ! -L "$path" ] || { state_error "Output root symlink refused: $path"; return 1; }
+    if [ "$resume" = false ]; then
+        # Atomic reservation: existing directories (including empty ones) are
+        # refused. Use a fresh child name; generated collisions fail safely.
+        mkdir -m 700 -- "$path" || { state_error "Output root already exists or cannot be reserved: $path"; return 1; }
+    fi
+    [ -d "$path" ] && [ -O "$path" ] || { state_error "Output root must be an owned directory."; return 1; }
+    mode=$(stat -c '%a' -- "$path") || return 1
+    (( (8#$mode & 077) == 0 )) || { state_error "Output root must be private (mode 700)."; return 1; }
+    # Inspect before opening the lock, so an unsafe resume cannot mutate even
+    # the lock file. Inspect again under ownership before any scan-state writes.
+    OUTPUT_DIR="$path"; OUTPUT_ROOT="$path"
+    OUTPUT_ID=$(stat -c '%d:%i' -- "$path") || return 1
+    _validate_existing_output_tree || return 1
+    exec {OUTPUT_LOCK_FD}<> "$path/.nullsec.lock" || { state_error "Cannot open output lock."; return 1; }
+    if ! flock -n "$OUTPUT_LOCK_FD"; then
+        exec {OUTPUT_LOCK_FD}>&-
+        OUTPUT_LOCK_FD=""
+        state_error "Output is owned by another process: $path"; return 1
+    fi
+    OUTPUT_OWNER="$BASHPID"
+    trap release_output_ownership EXIT
+    if ! validate_output_tree; then
+        release_output_ownership
+        return 1
+    fi
+}
+
+_managed_mkdir() {
+    local path
+    for path in "$@"; do
+        validate_output_path "$path" dir && mkdir -p -- "$path" \
+            || { state_error "Cannot create managed directory: $path"; return 1; }
+    done
+}
+
+_managed_remove() {
+    local path
+    validate_output_tree || return 1
+    for path in "$@"; do
+        validate_output_path "$path" || return 1
+        rm -rf -- "$path" || { state_error "Cannot remove managed path: $path"; return 1; }
+    done
+}
+
+# All framework state uses a private, unpredictable temporary file and a
+# checked same-directory rename. A failed write/rename leaves old state intact.
+_atomic_state_write() {
+    local destination="$1" tmp
+    validate_output_path "$destination" file || return 1
+    tmp=$(mktemp -- "${destination}.tmp.XXXXXXXX") || { state_error "Cannot create state temporary file."; return 1; }
+    if ! cat > "$tmp" || ! validate_output_path "$destination" file \
+        || ! mv -fT -- "$tmp" "$destination"; then
+        state_error "Could not persist state: $destination"
+        # Keep the temporary evidence on failure; never risk removing another
+        # object if the tree was replaced during the attempted transaction.
+        return 1
+    fi
+}
+
 save_checkpoint() {
-    local phase_num="$1" tmp
+    local phase_num="$1"
     if [ "$CHECKPOINT_FROZEN" = true ]; then
         return 0
     fi
-    if [ -n "$CHECKPOINT_FILE" ]; then
-        tmp="${CHECKPOINT_FILE}.tmp.$$"
-        printf '%s\n' "$phase_num" > "$tmp"
-        mv -f "$tmp" "$CHECKPOINT_FILE"
-        RESUME_FROM="$phase_num"
-    fi
+    [ -n "$CHECKPOINT_FILE" ] || { state_error "Checkpoint destination is unset."; return 1; }
+    _atomic_state_write "$CHECKPOINT_FILE" <<< "$phase_num" || return 1
+    RESUME_FROM="$phase_num"
 }
 
 phase_done() {
@@ -878,81 +1087,112 @@ safe_artifact_name() {
 # Snapshot every regular file recursively. Fresh results remain authoritative;
 # previous evidence is archived under prior-runs instead of being overwritten.
 backup_phase_outputs() {
-    local phase_dir="$1" phase_key stamp backup_dir file rel copied=0 root
+    _backup_phase_outputs "$@" || { state_error "Backup failed; retained available evidence for $1"; return 1; }
+}
+
+_backup_phase_outputs() {
+    local phase_dir="$1" phase_key backup_dir file rel copied=0 root listing existing destination stamp
+    validate_output_tree && validate_output_path "$phase_dir" dir || return 1
     [ -d "$phase_dir" ] || return 0
-    phase_key=$(basename "$phase_dir")
-    root="$OUTPUT_DIR/.phase-backups/$phase_key"
-
-    # A resume-wide snapshot may already protect this phase. Avoid duplicate
-    # snapshots when the phase itself calls this helper again.
-    if [ -d "$root" ] && find "$root" -type f -name .active -print -quit 2>/dev/null | grep -q .; then
-        return 0
-    fi
-
-    stamp="$(date +%Y%m%d-%H%M%S)-${BASHPID}"
-    backup_dir="$root/$stamp"
-
+    [ ! -e "$phase_dir/.active" ] || { state_error "Reserved backup marker name in phase outputs."; return 1; }
+    phase_key=$(basename -- "$phase_dir") || return 1
+    root="$OUTPUT_ROOT/.phase-backups/$phase_key"
+    _managed_mkdir "$root" || return 1
+    for existing in "$root"/*; do
+        [ -e "$existing" ] || continue
+        validate_output_path "$existing" dir && [ -d "$existing" ] || return 1
+        validate_output_path "$existing/.active" file || return 1
+        [ -f "$existing/.active" ] || return 1 # incomplete snapshots require recovery
+    done
+    for existing in "$root"/*; do
+        [ ! -d "$existing" ] || return 0 # already protected by a complete snapshot
+    done
+    stamp=$(date +%Y%m%d-%H%M%S) || return 1
+    [ -n "$stamp" ] || return 1
+    backup_dir=$(mktemp -d -- "$root/$stamp.XXXXXXXX") || return 1
+    listing=$(mktemp -- "$OUTPUT_ROOT/.phase-backups/.listing.XXXXXXXX") || return 1
+    find "$phase_dir" -type d -name prior-runs -prune -o \
+        -type f ! -name '*.bak' -print0 > "$listing" || return 1
     while IFS= read -r -d '' file; do
         rel="${file#"$phase_dir"/}"
-        mkdir -p "$backup_dir/$(dirname "$rel")"
-        cp -p "$file" "$backup_dir/$rel"
+        destination="$backup_dir/$rel"
+        validate_output_path "$file" file \
+            && _managed_mkdir "${destination%/*}" \
+            && validate_output_path "$backup_dir/$rel" file \
+            && cp -p -- "$file" "$backup_dir/$rel" \
+            && cmp -s -- "$file" "$backup_dir/$rel" || return 1
         copied=$(( copied + 1 ))
-    done < <(find "$phase_dir" -type f \
-        ! -path "$phase_dir/prior-runs/*" \
-        ! -name '*.bak' -print0 2>/dev/null)
-
+    done < "$listing"
+    _managed_remove "$listing" || return 1
     if [ "$copied" -gt 0 ]; then
-        : > "$backup_dir/.active"
+        _atomic_state_write "$backup_dir/.active" <<< complete || return 1
         info "  Preserved $copied existing output file(s) from $phase_key"
     else
-        rm -rf "$backup_dir"
+        _managed_remove "$backup_dir" || return 1
     fi
 }
 
 merge_phase_backup() {
-    local phase_dir="$1" restore_missing="${2:-false}"
-    local phase_key root backup_dir stamp file rel current archive
-    [ -d "$phase_dir" ] || return 0
-    phase_key=$(basename "$phase_dir")
-    root="$OUTPUT_DIR/.phase-backups/$phase_key"
+    _merge_phase_backup "$@" || { state_error "Preservation failed; source backup retained for $1"; return 1; }
+}
 
+_merge_phase_backup() {
+    local phase_dir="$1" restore_missing="${2:-false}"
+    local phase_key root backup_dir stamp file rel current archive listing destination
+    validate_output_tree && validate_output_path "$phase_dir" dir || return 1
+    [ -d "$phase_dir" ] || return 0
+    phase_key=$(basename -- "$phase_dir") || return 1
+    root="$OUTPUT_ROOT/.phase-backups/$phase_key"
     if [ -d "$root" ]; then
         for backup_dir in "$root"/*; do
-            [ -d "$backup_dir" ] && [ -f "$backup_dir/.active" ] || continue
-            stamp=$(basename "$backup_dir")
+            [ -e "$backup_dir" ] || continue
+            validate_output_path "$backup_dir" dir && [ -d "$backup_dir" ] || return 1
+            validate_output_path "$backup_dir/.active" file && [ -f "$backup_dir/.active" ] || return 1
+            stamp=$(basename -- "$backup_dir") || return 1
             archive="$phase_dir/prior-runs/$stamp"
+            _managed_mkdir "$archive" || return 1
+            listing=$(mktemp -- "$OUTPUT_ROOT/.phase-backups/.listing.XXXXXXXX") || return 1
+            find "$backup_dir" -type f -print0 > "$listing" || return 1
             while IFS= read -r -d '' file; do
-                [ "$(basename "$file")" = ".active" ] && continue
+                [ "$file" != "$backup_dir/.active" ] || continue
                 rel="${file#"$backup_dir"/}"
                 current="$phase_dir/$rel"
+                # Archive even when restoring. Retrying a partially completed
+                # restore therefore never discards the original preserved bytes.
+                destination="$archive/$rel"
+                validate_output_path "$file" file \
+                    && _managed_mkdir "${destination%/*}" \
+                    && validate_output_path "$archive/$rel" file \
+                    && cp -p -- "$file" "$archive/$rel" \
+                    && cmp -s -- "$file" "$archive/$rel" || return 1
                 if [ "$restore_missing" = true ] && [ ! -s "$current" ]; then
-                    # Interruption path: restore evidence that a killed phase did
-                    # not replace. Successful reruns never repopulate current
-                    # results with stale findings.
-                    mkdir -p "$(dirname "$current")"
-                    cp -p "$file" "$current"
-                else
-                    mkdir -p "$archive/$(dirname "$rel")"
-                    cp -p "$file" "$archive/$rel"
+                    _managed_mkdir "${current%/*}" \
+                        && validate_output_path "$current" file \
+                        && cp -p -- "$file" "$current" \
+                        && cmp -s -- "$file" "$current" || return 1
                 fi
-            done < <(find "$backup_dir" -type f -print0)
-            rm -rf "$backup_dir"
+            done < "$listing"
+            _managed_remove "$listing" || return 1
+            # This is the commit point: every required archive/restore succeeded.
+            _managed_remove "$backup_dir" || return 1
         done
-        rmdir "$root" 2>/dev/null || true
     fi
 
-    # Recover legacy sibling .bak files created by older NullSec versions.
+    # Legacy .bak recovery retains the existing traversal semantics (NS-022 is
+    # deferred). Only status handling and destination validation change here.
+    _managed_mkdir "$OUTPUT_ROOT/.phase-backups" || return 1
+    listing=$(mktemp -- "$OUTPUT_ROOT/.phase-backups/.listing.XXXXXXXX") || return 1
+    find "$phase_dir" -type f -name '*.bak' -print0 > "$listing" || return 1
     while IFS= read -r -d '' file; do
         current="${file%.bak}"
-        if [ "$restore_missing" = true ] && [ ! -s "$current" ]; then
-            mv -f "$file" "$current"
-        else
-            mkdir -p "$phase_dir/prior-runs/legacy"
+        if [ "$restore_missing" != true ] || [ -s "$current" ]; then
             rel="${file#"$phase_dir"/}"
-            mkdir -p "$phase_dir/prior-runs/legacy/$(dirname "$rel")"
-            mv -f "$file" "$phase_dir/prior-runs/legacy/$rel"
+            current="$phase_dir/prior-runs/legacy/$rel"
         fi
-    done < <(find "$phase_dir" -type f -name '*.bak' -print0 2>/dev/null)
+        validate_output_path "$file" file && _managed_mkdir "${current%/*}" \
+            && validate_output_path "$current" file && mv -fT -- "$file" "$current" || return 1
+    done < "$listing"
+    _managed_remove "$listing"
 }
 
 _all_output_dirs() {
@@ -977,14 +1217,14 @@ _all_output_dirs() {
 snapshot_all_outputs() {
     local phase_dir
     while IFS= read -r phase_dir; do
-        backup_phase_outputs "$phase_dir"
+        backup_phase_outputs "$phase_dir" || return 1
     done < <(_all_output_dirs)
 }
 
 finalize_all_output_backups() {
     local restore_missing="${1:-false}" phase_dir
     while IFS= read -r phase_dir; do
-        merge_phase_backup "$phase_dir" "$restore_missing"
+        merge_phase_backup "$phase_dir" "$restore_missing" || return 1
     done < <(_all_output_dirs)
 }
 
@@ -1310,23 +1550,18 @@ check_tools() {
 
 create_structure() {
     print_phase "📁 CREATING DIRECTORY STRUCTURE"
-
-    # Ensure parent directory exists before resolving absolute path
-    # (fixes original bug where cd would fail if parent didn't exist)
-    local parent_dir
-    parent_dir="$(dirname "$OUTPUT_DIR")"
-    mkdir -p "$parent_dir"
-    OUTPUT_DIR="$(cd "$parent_dir" && pwd)/$(basename "$OUTPUT_DIR")"
-
-    mkdir -p "$OUTPUT_DIR"/{phase1-subdomains,phase2-validation,phase2.5-cloud,phase3-probing,\
-phase4-portscan,phase5-urls,phase6-parameters,asset-scoring,phase7-vulns,phase8-javascript,\
-phase9-patterns,phase10-screenshots,phase11-fuzzing,phase12-active-vulns,reports}
-
-    mkdir -p "$OUTPUT_DIR/phase10-screenshots"/{403,admin,interesting,all}
-    mkdir -p "$OUTPUT_DIR/phase8-javascript/js-files"
-    mkdir -p "$OUTPUT_DIR/phase11-fuzzing"/{dirs,vhosts}
-    mkdir -p "$OUTPUT_DIR/phase2.5-cloud"/{s3,gcs,azure,exposed}
-
+    if [ -z "$OUTPUT_LOCK_FD" ]; then
+        _claim_output_root "$OUTPUT_DIR" false || return 1
+    fi
+    validate_output_tree || return 1
+    local dir
+    while IFS= read -r dir; do
+        _managed_mkdir "$dir" || { state_error "Cannot create required directory: $dir"; return 1; }
+    done < <(_all_output_dirs)
+    _managed_mkdir "$OUTPUT_ROOT/phase10-screenshots"/{403,admin,interesting,all} \
+        "$OUTPUT_ROOT/phase8-javascript/js-files" "$OUTPUT_ROOT/phase11-fuzzing"/{dirs,vhosts} \
+        "$OUTPUT_ROOT/phase2.5-cloud"/{s3,gcs,azure,exposed} \
+        || { state_error "Cannot create required output directories."; return 1; }
     success "Directory structure created: $OUTPUT_DIR"
 }
 
@@ -1401,12 +1636,13 @@ usage() {
 # PHASE 1: Subdomain Discovery
 # ─────────────────────────────────────────────────────────────────────────────
 phase1_subdomain_discovery() {
+    validate_output_tree || return 1
     phase_done 1 && { polite_sleep; return 0; }
     print_phase "🔍 PHASE 1: SUBDOMAIN DISCOVERY"
 
     local p1dir="$OUTPUT_DIR/phase1-subdomains"
     local phase_errors=0 rc tmp
-    backup_phase_outputs "$p1dir"
+    backup_phase_outputs "$p1dir" || return 1
 
     info "Running Subfinder (passive)..."
     : > "$p1dir/subfinder.txt"
@@ -1458,7 +1694,7 @@ phase1_subdomain_discovery() {
         [ "$amass_minutes" -lt 1 ] && amass_minutes=1
         amass_config_args=()
 
-        rm -rf "$amass_state"
+        _managed_remove "$amass_state" || return 1
         mkdir -p "$amass_state"
         : > "$amass_log"
         : > "$amass_detailed"
@@ -1484,6 +1720,7 @@ phase1_subdomain_discovery() {
 
     if [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_version" == v4.* ]]; then
         _nullsec_run_amass_v4 "$(command -v "$AMASS_V4_BIN")"
+        [ "$STATE_FAILED" = false ] || return 1
 
     elif check_command "amass"; then
         # The normal binary can itself be v4, in which case preserve the same
@@ -1494,6 +1731,7 @@ phase1_subdomain_discovery() {
 
         if [[ "$amass_version" == v4.* ]]; then
             _nullsec_run_amass_v4 "$amass_bin"
+            [ "$STATE_FAILED" = false ] || return 1
         elif grep -q -- '-src' <<< "$amass_help"; then
             # Older Amass fallback. This path is retained only for portability;
             # it does not provide the v4 Open Asset Model relationship display.
@@ -1510,7 +1748,7 @@ phase1_subdomain_discovery() {
             amass_export="$p1dir/.amass-export.tmp.$$"
             amass_log="$amass_state/amass.log"
 
-            rm -rf "$amass_state"
+            _managed_remove "$amass_state" || return 1
             mkdir -p "$amass_state"
             rm -f "$amass_export"
 
@@ -1615,7 +1853,7 @@ phase1_subdomain_discovery() {
         "$p1dir/assetfinder.txt" "$p1dir/crtsh.txt" 2>/dev/null \
         | in_scope | sort -u > "$p1dir/all-subdomains-passive.txt"; then
         error "Failed to merge passive subdomain sources."
-        merge_phase_backup "$p1dir"
+        merge_phase_backup "$p1dir" || return 1
         return 1
     fi
     success "Unique passive subdomains: $(count_lines "$p1dir/all-subdomains-passive.txt")"
@@ -1702,23 +1940,23 @@ phase1_subdomain_discovery() {
 
     local p1_total
     p1_total=$(count_lines "$p1dir/all-subdomains.txt")
-    merge_phase_backup "$p1dir"
+    merge_phase_backup "$p1dir" || return 1
 
     if [ "$p1_total" -eq 0 ]; then
         error "Phase 1 produced no subdomains."
         return 1
     fi
 
-    success "Phase 1 complete! Total subdomains: $p1_total"
-    notify "🌐 Phase 1 Complete" \
-        "Subdomain discovery finished.\nFound *${p1_total}* subdomains for \`${TARGET}\`."
 
     if [ "$phase_errors" -gt 0 ]; then
         warn "Phase 1 completed with $phase_errors source failure(s); checkpoint was not advanced so resume can retry."
         return 1
     fi
 
-    save_checkpoint 1
+    save_checkpoint 1 || return 1
+    success "Phase 1 complete! Total subdomains: $p1_total"
+    notify "🌐 Phase 1 Complete" \
+        "Subdomain discovery finished.\nFound *${p1_total}* subdomains for \`${TARGET}\`."
     polite_sleep
     return 0
 }
@@ -1727,6 +1965,7 @@ phase1_subdomain_discovery() {
 # PHASE 2: Validation & Resolution
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_validation() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase2_validation: skipped by authorization policy"; return 0; }
     phase_done 2 && { polite_sleep; return 0; }
     print_phase "✅ PHASE 2: VALIDATION & RESOLUTION"
@@ -1739,7 +1978,7 @@ phase2_validation() {
         error "No subdomains found in Phase 1. Skipping Phase 2."
         return 1
     fi
-    backup_phase_outputs "$p2dir"
+    backup_phase_outputs "$p2dir" || return 1
 
     # 2.1 Resolve with dnsx — collect A records and detect wildcards
     info "Resolving subdomains with dnsx..."
@@ -1804,15 +2043,15 @@ phase2_validation() {
         fi
     fi
 
-    merge_phase_backup "$p2dir"
-    success "Phase 2 complete! Valid subdomains: $valid"
+    merge_phase_backup "$p2dir" || return 1
 
     if [ "$phase_errors" -gt 0 ]; then
         warn "Phase 2 completed with $phase_errors error(s); checkpoint was not advanced."
         return 1
     fi
 
-    save_checkpoint 2
+    save_checkpoint 2 || return 1
+    success "Phase 2 complete! Valid subdomains: $valid"
     polite_sleep
     return 0
 }
@@ -1835,6 +2074,7 @@ phase2_validation() {
 #   - Report:  dedicated cloud findings section
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_5_cloud_enum() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase2_5_cloud_enum: skipped by authorization policy"; return 0; }
     # Phase 3 can only have completed after Phase 2.5 was reached. On resume from
     # checkpoint 3 or later, do not rerun cloud enumeration and append stale data.
@@ -1853,7 +2093,7 @@ phase2_5_cloud_enum() {
 
     local p2dir="$OUTPUT_DIR/phase2-validation"
     local cdir="$OUTPUT_DIR/phase2.5-cloud"
-    backup_phase_outputs "$cdir"
+    backup_phase_outputs "$cdir" || return 1
 
     local base_name
     base_name=$(printf '%s' "$TARGET" \
@@ -2177,7 +2417,7 @@ phase2_5_cloud_enum() {
     fi
 
     rm -f "$token_file" "$candidates_file" "$s3_candidates" "$gcs_candidates" "$azure_candidates"
-    merge_phase_backup "$cdir"
+    merge_phase_backup "$cdir" || return 1
     success "Phase 2.5 complete!"
     polite_sleep
     return 0
@@ -2187,6 +2427,7 @@ phase2_5_cloud_enum() {
 # PHASE 3: Live Web Service Probing
 # ─────────────────────────────────────────────────────────────────────────────
 phase3_probing() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase3_probing: skipped by authorization policy"; return 0; }
     phase_done 3 && { polite_sleep; return 0; }
     print_phase "🌐 PHASE 3: LIVE WEB SERVICE PROBING"
@@ -2199,7 +2440,7 @@ phase3_probing() {
         error "No valid subdomains from Phase 2. Skipping Phase 3."
         return 1
     fi
-    backup_phase_outputs "$p3dir"
+    backup_phase_outputs "$p3dir" || return 1
 
     info "Probing for live web hosts..."
     : > "$p3dir/live-hosts.txt"
@@ -2289,14 +2530,14 @@ phase3_probing() {
         [ -s "$vhost_ffuf_log" ] && info "vhost ffuf stderr preserved at: $vhost_ffuf_log"
     fi
 
-    merge_phase_backup "$p3dir"
+    merge_phase_backup "$p3dir" || return 1
     if [ "$phase_errors" -gt 0 ]; then
         warn "Phase 3 completed with $phase_errors error(s); checkpoint was not advanced."
         return 1
     fi
 
+    save_checkpoint 3 || return 1
     success "Phase 3 complete!"
-    save_checkpoint 3
     polite_sleep
     return 0
 }
@@ -2305,13 +2546,14 @@ phase3_probing() {
 # PHASE 4: Port Scanning
 # ─────────────────────────────────────────────────────────────────────────────
 phase4_portscan() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase4_portscan: skipped by authorization policy"; return 0; }
     phase_done 4 && { polite_sleep; return 0; }
     print_phase "🔌 PHASE 4: PORT SCANNING"
 
     if [ "$RUN_PORT_SCAN" = false ]; then
         info "Port scanning skipped (mode: $SCAN_MODE)."
-        save_checkpoint 4
+        save_checkpoint 4 || return 1
         polite_sleep
         return 0
     fi
@@ -2323,11 +2565,11 @@ phase4_portscan() {
 
     if [ ! -s "$p2dir/valid-subdomains.txt" ]; then
         warn "No valid subdomains for port scanning. Skipping Phase 4."
-        save_checkpoint 4
+        save_checkpoint 4 || return 1
         polite_sleep
         return 0
     fi
-    backup_phase_outputs "$p4dir"
+    backup_phase_outputs "$p4dir" || return 1
 
     # 4.1 Scan top 1000 ports with Naabu
     info "Scanning top 1000 ports with Naabu..."
@@ -2368,13 +2610,13 @@ phase4_portscan() {
         success "Additional web services on non-standard ports: $(count_lines "$p4dir/services-on-ports.txt")"
     fi
 
-    merge_phase_backup "$p4dir"
-    success "Phase 4 complete!"
+    merge_phase_backup "$p4dir" || return 1
     if [ "$phase_errors" -gt 0 ]; then
         warn "Phase 4 completed with $phase_errors error(s); checkpoint was not advanced."
         return 1
     fi
-    save_checkpoint 4
+    save_checkpoint 4 || return 1
+    success "Phase 4 complete!"
     polite_sleep
     return 0
 }
@@ -2383,6 +2625,7 @@ phase4_portscan() {
 # PHASE 5: URL Discovery & Crawling
 # ─────────────────────────────────────────────────────────────────────────────
 phase5_url_discovery() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase5_url_discovery: skipped by authorization policy"; return 0; }
     phase_done 5 && { polite_sleep; return 0; }
     print_phase "🔗 PHASE 5: URL DISCOVERY & CRAWLING"
@@ -2391,7 +2634,7 @@ phase5_url_discovery() {
     local p3dir="$OUTPUT_DIR/phase3-probing"
     local p5dir="$OUTPUT_DIR/phase5-urls"
     local phase_errors=0
-    backup_phase_outputs "$p5dir"
+    backup_phase_outputs "$p5dir" || return 1
 
     # Always initialize the main Phase 5 outputs so later phases/reporting do not
     # fail when Phase 3 found no live hosts or a passive source is unavailable.
@@ -2649,13 +2892,13 @@ phase5_url_discovery() {
         warn "gf not found — install tomnomnom/gf for higher-accuracy URL filtering."
     fi
 
-    merge_phase_backup "$p5dir"
-    success "Phase 5 complete!"
+    merge_phase_backup "$p5dir" || return 1
     if [ "$phase_errors" -gt 0 ]; then
         warn "Phase 5 completed with $phase_errors error(s); checkpoint was not advanced."
         return 1
     fi
-    save_checkpoint 5
+    save_checkpoint 5 || return 1
+    success "Phase 5 complete!"
     polite_sleep
     return 0
 }
@@ -2664,6 +2907,7 @@ phase5_url_discovery() {
 # PHASE 6: Parameter Discovery
 # ─────────────────────────────────────────────────────────────────────────────
 phase6_parameters() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase6_parameters: skipped by authorization policy"; return 0; }
     phase_done 6 && { polite_sleep; return 0; }
     print_phase "📊 PHASE 6: PARAMETER DISCOVERY"
@@ -2672,7 +2916,7 @@ phase6_parameters() {
     local p6dir="$OUTPUT_DIR/phase6-parameters"
     local p3dir="$OUTPUT_DIR/phase3-probing"
     local phase_errors=0
-    backup_phase_outputs "$p6dir"
+    backup_phase_outputs "$p6dir" || return 1
 
     : > "$p6dir/parameters.txt"
     : > "$p6dir/arjun-all-params.txt"
@@ -2715,13 +2959,13 @@ phase6_parameters() {
         warn "No status-200 hosts for Arjun."
     fi
 
-    merge_phase_backup "$p6dir"
-    success "Phase 6 complete!"
+    merge_phase_backup "$p6dir" || return 1
     if [ "$phase_errors" -gt 0 ]; then
         warn "Phase 6 completed with $phase_errors error(s); checkpoint was not advanced."
         return 1
     fi
-    save_checkpoint 6
+    save_checkpoint 6 || return 1
+    success "Phase 6 complete!"
     polite_sleep
     return 0
 }
@@ -2730,6 +2974,7 @@ phase6_parameters() {
 # PHASE 6b: Asset Scoring & Prioritization
 # ─────────────────────────────────────────────────────────────────────────────
 phase_asset_scoring() {
+    validate_output_tree || return 1
     # NOTE: No checkpoint guard — this phase is a fast local computation (no
     # network I/O) so it always re-runs, guaranteeing scores reflect the latest
     # data even on resume.  Runs in <2s on typical scan outputs.
@@ -3000,7 +3245,7 @@ phase_asset_scoring() {
     done
 
     # ── Cleanup temp files ───────────────────────────────────────────────────
-    rm -rf "$tmp_dir" "$host_list"
+    _managed_remove "$tmp_dir" "$host_list" || return 1
 
     success "Asset scoring complete! → $score_dir/"
     polite_sleep
@@ -3033,6 +3278,7 @@ _p7_report_skips() {
 # PHASE 7: Vulnerability Scanning (Nuclei)
 # ─────────────────────────────────────────────────────────────────────────────
 phase7_vulnerability_scanning() {
+    validate_output_tree || return 1
     authorization_allowed validation || { info "phase7_vulnerability_scanning: skipped by authorization policy"; return 0; }
     phase_done 7 && { polite_sleep; return; }
     print_phase "🛡️  PHASE 7: VULNERABILITY SCANNING (NUCLEI)"
@@ -3046,12 +3292,12 @@ phase7_vulnerability_scanning() {
         warn "No live hosts for Nuclei. Skipping Phase 7."
         # BUG-8 FIX: record checkpoint so resume correctly skips this phase,
         # and honour polite_sleep for consistency with all other skip paths.
-        save_checkpoint 7
+        save_checkpoint 7 || return 1
         polite_sleep
         return 0
     fi
 
-    backup_phase_outputs "$p7dir"
+    backup_phase_outputs "$p7dir" || return 1
     rm -f "$p7dir"/{all-findings.txt,all-findings.json,exposure-findings.txt,exposure-findings.json,critical-findings.txt,high-medium-findings.txt,cve-findings.txt,api-findings.txt,endpoint-findings.txt,js-exposure-findings.txt,scan1-nuclei.log,scan1-stats.json,scan2-nuclei.log,scan2-stats.json} 2>/dev/null || true
 
     # Optional template update — auto-updates if templates are older than 7 days
@@ -3190,8 +3436,8 @@ phase7_vulnerability_scanning() {
 
     if [ ! -s "$host_targets" ]; then
         warn "All live hosts were filtered out as out-of-scope for TARGET=$TARGET. Skipping Phase 7."
-        merge_phase_backup "$p7dir"
-        save_checkpoint 7
+        merge_phase_backup "$p7dir" || return 1
+        save_checkpoint 7 || return 1
         polite_sleep
         return 0
     fi
@@ -3365,8 +3611,7 @@ phase7_vulnerability_scanning() {
     local exposure_count
     exposure_count=$(count_lines "$p7dir/exposure-findings.txt")
 
-    merge_phase_backup "$p7dir"
-    success "Phase 7 complete! Total findings: $total_findings (+ $exposure_count exposure/misconfig)"
+    merge_phase_backup "$p7dir" || return 1
 
     # Notify on anything worth acting on immediately
     local p7_critical p7_high_med p7_cves
@@ -3388,7 +3633,8 @@ phase7_vulnerability_scanning() {
         polite_sleep
         return 1
     fi
-    save_checkpoint 7
+    save_checkpoint 7 || return 1
+    success "Phase 7 complete! Total findings: $total_findings (+ $exposure_count exposure/misconfig)"
     polite_sleep
     return 0
 }
@@ -3397,6 +3643,7 @@ phase7_vulnerability_scanning() {
 # PHASE 8: JavaScript Analysis & Secret Extraction
 # ─────────────────────────────────────────────────────────────────────────────
 phase8_javascript_analysis() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase8_javascript_analysis: skipped by authorization policy"; return 0; }
     phase_done 8 && { polite_sleep; return 0; }
     print_phase "📜 PHASE 8: JAVASCRIPT ANALYSIS & SECRET EXTRACTION"
@@ -3415,15 +3662,15 @@ phase8_javascript_analysis() {
         return 0
     fi
 
-    backup_phase_outputs "$p8dir"
-    rm -rf "$p8dir/js-files"
+    backup_phase_outputs "$p8dir" || return 1
+    _managed_remove "$p8dir/js-files" || return 1
     mkdir -p "$p8dir/js-files"
 
     local scoped_js="$p8dir/.scoped-js-input.txt"
     in_scope < "$p5dir/live-js-files.txt" | sort -u | head -n "$MAX_JS_FILES" > "$scoped_js"
     if [ ! -s "$scoped_js" ]; then
         warn "No in-scope JavaScript URLs remained after scope filtering."
-        merge_phase_backup "$p8dir"
+        merge_phase_backup "$p8dir" || return 1
         rm -f "$scoped_js"
         return 0
     fi
@@ -3457,7 +3704,7 @@ phase8_javascript_analysis() {
 
     if [ "$js_count" -eq 0 ]; then
         error "Every JavaScript download failed or exceeded the configured limits."
-        merge_phase_backup "$p8dir"
+        merge_phase_backup "$p8dir" || return 1
         return 1
     fi
 
@@ -3525,7 +3772,7 @@ phase8_javascript_analysis() {
         success "Live endpoints from JS: $(count_lines "$p8dir/live-js-endpoints.txt")"
     fi
 
-    merge_phase_backup "$p8dir"
+    merge_phase_backup "$p8dir" || return 1
     success "Phase 8 complete!"
 
     local p8_secrets p8_aws p8_privkeys p8_total
@@ -3545,6 +3792,7 @@ phase8_javascript_analysis() {
 # PHASE 9: Vulnerability Pattern Hunting
 # ─────────────────────────────────────────────────────────────────────────────
 phase9_pattern_hunting() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase9_pattern_hunting: skipped by authorization policy"; return 0; }
     phase_done 9 && { polite_sleep; return; }
     print_phase "🎯 PHASE 9: VULNERABILITY PATTERN HUNTING"
@@ -3556,11 +3804,11 @@ phase9_pattern_hunting() {
 
     local phase_status=0
     local p9dir_backup="$OUTPUT_DIR/phase9-patterns"
-    backup_phase_outputs "$p9dir_backup"
+    backup_phase_outputs "$p9dir_backup" || return 1
     : > "$p9dir_backup/cors-findings.txt"
     : > "$p9dir_backup/host-injection-findings.txt"
     : > "$p9dir_backup/dalfox-xss-confirmed.txt"
-    rm -rf "$p9dir_backup/sqlmap-results"
+    _managed_remove "$p9dir_backup/sqlmap-results" || return 1
     mkdir -p "$p9dir_backup/sqlmap-results"
 
     local p5dir="$OUTPUT_DIR/phase5-urls"
@@ -3883,7 +4131,7 @@ phase9_pattern_hunting() {
     fi
     [ "$hhi_failures" -gt 0 ] && warn "HHI scan: $hhi_failures/$hhi_count requests failed (timeouts/resets)."
 
-    merge_phase_backup "$p9dir_backup"
+    merge_phase_backup "$p9dir_backup" || return 1
     success "Phase 9 complete!"
 
     # Notify on high-signal pattern hits
@@ -3905,6 +4153,7 @@ phase9_pattern_hunting() {
 # PHASE 10: Screenshots & Visual Reconnaissance
 # ─────────────────────────────────────────────────────────────────────────────
 phase10_screenshots() {
+    validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase10_screenshots: skipped by authorization policy"; return 0; }
     phase_done 10 && { polite_sleep; return 0; }
     print_phase "📸 PHASE 10: SCREENSHOTS & VISUAL RECONNAISSANCE"
@@ -3924,8 +4173,8 @@ phase10_screenshots() {
         return 0
     fi
 
-    backup_phase_outputs "$p10dir"
-    rm -rf "$p10dir/403" "$p10dir/interesting" "$p10dir/admin" "$p10dir/all"
+    backup_phase_outputs "$p10dir" || return 1
+    _managed_remove "$p10dir/403" "$p10dir/interesting" "$p10dir/admin" "$p10dir/all" || return 1
     mkdir -p "$p10dir/403" "$p10dir/interesting" "$p10dir/admin" "$p10dir/all"
 
     _run_gowitness_batch() {
@@ -3955,7 +4204,7 @@ phase10_screenshots() {
     _run_gowitness_batch "live host" "$p3dir/live-hosts.txt" "$p10dir/all" || phase_status=1
     unset -f _run_gowitness_batch
 
-    merge_phase_backup "$p10dir"
+    merge_phase_backup "$p10dir" || return 1
     success "Phase 10 complete!"
     return "$phase_status"
 }
@@ -3964,6 +4213,7 @@ phase10_screenshots() {
 # PHASE 11: Directory & Content Fuzzing  [NEW]
 # ─────────────────────────────────────────────────────────────────────────────
 phase11_fuzzing() {
+    validate_output_tree || return 1
     authorization_allowed validation || { info "phase11_fuzzing: skipped by authorization policy"; return 0; }
     phase_done 11 && { polite_sleep; return 0; }
     print_phase "💥 PHASE 11: DIRECTORY & CONTENT FUZZING"
@@ -3990,8 +4240,8 @@ phase11_fuzzing() {
         return 0
     fi
 
-    backup_phase_outputs "$p11dir"
-    rm -rf "$p11dir/dirs"
+    backup_phase_outputs "$p11dir" || return 1
+    _managed_remove "$p11dir/dirs" || return 1
     mkdir -p "$p11dir/dirs"
 
     local fuzz_input="$p11dir/.fuzz-targets-in-scope.txt"
@@ -3999,7 +4249,7 @@ phase11_fuzzing() {
     if [ ! -s "$fuzz_input" ]; then
         warn "No in-scope status-200 hosts for fuzzing (TARGET=$TARGET)."
         rm -f "$fuzz_input"
-        merge_phase_backup "$p11dir"
+        merge_phase_backup "$p11dir" || return 1
         return 0
     fi
 
@@ -4077,7 +4327,7 @@ phase11_fuzzing() {
     fi
 
     rm -f "$fuzz_input"
-    merge_phase_backup "$p11dir"
+    merge_phase_backup "$p11dir" || return 1
     success "Phase 11 complete!"
     return "$phase_status"
 }
@@ -4086,13 +4336,14 @@ phase11_fuzzing() {
 # PHASE 12: Active Vulnerability Confirmation  [NEW]
 # ─────────────────────────────────────────────────────────────────────────────
 phase12_active_vulns() {
+    validate_output_tree || return 1
     authorization_allowed validation || { info "phase12_active_vulns: skipped by authorization policy"; return 0; }
     phase_done 12 && { polite_sleep; return 0; }
     print_phase "🔥 PHASE 12: ACTIVE VULNERABILITY CONFIRMATION"
 
     if [ "$RUN_ACTIVE_VULNS" = false ]; then
         info "Active vulnerability confirmation skipped (mode: $SCAN_MODE)."
-        save_checkpoint 12
+        save_checkpoint 12 || return 1
         return 0
     fi
 
@@ -4100,7 +4351,7 @@ phase12_active_vulns() {
     local p5dir="$OUTPUT_DIR/phase5-urls"
     local p12dir="$OUTPUT_DIR/phase12-active-vulns"
     local phase_status=0
-    backup_phase_outputs "$p12dir"
+    backup_phase_outputs "$p12dir" || return 1
 
     : > "$p12dir/ssrf-confirmed.txt"
     : > "$p12dir/redirect-confirmed.txt"
@@ -4173,13 +4424,13 @@ phase12_active_vulns() {
         fi
     fi
 
-    merge_phase_backup "$p12dir"
+    merge_phase_backup "$p12dir" || return 1
     if [ "$phase_status" -ne 0 ]; then
         warn "Phase 12 completed with errors; checkpoint was not advanced."
         return 1
     fi
+    save_checkpoint 12 || return 1
     success "Phase 12 complete!"
-    save_checkpoint 12
     return 0
 }
 
@@ -4193,8 +4444,12 @@ generate_report() {
 
     print_phase "📋 GENERATING FINAL REPORT"
 
-    local report_file="$OUTPUT_DIR/reports/recon-report.txt"
-    backup_phase_outputs "$OUTPUT_DIR/reports"
+    validate_output_tree || return 1
+    local report_destination="$OUTPUT_DIR/reports/recon-report.txt" report_file
+    validate_output_path "$report_destination" file || return 1
+    backup_phase_outputs "$OUTPUT_DIR/reports" || return 1
+
+    report_file=$(mktemp -- "$OUTPUT_DIR/reports/.report.XXXXXXXX") || { state_error "Cannot create report temporary file."; return 1; }
 
     cat > "$report_file" << EOF
 ================================================================================
@@ -4294,6 +4549,7 @@ ACTIVE CONFIRMATION:
 ================================================================================
 
 EOF
+    [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
 
     for findings_file in \
         "$OUTPUT_DIR/phase7-vulns/critical-findings.txt" \
@@ -4309,9 +4565,9 @@ EOF
         "$OUTPUT_DIR/phase12-active-vulns/403-bypass-confirmed.txt" \
         "$OUTPUT_DIR/phase12-active-vulns/graphql-findings.txt"; do
         if [ -s "$findings_file" ]; then
-            echo "--- $(basename "$findings_file") ---" >> "$report_file"
-            cat "$findings_file" >> "$report_file"
-            echo "" >> "$report_file"
+            echo "--- $(basename "$findings_file") ---" >> "$report_file" || { state_error "Report write failed."; return 1; }
+            cat "$findings_file" >> "$report_file" || { state_error "Report write failed."; return 1; }
+            echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
         fi
     done
 
@@ -4324,8 +4580,9 @@ EOF
 ================================================================================
 
 EOF
-        head -25 "$OUTPUT_DIR/asset-scoring/scored-targets.txt" >> "$report_file"
-        echo "" >> "$report_file"
+        [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
+        head -25 "$OUTPUT_DIR/asset-scoring/scored-targets.txt" >> "$report_file" || { state_error "Report write failed."; return 1; }
+        echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
     fi
 
     cat >> "$report_file" << EOF
@@ -4335,6 +4592,7 @@ EOF
 ================================================================================
 
 EOF
+    [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
 
     for secret_file in \
         "$OUTPUT_DIR/phase8-javascript/trufflehog-summary.txt" \
@@ -4345,9 +4603,9 @@ EOF
         "$OUTPUT_DIR/phase8-javascript/stripe-keys.txt" \
         "$OUTPUT_DIR/phase8-javascript/private-keys.txt"; do
         if [ -s "$secret_file" ]; then
-            echo "--- $(basename "$secret_file") ---" >> "$report_file"
-            cat "$secret_file" >> "$report_file"
-            echo "" >> "$report_file"
+            echo "--- $(basename "$secret_file") ---" >> "$report_file" || { state_error "Report write failed."; return 1; }
+            cat "$secret_file" >> "$report_file" || { state_error "Report write failed."; return 1; }
+            echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
         fi
     done
 
@@ -4363,9 +4621,13 @@ Happy Hunting! 🐛
 
 ================================================================================
 EOF
+    [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
 
-    merge_phase_backup "$OUTPUT_DIR/reports"
-    success "Report generated: $report_file"
+    validate_output_path "$report_destination" file \
+        && mv -fT -- "$report_file" "$report_destination" \
+        || { state_error "Report rename failed."; return 1; }
+    merge_phase_backup "$OUTPUT_DIR/reports" || return 1
+    success "Report generated: $report_destination"
 }
 
 #==============================================================================#
@@ -4423,11 +4685,7 @@ main() {
         exit 1
     fi
     if [ -n "$RESUME_DIR" ]; then
-        if [ ! -d "$RESUME_DIR" ]; then
-            error "Resume directory not found: $RESUME_DIR"
-            exit 1
-        fi
-        OUTPUT_DIR="$(cd "$RESUME_DIR" && pwd)"
+        _claim_output_root "$RESUME_DIR" true || exit 1
         local early_meta="$OUTPUT_DIR/.scan-meta"
         local early_checkpoint="$OUTPUT_DIR/.checkpoint"
         if [ ! -f "$early_meta" ]; then
@@ -4439,36 +4697,31 @@ main() {
             exit 1
         fi
         local stored_target stored_mode
-        stored_target=$(awk -F= '$1=="TARGET" {sub(/^[^=]*=/,""); print; exit}' "$early_meta")
-        stored_mode=$(awk -F= '$1=="SCAN_MODE" {sub(/^[^=]*=/,""); print; exit}' "$early_meta")
+        stored_target=$(awk -F= '$1=="TARGET" {sub(/^[^=]*=/,""); print; exit}' "$early_meta") || { error "Cannot read scan metadata."; exit 1; }
+        stored_mode=$(awk -F= '$1=="SCAN_MODE" {sub(/^[^=]*=/,""); print; exit}' "$early_meta") || { error "Cannot read scan metadata."; exit 1; }
         if [ "$stored_target" != "$TARGET" ]; then
             error "Resume target mismatch: directory belongs to '$stored_target', not '$TARGET'."
             exit 1
         fi
-        if [ -n "$stored_mode" ] && [ "$stored_mode" != "$SCAN_MODE" ]; then
-            warn "Scan mode changed from '$stored_mode' to '$SCAN_MODE'; restarting at Phase 1 inside the same target-bound directory."
-            RESUME_FROM=0
-            MODE_CHANGED=true
-        elif [ -f "$early_checkpoint" ]; then
-            RESUME_FROM=$(tr -cd '0-9.\n' < "$early_checkpoint" | head -1)
+        if [ -f "$early_checkpoint" ]; then
+            RESUME_FROM=$(tr -cd '0-9.\n' < "$early_checkpoint" | head -1) || { error "Cannot read checkpoint."; exit 1; }
             [[ "${RESUME_FROM:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] || RESUME_FROM=0
-            info "Resuming scan from checkpoint $RESUME_FROM."
         else
             RESUME_FROM=0
             warn "No checkpoint file found — starting from Phase 1."
+        fi
+        if [ -n "$stored_mode" ] && [ "$stored_mode" != "$SCAN_MODE" ]; then
+            warn "Scan mode changed from '$stored_mode' to '$SCAN_MODE'; restarting at Phase 1 inside the same target-bound directory."
+            MODE_CHANGED=true
+        else
+            info "Resuming scan from checkpoint $RESUME_FROM."
         fi
     else
         RESUME_FROM=0
         if [ -z "$OUTPUT_DIR" ]; then
             OUTPUT_DIR="./recon-$TARGET-$(date +%Y%m%d-%H%M%S)"
-        elif [ -d "$OUTPUT_DIR" ] && [ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-            error "Output directory is not empty: $OUTPUT_DIR"
-            error "Choose a new -o directory or use -c to resume the existing scan."
-            exit 1
-        elif [ -e "$OUTPUT_DIR" ] && [ ! -d "$OUTPUT_DIR" ]; then
-            error "Output path exists and is not a directory: $OUTPUT_DIR"
-            exit 1
         fi
+        _claim_output_root "$OUTPUT_DIR" false || exit 1
     fi
 
     local START_TIME
@@ -4497,7 +4750,7 @@ main() {
     fi
     success "Internet connectivity OK"
 
-    create_structure
+    create_structure || exit 1
     CHECKPOINT_FILE="$OUTPUT_DIR/.checkpoint"
     SCAN_META_FILE="$OUTPUT_DIR/.scan-meta"
 
@@ -4505,18 +4758,20 @@ main() {
     # incomplete checkpoint. Snapshot every output type before direct redirects
     # or tool -o flags can replace prior evidence.
     if [ -n "$RESUME_DIR" ]; then
-        snapshot_all_outputs
+        snapshot_all_outputs || exit 1
     fi
 
-    local meta_tmp="${SCAN_META_FILE}.tmp.$$"
-    if ! printf 'TARGET=%s\nSCAN_MODE=%s\nPOLICY_FINGERPRINT=%s\n' "$TARGET" "$SCAN_MODE" "$POLICY_FINGERPRINT" > "$meta_tmp" \
-       || ! mv -f "$meta_tmp" "$SCAN_META_FILE"; then
+    if [ -z "$RESUME_DIR" ] || [ "$MODE_CHANGED" = true ]; then
+        save_checkpoint 0 || exit 1
+    fi
+    if ! _atomic_state_write "$SCAN_META_FILE" << EOF
+TARGET=$TARGET
+SCAN_MODE=$SCAN_MODE
+POLICY_FINGERPRINT=$POLICY_FINGERPRINT
+EOF
+    then
         error "Could not bind output metadata to the authorization policy."
         exit 1
-    fi
-    if [ "$MODE_CHANGED" = true ]; then
-        printf '0\n' > "$CHECKPOINT_FILE"
-        RESUME_FROM=0
     fi
 
     local scan_failed=false
@@ -4526,20 +4781,21 @@ main() {
             warn "$label returned an error; later phases may continue, but checkpoint advancement is frozen."
             scan_failed=true
             CHECKPOINT_FROZEN=true
-            return 1
+            [ "$STATE_FAILED" = false ] || exit 1
+            return 0 # failure recorded; critical state failures exited above
         fi
         return 0
     }
 
-    _run_sequential_phase "Phase 1" phase1_subdomain_discovery || true
-    _run_sequential_phase "Phase 2" phase2_validation || true
-    _run_sequential_phase "Phase 2.5" phase2_5_cloud_enum || true
-    _run_sequential_phase "Phase 3" phase3_probing || true
-    _run_sequential_phase "Phase 4" phase4_portscan || true
-    _run_sequential_phase "Phase 5" phase5_url_discovery || true
-    _run_sequential_phase "Phase 6" phase6_parameters || true
-    _run_sequential_phase "Asset scoring" phase_asset_scoring || true
-    _run_sequential_phase "Phase 7" phase7_vulnerability_scanning || true
+    _run_sequential_phase "Phase 1" phase1_subdomain_discovery
+    _run_sequential_phase "Phase 2" phase2_validation
+    _run_sequential_phase "Phase 2.5" phase2_5_cloud_enum
+    _run_sequential_phase "Phase 3" phase3_probing
+    _run_sequential_phase "Phase 4" phase4_portscan
+    _run_sequential_phase "Phase 5" phase5_url_discovery
+    _run_sequential_phase "Phase 6" phase6_parameters
+    _run_sequential_phase "Asset scoring" phase_asset_scoring
+    _run_sequential_phase "Phase 7" phase7_vulnerability_scanning
     unset -f _run_sequential_phase
 
     local -a parallel_pids=() parallel_names=() watchdog_pids=()
@@ -4547,7 +4803,8 @@ main() {
         local name="$1" fn="$2" wall_timeout="$3" pid watchdog gate parent_pid
         gate="$OUTPUT_DIR/.parallel-start.${BASHPID}.${#parallel_pids[@]}"
         parent_pid="$BASHPID"
-        rm -f "$gate"
+        validate_output_path "$gate" file || return 1
+        _managed_remove "$gate" || return 1
 
         # The child cannot launch scanners until the parent has recorded its PID.
         # If the parent dies before opening the gate, the blocked child exits on
@@ -4558,14 +4815,14 @@ main() {
                 kill -0 "$parent_pid" 2>/dev/null || exit 143
                 sleep 0.05
             done
-            rm -f "$gate"
+            _managed_remove "$gate" || exit 1
             "$fn"
         ) &
         pid=$!
         parallel_pids+=("$pid")
         parallel_names+=("$name")
         _PARALLEL_PIDS+=("$pid")
-        : > "$gate"
+        _atomic_state_write "$gate" <<< start || return 1
 
         (
             sleep "$wall_timeout"
@@ -4579,10 +4836,10 @@ main() {
         _PARALLEL_PIDS+=("$watchdog")
     }
 
-    _launch_parallel_phase "Phase 8" phase8_javascript_analysis "$PHASE8_WALL_TIMEOUT"
-    _launch_parallel_phase "Phase 9" phase9_pattern_hunting "$PHASE9_WALL_TIMEOUT"
-    _launch_parallel_phase "Phase 10" phase10_screenshots "$PHASE10_WALL_TIMEOUT"
-    _launch_parallel_phase "Phase 11" phase11_fuzzing "$PHASE11_WALL_TIMEOUT"
+    _launch_parallel_phase "Phase 8" phase8_javascript_analysis "$PHASE8_WALL_TIMEOUT" || _nullsec_cleanup
+    _launch_parallel_phase "Phase 9" phase9_pattern_hunting "$PHASE9_WALL_TIMEOUT" || _nullsec_cleanup
+    _launch_parallel_phase "Phase 10" phase10_screenshots "$PHASE10_WALL_TIMEOUT" || _nullsec_cleanup
+    _launch_parallel_phase "Phase 11" phase11_fuzzing "$PHASE11_WALL_TIMEOUT" || _nullsec_cleanup
     unset -f _launch_parallel_phase
 
     local parallel_failed=false i exit_code
@@ -4604,13 +4861,18 @@ main() {
         _terminate_process_tree "$watchdog" 1
     done
     _PARALLEL_PIDS=()
-    rm -f "$OUTPUT_DIR"/.parallel-start.* 2>/dev/null || true
+    for gate in "$OUTPUT_DIR"/.parallel-start.*; do
+        _managed_remove "$gate" || exit 1
+    done
 
     if [ "$parallel_failed" = false ]; then
-        success "Phases 8–11 completed in parallel."
         if [ "$CHECKPOINT_FROZEN" = false ]; then
-            save_checkpoint 11
+            if ! save_checkpoint 11; then
+                scan_failed=true
+                CHECKPOINT_FROZEN=true
+            fi
         fi
+        [ "$scan_failed" = true ] || success "Phases 8–11 completed in parallel."
     else
         scan_failed=true
         CHECKPOINT_FROZEN=true
@@ -4629,14 +4891,14 @@ main() {
     # Archive resume snapshots that were not already finalized by individual
     # phases. Successful zero-result reruns remain zero-result; prior evidence is
     # retained only under prior-runs rather than leaking into the current report.
-    finalize_all_output_backups false
+    finalize_all_output_backups false || scan_failed=true
 
     local END_TIME ELAPSED_SECS elapsed_mins elapsed_secs
     END_TIME=$(date +%s)
     ELAPSED_SECS=$(( END_TIME - START_TIME ))
     elapsed_mins=$(( ELAPSED_SECS / 60 ))
     elapsed_secs=$(( ELAPSED_SECS % 60 ))
-    generate_report "$elapsed_mins" "$elapsed_secs"
+    generate_report "$elapsed_mins" "$elapsed_secs" || scan_failed=true
 
     local nc_subs nc_live nc_crit nc_high nc_buckets nc_secrets
     nc_subs=$(count_lines "$OUTPUT_DIR/phase1-subdomains/all-subdomains.txt")
@@ -4662,6 +4924,7 @@ main() {
     info "Report           : $OUTPUT_DIR/reports/recon-report.txt"
     info "Total Scan Time  : ${elapsed_mins}m ${elapsed_secs}s"
 
+    release_output_ownership
     [ "$scan_failed" = false ]
 }
 
