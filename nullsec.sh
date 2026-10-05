@@ -4616,7 +4616,8 @@ phase10_screenshots() {
     mkdir -p "$p10dir/403" "$p10dir/interesting" "$p10dir/admin" "$p10dir/all"
 
     _run_gowitness_batch() {
-        local label="$1" input="$2" output_dir="$3" targets="$output_dir/targets.txt"
+        local label="$1" input="$2" output_dir="$3"
+        local targets="$output_dir/targets.txt"
         [ -s "$input" ] || return 0
         head -"$MAX_SCREENSHOTS" "$input" | in_scope > "$targets"
         [ -s "$targets" ] || return 0
