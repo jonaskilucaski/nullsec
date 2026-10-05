@@ -4997,6 +4997,9 @@ _report_context() {
             case "$ACTION_STATUS" in failed) failed=true ;; partial) partial=true ;; esac
         done
     done
+    # Known persistence/preservation failures can strengthen, never erase,
+    # the failure outcome established by validated persisted state.
+    [ "$STATE_FAILED" = false ] || failed=true
     REPORT_OUTCOME=COMPLETE
     if [ "$failed" = true ]; then REPORT_OUTCOME='FAILED / INCOMPLETE'
     elif [ "$partial" = true ]; then REPORT_OUTCOME=PARTIAL
@@ -5240,10 +5243,12 @@ generate_report() {
         state_error "Report write or evidence validation failed."
         return 1
     fi
+    # Finish preservation before publication. On failure the previous report
+    # stays current and the new temporary report remains available for recovery.
+    merge_phase_backup "$OUTPUT_DIR/reports" || return 1
     validate_output_path "$report_destination" file \
         && mv -fT -- "$report_file" "$report_destination" \
         || { state_error "Report rename failed."; return 1; }
-    merge_phase_backup "$OUTPUT_DIR/reports" || return 1
     success "Report generated: $report_destination"
 }
 
