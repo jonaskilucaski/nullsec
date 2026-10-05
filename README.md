@@ -569,9 +569,18 @@ NullSec stores:
 ```text
 .checkpoint
 .scan-meta
+.run-state/
 ```
 
-The metadata binds the output directory to the target, scan mode, and normalized authorization fingerprint. Resume refuses target or authorization mismatches and missing authorization state. Changing the mode while resuming restarts at Phase 1 only when authorization still matches.
+Round 3 metadata uses canonical `FORMAT=3` records and binds the target, scan mode, normalized authorization fingerprint, and a random 256-bit generation identity. `.run-state/progress` repeats the generation identity and checkpoint. Each phase record repeats its generation and phase identity, records its execution state, and stores a SHA-256 digest of active output filenames and contents when completion can be committed. Historical `prior-runs/` trees and legacy `.bak` files are excluded from these digests and current aggregation.
+
+A new scan creates a new generation. `-c` continues an interrupted generation only after metadata, checkpoint, phase records, and the active evidence of committed phases all validate. A mode change or `-c` on a completed checkpoint `12` starts a new generation after the old generation validates; authorization must still match. There is no inference of completion from result files alone.
+
+Checkpoints contain exactly one canonical value followed by one newline: `0`, `1`, `2`, `3`, `4`, `5`, `6`, `7`, `11`, or `12`. No whitespace, additional lines, decimals, or repaired text is accepted. The only advances are `0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 11 → 12`. Phase 2.5 is proven by the Phase 3 commit; scoring is proven by the Phase 7 commit. Phases 8–11 have separate atomic records and commit checkpoint 11 only when every worker succeeds and all earlier prerequisites are proven. Phase 12 cannot commit without that group. Intentional policy/mode/tool skips are explicit states, not evidence of a tool having run.
+
+A missing checkpoint is treated as `0` only when canonical generation metadata, all phase records, and generation progress explicitly prove checkpoint `0`. Empty or corrupt checkpoints are refused. A completion record ahead of its checkpoint is allowed only in the next legal commit window and is conservatively rerun; it never advances progress on its own. A mismatch between the two progress files, an incomplete generation transition, changed committed evidence, duplicate/malformed records, or impossible completion requires a new output directory. Validation and output preparation occur before connectivity checks or target-capable work.
+
+**Legacy migration:** scan directories from earlier NullSec versions lack Round 3 generation integrity state and are refused, even if their authorization fingerprint or numeric checkpoint looks valid. Keep those directories for analyst reference and select a fresh output directory. NullSec does not upgrade legacy checkpoints by trusting old result files.
 
 New scans atomically reserve a fresh output directory. An existing directory, including an empty one, is refused; choose a new child path or use `-c` for an existing scan. A default name collision fails safely. Absolute paths, relative paths, spaces, and symlinked ancestors outside the output tree are supported after resolving the physical parent. Output names containing newlines or carriage returns are refused.
 
@@ -579,7 +588,7 @@ The physical root must belong to the current user and have private permissions (
 
 One process owns the output state through an exclusive nonblocking lock on `.nullsec.lock`, acquired before resume reads, snapshots, or state changes. The lock file remains in place after completion: do not delete or replace it. Ownership is released by closing the descriptor, including on handled termination. Children inherit the descriptor, so surviving children continue to prevent another run from taking ownership until they exit. There is no PID-based stale-lock takeover.
 
-Checkpoints, metadata, and reports use private temporary files and checked renames. A failed checkpoint write leaves the previous checkpoint and in-memory resume position intact. A mode-change reset is persisted before new metadata. Failed persistence prevents success announcements and produces a failing scan status.
+Checkpoints, metadata, and reports use private temporary files and checked renames. A failed checkpoint write leaves the previous checkpoint and in-memory resume position intact. Phase completion is persisted before progress advances. A generation-transition marker invalidates the old state before any mode-change reset; interruption during that transition fails closed. Failed persistence prevents final success announcements and produces a failing scan status.
 
 When interrupted with `Ctrl+C`, NullSec attempts to:
 
@@ -587,14 +596,18 @@ When interrupted with `Ctrl+C`, NullSec attempts to:
 - prevent orphaned background tools from continuing;
 - retain evidence from unfinished state writes;
 - preserve partial evidence;
-- restore missing outputs when appropriate; and
+- archive previous evidence without restoring it as current; and
 - print a resume command.
 
-When a resumed phase replaces an existing result, prior evidence is archived under a `prior-runs/` directory instead of being silently mixed into current findings.
+Current outputs belong to one validated generation. Before rerunning an uncommitted phase, NullSec copies and verifies its active files, commits them under that phase's `prior-runs/`, then removes individually validated active files. It keeps directories and historical subtrees, does not clear upstream inputs, and stops on preservation/reset failure. All unproven downstream outputs and the old report are prepared before execution, so a skipped phase, absent prerequisite/tool/pattern, or successful zero-result rerun cannot inherit old findings. Existing histories remain accessible outside current counts.
 
-Backups under `.phase-backups/` become active only after every copy succeeds and is compared with its source. Finalization checks archive copies and any interruption restoration before deleting the source backup. Failures retain the source and return an error; retrying completed finalization preserves archived evidence. Unfinished snapshots without `.active` are refused on retry and require manual review/recovery of the preserved files before their incomplete directory is removed. Failed temporary writes may also remain for inspection.
+Phase records distinguish `pending`, `running`, `complete`, `zero-result`, `skipped`, and `failed`. `zero-result` means successfully executed work left its designated result artifacts empty; logs and temporary/input files do not count as findings. An unsuccessful prerequisite skip has no completion digest and cannot authorize progress. Successfully executed work after an earlier failure is marked `partial` and is retried on resume. Completed phases in a genuine continuation retain their current evidence unchanged, including scoring. Phase 4's intentional addition of alternate-port hosts to Phase 3 is rebound before committing Phase 4; interruption before rebinding is conservatively refused.
 
-These checks protect cooperative NullSec runs and reject unsafe existing trees. Bash pathname checks and external tools' output paths cannot eliminate check-then-use races against a hostile process running as the same user, or privileged filesystem replacement. Keep the tree private, do not modify it during a scan, and treat scanner processes as trusted filesystem writers. Atomic renames provide process-level persistence; power-loss durability (`fsync`) is not guaranteed. The separate legacy recursive `.bak` traversal behavior is unchanged.
+GF actions also have generation-bound `.action-gf-*` records that distinguish unavailable tools/patterns from executed empty matches and errors. Reports show the generation, checkpoint, each phase's state, and available GF action states. Counts use active files only. A report with a checkpoint below 12 or failed/partial/running work is incomplete; skipped work must not be interpreted as a successful scan with no vulnerabilities. History is never added to current totals.
+
+Backups under `.phase-backups/` become active only after every copy succeeds and is compared with its source. Finalization checks archive copies before deleting the source backup; it never restores historical bytes into active paths. Failures retain the source and return an error; retrying completed finalization preserves archived evidence. Unfinished snapshots without `.active` are refused on retry and require manual review/recovery of the preserved files before their incomplete directory is removed. Failed temporary writes may also remain for inspection.
+
+These checks protect cooperative NullSec runs and reject unsafe existing trees. Bash pathname checks and external tools' output paths cannot eliminate check-then-use races against a hostile process running as the same user, or privileged filesystem replacement. Keep the tree private, do not modify it during a scan, and treat scanner processes as trusted filesystem writers. Atomic renames provide process-level persistence; power-loss durability (`fsync`) is not guaranteed. Legacy `.bak` finalization prunes `prior-runs/` and archives active legacy backups under unique paths without overwriting earlier history; other legacy recovery semantics remain deferred. Digests establish consistency under exclusive cooperative ownership, not authenticity against a malicious process running as the same user. Output digests include the physical directory path, so moving or copying a scan to another path requires a fresh output directory. Atomic renames do not constitute a multi-file transaction: a crash between progress writes is conservatively refused, and a new output directory is required.
 
 ## Output Structure
 
