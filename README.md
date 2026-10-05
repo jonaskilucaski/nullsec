@@ -428,11 +428,11 @@ phase4-portscan/services-on-ports.txt
 
 ### Phase 5 — URL discovery and crawling
 
-Combines Katana, Hakrawler, Cariddi, Waybackurls, GAU, cloud URLs, and alternate-port services. The corpus is scope-filtered, deduplicated, parameter-collapsed, and checked for liveness.
+Combines Katana, Hakrawler, Cariddi, Waybackurls, GAU, cloud URLs, and alternate-port services. The corpus is scope-filtered, deduplicated, and parameter-collapsed. URL and JavaScript seed corpora use HTTP liveness filtering when available, but can contain unprobed fallback URLs. The report does not claim that every URL in those corpora is live.
 
 NullSec keeps two important URL sets:
 
-- `all-urls.txt`: refined, live, in-scope, parameter-collapsed endpoints
+- `all-urls.txt`: refined, in-scope, parameter-collapsed endpoints; individual liveness is not guaranteed
 - `all-urls-injectable.txt`: full-value parameterized URLs used by injection-oriented phases
 
 The phase also categorizes API endpoints, JavaScript files, sensitive paths, interesting files, and gf matches.
@@ -617,7 +617,7 @@ Phase functions may call `_set_phase_outcome complete|zero-result|skipped|partia
 
 Execution outcome and checkpoint eligibility are separate. An earlier incomplete phase freezes progress without relabeling later successful outcomes as partial. Successful records made behind that barrier retain their digest and append `BLOCKED_AT=<committed checkpoint>` to the existing four-line, generation-bound format. Resume validates that marker against the committed checkpoint, an earlier incomplete phase, and the recorded evidence; it cannot authorize a checkpoint. Ordinary four-line records retain the existing next-commit-window rules. Only phases protected by the committed checkpoint are retained as current completion: partial work and later uncommitted successes are archived under `prior-runs/` and rerun. Committed evidence, including scoring, remains unchanged. Phase 4's intentional addition of alternate-port hosts to Phase 3 is rebound before committing Phase 4; interruption before rebinding is conservatively refused.
 
-Generic action records support `complete`, `zero-result`, `skipped`, `partial`, and `failed`, including existing generation-bound `.action-gf-*` records. Current records require canonical serialization, matching generation/phase/action identities, and a valid status; malformed or stale records are refused. Historical action records under `prior-runs/` are never current proof. Reports show the generation, checkpoint, each phase's state, and available GF action states. Counts use active files only. A report with a checkpoint below 12 or failed/partial/running work is incomplete; skipped work must not be interpreted as a successful scan with no vulnerabilities. History is never added to current totals.
+Generic action records support `complete`, `zero-result`, `skipped`, `partial`, and `failed`, including existing generation-bound `.action-gf-*` records. Current records require canonical serialization, matching generation/phase/action identities, and a valid status; malformed or stale records are refused. Historical action records under `prior-runs/` are never current proof. Reports show the persisted generation mode, generation ID, checkpoint, every phase outcome, checkpoint eligibility/barriers, and all existing current action records. The mode is a capability preset, not authorization. Enumeration, validation, and secret-verification authorization are reported from the loaded policy after its fingerprint matches generation metadata. Counts use active files only; history never enters current totals.
 
 Backups under `.phase-backups/` become active only after every copy succeeds and is compared with its source. Finalization checks archive copies before deleting the source backup; it never restores historical bytes into active paths. Failures retain the source and return an error; retrying completed finalization preserves archived evidence. Unfinished snapshots without `.active` are refused on retry and require manual review/recovery of the preserved files before their incomplete directory is removed. Failed temporary writes may also remain for inspection.
 
@@ -649,7 +649,13 @@ recon-example.com-YYYYMMDD-HHMMSS/
     └── recon-report.txt
 ```
 
-The final report summarizes discovery counts, live services, URL coverage, asset scores, Nuclei results, cloud checks, JavaScript secrets, pattern-hunting leads, fuzzing results, and active-confirmation output.
+The final report derives one overall outcome from validated persisted generation, checkpoint, phase, and existing action state. `COMPLETE` requires checkpoint `12`, validated completion proof for every required phase, and no partial or failed action record. Intentional skipped phases can satisfy checkpoint requirements but remain visibly skipped; completion does not mean every optional check ran. `PARTIAL` means declared partial phase/action coverage; `FAILED / INCOMPLETE` takes precedence when a phase/action failed. `INCOMPLETE` covers pending/running work, missing completion proof, or uncommitted progress. A mutable shell completion flag cannot override persisted state.
+
+Each phase keeps its canonical execution outcome separate from checkpoint eligibility: a later successful phase blocked by an earlier failure remains `complete` or `zero-result`, with its barrier shown separately. `skipped` means the operation was not performed; `zero-result` means successful execution selected no evidence. Missing evidence is shown as `not recorded`, and skipped/unfinished coverage never becomes a numeric zero-finding assertion. Partial/failed evidence counts are provisional. Malformed generation, phase, action, or checkpoint state, changed completion-bound evidence, and failed report writes/renames cause report generation to fail.
+
+Evidence summaries pair counts with phase state, relative evidence paths, and source descriptions. Current-generation discovery/refinement does not prove individual liveness; `phase8-javascript/live-js-endpoints.txt` is specifically HTTP-probe output. Phase 7 severity totals deduplicate the available current `all-findings.json` and `exposure-findings.json` exports using template, match location, matcher/extractor, protocol, and extracted-result identity. Missing exports are explicitly unavailable rather than zero findings; malformed exports or conflicting duplicate severities refuse the report. Existing text categories remain identified by scan source.
+
+Cloud sections reference existing S3, GCS, and Azure evidence, including permission classifications and CDN references, with evidence-qualified wording. These are reporting descriptions, not additional impact validation. Secret/token/key values and raw finding payloads stay in evidence files; the report supplies count/state/path references. Current direct Nuclei template identity records remain included. Reports and historical evidence remain sensitive and should be kept private.
 
 ## Configuration
 

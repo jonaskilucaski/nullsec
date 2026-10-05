@@ -4956,220 +4956,290 @@ phase12_active_vulns() {
 #                           REPORT GENERATION                                  #
 #==============================================================================#
 
-generate_report() {
-    local elapsed_mins="${1:-0}"
-    local elapsed_secs="${2:-0}"
+# Reporting reads existing state; it never changes execution or checkpoint rules.
+_report_context() {
+    local fingerprint id dir action_file action digest
+    local incomplete=false partial=false failed=false
+    [ "$POLICY_READY" = true ] || return 1
+    case "$ALLOW_ACTIVE_ENUM:$ALLOW_ACTIVE_VALIDATION:$ALLOW_SECRET_VERIFICATION" in
+        true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
+        *) return 1 ;;
+    esac
+    # The persisted metadata binds this loaded policy, including authorization.
+    # Recompute without reloading policy files or changing authorization gates.
+    fingerprint=$(printf 'POLICY_VERSION=1\nTARGET=%s\nENUM=%s\nVALIDATE=%s\nVERIFY=%s\nINCLUDE\n%s\nEXCLUDE\n%s\nCLOUD\n%s\n' \
+        "$TARGET" "$ALLOW_ACTIVE_ENUM" "$ALLOW_ACTIVE_VALIDATION" "$ALLOW_SECRET_VERIFICATION" \
+        "$INCLUDE_RULES" "$EXCLUDE_RULES" "$CLOUD_RULES" | sha256sum) || return 1
+    [ "${fingerprint%% *}" = "$POLICY_FINGERPRINT" ] || return 1
+    validate_generation_resume || return 1
+    [ "$RESUME_FROM" = 12 ] || incomplete=true
+    for id in "${PHASE_IDS[@]}"; do
+        _read_phase_state "$id" || return 1
+        case "$PHASE_STATUS" in
+            failed) failed=true ;; partial) partial=true ;;
+            pending|running) incomplete=true ;;
+            skipped) [ "$PHASE_DIGEST" != - ] || incomplete=true ;;
+        esac
+        [ "$PHASE_BLOCKED_AT" = - ] || incomplete=true
+        # Also bind successful evidence in the next, uncommitted window. The
+        # resume validator already checks committed and barrier-bound evidence.
+        if _phase_terminal && [ "$PHASE_BLOCKED_AT" = - ]; then
+            case "$TRUSTED_PHASES" in *" $id "*) ;;
+                *) digest=$(_phase_digest "$id") || return 1
+                   [ "$digest" = "$PHASE_DIGEST" ] || return 1 ;;
+            esac
+        fi
+        dir=$(_phase_dir "$id") || return 1
+        for action_file in "$dir"/.action-*; do
+            [ -e "$action_file" ] || continue
+            action="${action_file##*/}"; action="${action#.action-}"
+            _read_phase_action "$id" "$action" || return 1
+            case "$ACTION_STATUS" in failed) failed=true ;; partial) partial=true ;; esac
+        done
+    done
+    REPORT_OUTCOME=COMPLETE
+    if [ "$failed" = true ]; then REPORT_OUTCOME='FAILED / INCOMPLETE'
+    elif [ "$partial" = true ]; then REPORT_OUTCOME=PARTIAL
+    elif [ "$incomplete" = true ]; then REPORT_OUTCOME=INCOMPLETE
+    fi
+    REPORT_ENUM=disabled; REPORT_VALIDATION=disabled; REPORT_VERIFICATION=disabled
+    authorization_allowed enumeration && REPORT_ENUM=enabled
+    authorization_allowed validation && REPORT_VALIDATION=enabled
+    authorization_allowed verification && REPORT_VERIFICATION=enabled
+    return 0
+}
 
-    print_phase "📋 GENERATING FINAL REPORT"
+_report_evidence_row() {
+    local id="$1" label="$2" relative="$3" source="$4" file count
+    file="$OUTPUT_DIR/$relative"
+    validate_output_path "$file" file && _read_phase_state "$id" || return 1
+    case "$PHASE_STATUS" in
+        skipped) count='not performed' ;;
+        pending|running) count='not available (unfinished)' ;;
+        *) if [ -f "$file" ]; then
+               count=$(wc -l < "$file") || return 1
+           else count='not recorded'; fi ;;
+    esac
+    printf '  %s | count=%s | phase=%s state=%s | evidence=%s | source=%s\n' \
+        "$label" "$count" "$id" "$PHASE_STATUS" "$relative" "$source"
+}
 
-    validate_output_tree && validate_generation_resume || return 1
-    local report_destination="$OUTPUT_DIR/reports/recon-report.txt" report_file
-    validate_output_path "$report_destination" file || return 1
-    backup_phase_outputs "$OUTPUT_DIR/reports" || return 1
+_report_nuclei_severity() {
+    local relative file summary
+    local -a exports=()
+    _read_phase_state 7 || return 1
+    printf '\nPHASE 7 UNIFIED SEVERITY (deduplicated available current JSON exports):\n' || return 1
+    printf '  Phase 7 state: %s; scanner matches are evidence, not independent impact confirmation.\n' "$PHASE_STATUS" || return 1
+    case "$PHASE_STATUS" in
+        skipped) printf '  Not performed; no severity totals asserted.\n'; return $? ;;
+        pending|running) printf '  Unfinished; no severity totals asserted.\n'; return $? ;;
+    esac
+    for relative in phase7-vulns/all-findings.json phase7-vulns/exposure-findings.json; do
+        file="$OUTPUT_DIR/$relative"
+        validate_output_path "$file" file || return 1
+        if [ -s "$file" ]; then
+            exports+=("$file")
+            printf '  Evidence: %s (current JSON export)\n' "$relative" || return 1
+        else
+            printf '  Evidence: %s (no JSON export recorded; severity coverage unavailable for this source)\n' "$relative" || return 1
+        fi
+    done
+    if [ "${#exports[@]}" = 0 ]; then
+        printf '  Severity counts unavailable; inspect text evidence and phase state.\n'
+        return $?
+    fi
+    # Nuclei -je exports arrays. Identity includes the template, match location,
+    # matcher/extractor, protocol and extracted results, excluding volatile
+    # timestamp/request/response metadata. Conflicting duplicate severities fail
+    # closed rather than selecting an arbitrary severity. No evidence is rewritten.
+    summary=$(jq -ers '
+        def valid:
+            type == "array" and all(.[];
+                type == "object" and
+                (."template-id" | type == "string" and length > 0) and
+                ((."matched-at" // .host) | type == "string" and length > 0) and
+                (.info.severity | IN("critical","high","medium","low","info","unknown")));
+        if all(.[]; valid) then . else error("Invalid Nuclei report export") end |
+        add | group_by([."template-id", ."matcher-name", ."extractor-name",
+                        .type, (."matched-at" // .host), ."extracted-results"]) |
+        map(if (map(.info.severity) | unique | length) == 1 then .[0]
+            else error("Conflicting Nuclei severities") end) as $findings |
+        ["critical","high","medium","low","info","unknown"][] as $severity |
+        "  \($severity): \([$findings[] | select(.info.severity == $severity)] | length)"' \
+        "${exports[@]}") || { state_error "Cannot validate Phase 7 severity evidence."; return 1; }
+    printf '%s\n' "$summary" || return 1
+    printf '  Totals cover available exports only; absent exports are not zero-result proof.\n'
+}
 
-    report_file=$(mktemp -- "$OUTPUT_DIR/reports/.report.XXXXXXXX") || { state_error "Cannot create report temporary file."; return 1; }
-
-    cat > "$report_file" << EOF
+_render_report() {
+    local elapsed_mins="$1" elapsed_secs="$2" id eligibility dir action_file action
+    local label relative source template_record
+    cat <<EOF
 ================================================================================
                     BUG BOUNTY RECONNAISSANCE REPORT
                          Generated by NULLSEC
 ================================================================================
 
-TARGET         : $TARGET
-DATE           : $(date)
-OUTPUT DIR     : $OUTPUT_DIR
-SCAN DURATION  : ${elapsed_mins}m ${elapsed_secs}s
-GENERATION     : $GENERATION_ID
-CURRENT STATE  : checkpoint $RESUME_FROM (only 12 proves complete prerequisites)
-EVIDENCE       : current generation; failed/partial/running phases are incomplete
-HISTORY        : prior-runs/ is excluded from all current counts
+TARGET                    : $TARGET
+DATE                      : $(date)
+OUTPUT DIR                : $OUTPUT_DIR
+SCAN DURATION             : ${elapsed_mins}m ${elapsed_secs}s
+SCAN MODE                 : $GENERATION_MODE
+GENERATION                : $GENERATION_ID
+CURRENT CHECKPOINT        : $RESUME_FROM
+OVERALL OUTCOME           : $REPORT_OUTCOME
+ENUMERATION AUTHORIZATION : $REPORT_ENUM
+VALIDATION AUTHORIZATION  : $REPORT_VALIDATION
+SECRET VERIFICATION AUTHORIZATION: $REPORT_VERIFICATION
 
-================================================================================
-                           EXECUTIVE SUMMARY
-================================================================================
+Mode is a capability preset; it does not grant authorization.
+COMPLETE proves completion of the recorded generation, including intentional skips;
+it does not assert that every optional check ran or that the target is vulnerability-free.
+PARTIAL, FAILED / INCOMPLETE and INCOMPLETE mean coverage is incomplete.
+Current evidence only; prior-runs/ is historical and excluded from counts.
+Counts describe evidence records, not necessarily distinct vulnerabilities.
+Partial/failed evidence counts are provisional; absent files are not zero-result proof.
 
-SUBDOMAIN DISCOVERY:
-  Total Enumerated   : $(count_lines "$OUTPUT_DIR/phase1-subdomains/all-subdomains.txt")
-  Resolved / Valid   : $(count_lines "$OUTPUT_DIR/phase2-validation/valid-subdomains.txt")
-  Wildcards Filtered : $(count_lines "$OUTPUT_DIR/phase2-validation/wildcards.txt")
+STATE INTERPRETATION:
+  complete    : successful execution with selected current evidence
+  zero-result : operation performed successfully and selected no evidence
+  skipped     : operation not performed
+  partial     : useful current evidence with declared incomplete coverage
+  failed      : operation failed
+  pending / running : unfinished execution
 
-LIVE WEB SERVICES:
-  Live Hosts         : $(count_lines "$OUTPUT_DIR/phase3-probing/live-hosts.txt")
-  Status 200         : $(count_lines "$OUTPUT_DIR/phase3-probing/status-200.txt")
-  Status 403         : $(count_lines "$OUTPUT_DIR/phase3-probing/status-403.txt")
-  Status 401         : $(count_lines "$OUTPUT_DIR/phase3-probing/status-401.txt")
-  Status 500         : $(count_lines "$OUTPUT_DIR/phase3-probing/status-500.txt")
-  Hidden Vhost Candidates: $(count_lines "$OUTPUT_DIR/phase3-probing/discovered-vhosts.txt")
-
-PORT SCANNING:
-  Open Ports         : $(count_lines "$OUTPUT_DIR/phase4-portscan/open-ports.txt")
-  Web on Alt Ports   : $(count_lines "$OUTPUT_DIR/phase4-portscan/services-on-ports.txt")
-
-URL DISCOVERY:
-  Raw Merged URLs    : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls-raw.txt")
-  Refined URLs       : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls.txt")  [live, in-scope, param-collapsed]
-  Injectable URLs    : $(count_lines "$OUTPUT_DIR/phase5-urls/all-urls-injectable.txt")  [full param values — feeds SQLi/XSS/IDOR]
-  API Endpoints      : $(count_lines "$OUTPUT_DIR/phase5-urls/api-endpoints.txt")
-  Sensitive Endpoints: $(count_lines "$OUTPUT_DIR/phase5-urls/sensitive-endpoints.txt")
-  Live JS Files      : $(count_lines "$OUTPUT_DIR/phase5-urls/live-js-files.txt")
-
-ASSET SCORING:
-  Hosts Scored       : $(count_lines "$OUTPUT_DIR/asset-scoring/scored-targets.txt")
-  Top Targets (25%)  : $(count_lines "$OUTPUT_DIR/asset-scoring/top-targets.txt")
-
-NUCLEI FINDINGS:
-  Critical           : $(count_lines "$OUTPUT_DIR/phase7-vulns/critical-findings.txt")
-  High / Medium      : $(count_lines "$OUTPUT_DIR/phase7-vulns/high-medium-findings.txt")
-  CVEs               : $(count_lines "$OUTPUT_DIR/phase7-vulns/cve-findings.txt")
-  Exposures          : $(count_lines "$OUTPUT_DIR/phase7-vulns/exposure-findings.txt")
-  Subdomain Takeover : $(count_lines "$OUTPUT_DIR/phase2-validation/takeover-findings.txt")
-
-CLOUD STORAGE:
-  S3 Buckets Found       : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/s3/exists.txt")
-  S3 Readable            : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/s3/readable.txt")
-  S3 WRITABLE (CRITICAL) : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/s3/writable.txt")
-  GCS Buckets Found      : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/gcs/exists.txt")
-  GCS Readable           : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/gcs/readable.txt")
-  Unverified Names (NOTE): $(count_lines "$OUTPUT_DIR/phase2.5-cloud/exposed/unverified-candidates.txt")  [not probed without ownership evidence]
-  Azure Accounts Found   : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/azure/exists.txt")
-  Azure Readable         : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/azure/readable.txt")
-  Total Exposed          : $(count_lines "$OUTPUT_DIR/phase2.5-cloud/exposed/all-exposed-buckets.txt")
-
-JAVASCRIPT SECRETS:
-  TruffleHog Verified: $(count_lines "$OUTPUT_DIR/phase8-javascript/trufflehog-summary.txt")
-  AWS Access Keys    : $(count_lines "$OUTPUT_DIR/phase8-javascript/aws-access-keys.txt")
-  Google API Keys    : $(count_lines "$OUTPUT_DIR/phase8-javascript/google-api-keys.txt")
-  GitHub Tokens      : $(count_lines "$OUTPUT_DIR/phase8-javascript/github-tokens.txt")
-  Slack Tokens       : $(count_lines "$OUTPUT_DIR/phase8-javascript/slack-tokens.txt")
-  Stripe Keys        : $(count_lines "$OUTPUT_DIR/phase8-javascript/stripe-keys.txt")
-  Private Keys       : $(count_lines "$OUTPUT_DIR/phase8-javascript/private-keys.txt")
-
-PATTERN HUNTING:
-  SSRF Candidates    : $(count_lines "$OUTPUT_DIR/phase9-patterns/ssrf-candidates.txt")
-  Open Redirects     : $(count_lines "$OUTPUT_DIR/phase9-patterns/redirect-candidates.txt")
-  XSS Candidates     : $(count_lines "$OUTPUT_DIR/phase9-patterns/xss-candidates.txt")
-  XSS Confirmed      : $(count_lines "$OUTPUT_DIR/phase9-patterns/dalfox-xss-confirmed.txt")
-  SQLi Candidates    : $(count_lines "$OUTPUT_DIR/phase9-patterns/sqli-candidates.txt")
-  LFI Candidates     : $(count_lines "$OUTPUT_DIR/phase9-patterns/lfi-candidates.txt")
-  IDOR Candidates    : $(count_lines "$OUTPUT_DIR/phase9-patterns/idor-candidates.txt")
-  CORS Issues        : $(count_lines "$OUTPUT_DIR/phase9-patterns/cors-findings.txt")
-  Host Header Inject : $(count_lines "$OUTPUT_DIR/phase9-patterns/host-injection-findings.txt")
-
-DIRECTORY FUZZING:
-  Paths Discovered   : $(count_lines "$OUTPUT_DIR/phase11-fuzzing/dirs/all-found-paths.txt")
-  Backup/Config Files: $(count_lines "$OUTPUT_DIR/phase11-fuzzing/dirs/all-found-backups.txt")
-
-ACTIVE CONFIRMATION:
-  SSRF Confirmed     : $(count_lines "$OUTPUT_DIR/phase12-active-vulns/ssrf-confirmed.txt")
-  Redirects Confirmed: $(count_lines "$OUTPUT_DIR/phase12-active-vulns/redirect-confirmed.txt")
-  LFI Confirmed      : $(count_lines "$OUTPUT_DIR/phase12-active-vulns/lfi-confirmed.txt")
-  403 Bypasses       : $(count_lines "$OUTPUT_DIR/phase12-active-vulns/403-bypass-confirmed.txt")
-  GraphQL Issues     : $(count_lines "$OUTPUT_DIR/phase12-active-vulns/graphql-findings.txt")
-
-================================================================================
-                         CRITICAL / HIGH FINDINGS
-================================================================================
-
+GENERATION PHASE STATES (execution outcome and checkpoint eligibility):
 EOF
-    [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
-    local state_id
-    printf '\nGENERATION PHASE STATES:\n' >> "$report_file" || return 1
-    for state_id in "${PHASE_IDS[@]}"; do
-        _read_phase_state "$state_id" || return 1
-        printf '  Phase %-7s : %s\n' "$state_id" "$PHASE_STATUS" >> "$report_file" || return 1
-    done
-    local pattern action_file
-    for pattern in xss sqli ssrf redirect lfi idor; do
-        action_file="$OUTPUT_DIR/phase5-urls/.action-gf-$pattern"
-        [ -e "$action_file" ] || continue
-        _read_phase_action 5 "gf-$pattern" || return 1
-        printf '  gf-%-10s : %s\n' "$pattern" "$ACTION_STATUS" >> "$report_file" || return 1
-    done
-
-    for findings_file in \
-        "$OUTPUT_DIR/phase7-vulns/critical-findings.txt" \
-        "$OUTPUT_DIR/phase7-vulns/high-medium-findings.txt" \
-        "$OUTPUT_DIR/phase2-validation/takeover-findings.txt" \
-        "$OUTPUT_DIR/phase2.5-cloud/exposed/critical-writable.txt" \
-        "$OUTPUT_DIR/phase2.5-cloud/exposed/all-exposed-buckets.txt" \
-        "$OUTPUT_DIR/phase9-patterns/dalfox-xss-confirmed.txt" \
-        "$OUTPUT_DIR/phase9-patterns/cors-findings.txt" \
-        "$OUTPUT_DIR/phase3-probing/vhost-findings.txt" \
-        "$OUTPUT_DIR/phase11-fuzzing/dirs/all-found-backups.txt" \
-        "$OUTPUT_DIR/phase12-active-vulns/ssrf-confirmed.txt" \
-        "$OUTPUT_DIR/phase12-active-vulns/403-bypass-confirmed.txt" \
-        "$OUTPUT_DIR/phase12-active-vulns/graphql-findings.txt"; do
-        if [ -s "$findings_file" ]; then
-            echo "--- $(basename "$findings_file") ---" >> "$report_file" || { state_error "Report write failed."; return 1; }
-            cat "$findings_file" >> "$report_file" || { state_error "Report write failed."; return 1; }
-            echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
+    [ "$?" -eq 0 ] || return 1
+    for id in "${PHASE_IDS[@]}"; do
+        _read_phase_state "$id" || return 1
+        eligibility='ineligible (no completion proof)'
+        if _phase_terminal; then
+            eligibility='uncommitted (does not prove overall completion)'
+            case "$TRUSTED_PHASES" in *" $id "*) eligibility=committed ;; esac
         fi
+        [ "$PHASE_BLOCKED_AT" = - ] || eligibility="blocked at checkpoint $PHASE_BLOCKED_AT"
+        dir=$(_phase_dir "$id") || return 1
+        printf '  Phase %s | outcome=%s | checkpoint=%s | state=.run-state/%s | evidence=%s/\n' \
+            "$id" "$PHASE_STATUS" "$eligibility" "$id" "${dir#"$OUTPUT_DIR"/}" || return 1
     done
-
-    # ── Top scored targets ───────────────────────────────────────────────────
-    if [ -s "$OUTPUT_DIR/asset-scoring/scored-targets.txt" ]; then
-        cat >> "$report_file" << EOF
-
-================================================================================
-                        TOP SCORED TARGETS (by attack potential)
-================================================================================
-
-EOF
-        [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
-        head -25 "$OUTPUT_DIR/asset-scoring/scored-targets.txt" >> "$report_file" || { state_error "Report write failed."; return 1; }
-        echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
-    fi
-
-    # Only direct current-phase identity records are included, never prior-runs.
-    local template_record
-    printf '\nNUCLEI TEMPLATE IDENTITIES (local pre-scan inventory; version may be unknown):\n' \
-        >> "$report_file" || { state_error "Report write failed."; return 1; }
+    printf '\nCURRENT ACTION STATES (existing records only; absence means coverage unrecorded):\n' || return 1
+    for id in "${PHASE_IDS[@]}"; do
+        dir=$(_phase_dir "$id") || return 1
+        for action_file in "$dir"/.action-*; do
+            [ -e "$action_file" ] || continue
+            action="${action_file##*/}"; action="${action#.action-}"
+            _read_phase_action "$id" "$action" || return 1
+            printf '  Phase %s action=%s | outcome=%s | state=%s\n' \
+                "$id" "$action" "$ACTION_STATUS" "${action_file#"$OUTPUT_DIR"/}" || return 1
+        done
+    done
+    _report_nuclei_severity || return 1
+    printf '\nCURRENT EVIDENCE SUMMARY (paths relative to OUTPUT DIR):\n' || return 1
+    while IFS='|' read -r id label relative source; do
+        _report_evidence_row "$id" "$label" "$relative" "$source" || return 1
+    done <<'EVIDENCE'
+1|Total Enumerated|phase1-subdomains/all-subdomains.txt|current-generation phase output
+2|Resolved / Valid|phase2-validation/valid-subdomains.txt|current-generation phase output
+2|Wildcards Filtered|phase2-validation/wildcards.txt|current-generation phase output
+2|Potential subdomain takeover|phase2-validation/takeover-findings.txt|Nuclei takeover-template matches
+2.5|S3 existence evidence|phase2.5-cloud/s3/exists.txt|observed cloud evidence; impact not independently established
+2.5|S3 Readable|phase2.5-cloud/s3/readable.txt|observed cloud evidence; impact not independently established
+2.5|S3 potential permission evidence|phase2.5-cloud/s3/writable.txt|observed cloud evidence; impact not independently established
+2.5|GCS existence evidence|phase2.5-cloud/gcs/exists.txt|observed cloud evidence; impact not independently established
+2.5|GCS Readable|phase2.5-cloud/gcs/readable.txt|observed cloud evidence; impact not independently established
+2.5|Azure existence evidence|phase2.5-cloud/azure/exists.txt|observed cloud evidence; impact not independently established
+2.5|Azure Readable|phase2.5-cloud/azure/readable.txt|observed cloud evidence; impact not independently established
+2.5|Combined storage exposure evidence|phase2.5-cloud/exposed/all-exposed-buckets.txt|observed cloud evidence; impact not independently established
+2.5|GCS potential permission evidence|phase2.5-cloud/gcs/writable.txt|observed IAM evidence; impact not independently established
+2.5|GCS unverified evidence|phase2.5-cloud/gcs/unverified.txt|provider reference evidence
+2.5|Azure CDN references|phase2.5-cloud/azure/cdn-references.txt|discovery references; not storage exposure proof
+2.5|Cloud enumeration output|phase2.5-cloud/exposed/cloud_enum-open.txt|existing enumeration evidence; phase/action state governs coverage
+2.5|Combined potential cloud permission evidence|phase2.5-cloud/exposed/critical-writable.txt|existing S3/GCS policy/ACL classification; no new impact assertion
+2.5|Unverified Names (NOTE)|phase2.5-cloud/exposed/unverified-candidates.txt|name candidates; not proof of ownership or probing
+2.5|Cloud reference evidence lines|phase2.5-cloud/ownership-evidence.txt|DNS/web reference leads; references do not prove ownership or permission
+2.5|Provider reference names|phase2.5-cloud/ownership-corroborated-names.txt|names extracted from references before approval filtering; not ownership proof
+2.5|Approved referenced S3 probe seeds|phase2.5-cloud/.verified-s3.txt|exact-approved provider references; not verified exposure
+2.5|Approved referenced GCS probe seeds|phase2.5-cloud/.verified-gcs.txt|exact-approved provider references; not verified exposure
+2.5|Approved referenced Azure probe seeds|phase2.5-cloud/.verified-azure.txt|exact-approved provider references; not verified exposure
+3|Live Hosts|phase3-probing/live-hosts.txt|HTTP-probe output and status categorization
+3|Status 200|phase3-probing/status-200.txt|HTTP-probe output and status categorization
+3|Status 403|phase3-probing/status-403.txt|HTTP-probe output and status categorization
+3|Status 401|phase3-probing/status-401.txt|HTTP-probe output and status categorization
+3|Status 500|phase3-probing/status-500.txt|HTTP-probe output and status categorization
+3|Hidden Vhost Candidates|phase3-probing/discovered-vhosts.txt|current-generation phase output
+3|Vhost finding evidence|phase3-probing/vhost-findings.txt|existing virtual-host discovery output
+4|Open Ports|phase4-portscan/open-ports.txt|current-generation phase output
+4|Web on Alt Ports|phase4-portscan/services-on-ports.txt|current-generation phase output
+5|Raw Merged URLs|phase5-urls/all-urls-raw.txt|merged discovery output; scope/liveness not asserted
+5|Refined URLs (parameter-collapsed)|phase5-urls/all-urls.txt|in-scope discovery/refinement; individual liveness not guaranteed
+5|Injectable URLs|phase5-urls/all-urls-injectable.txt|in-scope discovery/refinement; individual liveness not guaranteed
+5|API Endpoints|phase5-urls/api-endpoints.txt|in-scope discovery/refinement; individual liveness not guaranteed
+5|JS seed corpus (may contain unprobed fallback URLs)|phase5-urls/live-js-files.txt|in-scope discovery/refinement; individual liveness not guaranteed
+5|Sensitive Endpoints|phase5-urls/sensitive-endpoints.txt|in-scope discovery/refinement; individual liveness not guaranteed
+6|Extracted parameter names|phase6-parameters/parameters.txt|Unfurl extraction from current URL corpus
+6|Arjun parameter evidence|phase6-parameters/arjun-all-params.txt|existing parameter-discovery output; action coverage not separately recorded
+scoring|Hosts Scored|asset-scoring/scored-targets.txt|current-generation phase output
+scoring|Top Targets (25%)|asset-scoring/top-targets.txt|current-generation phase output
+7|Primary category: Critical|phase7-vulns/critical-findings.txt|primary scan category; overall severity uses both JSON exports
+7|Primary category: High / Medium|phase7-vulns/high-medium-findings.txt|primary scan category; overall severity uses both JSON exports
+7|CVEs|phase7-vulns/cve-findings.txt|primary scan category; overall severity uses both JSON exports
+7|Exposures|phase7-vulns/exposure-findings.txt|exposure/config/misconfig scan text output
+7|Primary scan text evidence|phase7-vulns/all-findings.txt|scanner text matches; not independent impact confirmation
+8|AWS Access Keys|phase8-javascript/aws-access-keys.txt|regex-only candidate matches; not verified
+8|Google API Keys|phase8-javascript/google-api-keys.txt|regex-only candidate matches; not verified
+8|GitHub Tokens|phase8-javascript/github-tokens.txt|regex-only candidate matches; not verified
+8|Slack Tokens|phase8-javascript/slack-tokens.txt|regex-only candidate matches; not verified
+8|Stripe Keys|phase8-javascript/stripe-keys.txt|regex-only candidate matches; not verified
+8|Private Keys|phase8-javascript/private-keys.txt|regex-only candidate matches; not verified
+8|JS-derived endpoint candidates|phase8-javascript/js-endpoints.txt|in-scope extracted/constructed endpoints; not individually live-probed
+8|Liveness-filtered JS-derived endpoints|phase8-javascript/live-js-endpoints.txt|HTTP-probe output; partial/failed phase limits coverage
+8|TruffleHog raw evidence records|phase8-javascript/trufflehog-secrets.json|verified-only verifier output; credentials remain in evidence file
+8|TruffleHog Verified|phase8-javascript/trufflehog-summary.txt|TruffleHog verified-only summary; verifier coverage not separately recorded
+9|SSRF Candidates|phase9-patterns/ssrf-candidates.txt|current-generation phase output
+9|Open Redirects|phase9-patterns/redirect-candidates.txt|current-generation phase output
+9|XSS Candidates|phase9-patterns/xss-candidates.txt|current-generation phase output
+9|Dalfox-reported XSS evidence|phase9-patterns/dalfox-xss-confirmed.txt|Dalfox output; not independent impact confirmation
+9|SQLi Candidates|phase9-patterns/sqli-candidates.txt|current-generation phase output
+9|LFI Candidates|phase9-patterns/lfi-candidates.txt|current-generation phase output
+9|IDOR Candidates|phase9-patterns/idor-candidates.txt|current-generation phase output
+9|CORS Issues|phase9-patterns/cors-findings.txt|current-generation phase output
+9|Host Header Inject|phase9-patterns/host-injection-findings.txt|current-generation phase output
+11|Paths Discovered|phase11-fuzzing/dirs/all-found-paths.txt|current-generation phase output
+11|Backup/Config Files|phase11-fuzzing/dirs/all-found-backups.txt|current-generation phase output
+12|Nuclei-reported SSRF confirmation evidence|phase12-active-vulns/ssrf-confirmed.txt|Nuclei confirmation-template matches; not independent impact confirmation
+12|Nuclei-reported LFI confirmation evidence|phase12-active-vulns/lfi-confirmed.txt|Nuclei confirmation-template matches; not independent impact confirmation
+12|Nuclei-reported 403 bypass evidence|phase12-active-vulns/403-bypass-confirmed.txt|Nuclei confirmation-template matches; not independent impact confirmation
+12|Nuclei-reported GraphQL evidence|phase12-active-vulns/graphql-findings.txt|Nuclei confirmation-template matches; not independent impact confirmation
+12|Nuclei-reported redirect confirmation evidence|phase12-active-vulns/redirect-confirmed.txt|Nuclei confirmation-template matches; not independent impact confirmation
+EVIDENCE
+    # Identity records contain local inventory metadata, not credential evidence.
+    # Preserve current direct records; never read identities beneath prior-runs.
+    printf '\nNUCLEI TEMPLATE IDENTITIES (local pre-scan inventory; version may be unknown):\n' || return 1
     for template_record in "$OUTPUT_DIR/phase2-validation/"*.templates.txt \
         "$OUTPUT_DIR/phase7-vulns/"*.templates.txt "$OUTPUT_DIR/phase12-active-vulns/"*.templates.txt; do
         [ -f "$template_record" ] || continue
-        printf '\n--- %s ---\n' "${template_record#"$OUTPUT_DIR"/}" >> "$report_file" \
-            && cat -- "$template_record" >> "$report_file" \
-            || { state_error "Template identity report write failed."; return 1; }
+        validate_output_path "$template_record" file || return 1
+        printf '\n--- %s ---\n' "${template_record#"$OUTPUT_DIR"/}" \
+            && cat -- "$template_record" || return 1
     done
+    printf '\nSensitive evidence is referenced by count/state/path above; raw credentials and\nfinding payloads are retained in evidence files and are not embedded here.\n\nReport generated by NullSec Framework v%s\nCreated by %s\n' "$VERSION" "$AUTHOR"
+}
 
-    cat >> "$report_file" << EOF
-
-================================================================================
-                         SECRETS FOUND IN JAVASCRIPT
-================================================================================
-
-EOF
-    [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
-
-    for secret_file in \
-        "$OUTPUT_DIR/phase8-javascript/trufflehog-summary.txt" \
-        "$OUTPUT_DIR/phase8-javascript/aws-access-keys.txt" \
-        "$OUTPUT_DIR/phase8-javascript/google-api-keys.txt" \
-        "$OUTPUT_DIR/phase8-javascript/github-tokens.txt" \
-        "$OUTPUT_DIR/phase8-javascript/slack-tokens.txt" \
-        "$OUTPUT_DIR/phase8-javascript/stripe-keys.txt" \
-        "$OUTPUT_DIR/phase8-javascript/private-keys.txt"; do
-        if [ -s "$secret_file" ]; then
-            echo "--- $(basename "$secret_file") ---" >> "$report_file" || { state_error "Report write failed."; return 1; }
-            cat "$secret_file" >> "$report_file" || { state_error "Report write failed."; return 1; }
-            echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
-        fi
-    done
-
-    cat >> "$report_file" << EOF
-
-================================================================================
-                              END OF REPORT
-================================================================================
-
-Report generated by NullSec Framework v${VERSION}
-Created by ${AUTHOR}
-Happy Hunting! 🐛
-
-================================================================================
-EOF
-    [ "$?" -eq 0 ] || { state_error "Report write failed."; return 1; }
-
+generate_report() {
+    local elapsed_mins="${1:-0}" elapsed_secs="${2:-0}"
+    local REPORT_OUTCOME REPORT_ENUM REPORT_VALIDATION REPORT_VERIFICATION
+    print_phase "📋 GENERATING FINAL REPORT"
+    validate_output_tree && _report_context \
+        || { state_error "Report refused: current generation/state/context is unvalidated."; return 1; }
+    local report_destination="$OUTPUT_DIR/reports/recon-report.txt" report_file
+    validate_output_path "$report_destination" file || return 1
+    backup_phase_outputs "$OUTPUT_DIR/reports" || return 1
+    report_file=$(mktemp -- "$OUTPUT_DIR/reports/.report.XXXXXXXX") || { state_error "Cannot create report temporary file."; return 1; }
+    if ! _render_report "$elapsed_mins" "$elapsed_secs" > "$report_file"; then
+        state_error "Report write or evidence validation failed."
+        return 1
+    fi
     validate_output_path "$report_destination" file \
         && mv -fT -- "$report_file" "$report_destination" \
         || { state_error "Report rename failed."; return 1; }
