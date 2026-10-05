@@ -500,22 +500,51 @@ update_nuclei_templates() {
     success "Nuclei templates updated."
 }
 
-# Read local template bytes only. A content digest is not a release version.
-# Symlinks or unreadable files make this conservative inventory unknown.
+# Inventory recognized YAML template descriptors, not arbitrary installation files.
+# Unknown/ambiguous sources never produce a guessed corpus or release version.
 nuclei_template_identity() (
-    local selected="$1" digest=unknown links candidate
+    local selected="$1" digest=unknown candidate
     if [ -d "$NUCLEI_TEMPLATES" ]; then
         candidate=$(
-            cd -- "$NUCLEI_TEMPLATES" || exit 1
-            links=$(find . -type d -name .git -prune -o -type l -print) || exit 1
-            [ -z "$links" ] || exit 1
-            find . -type d -name .git -prune -o -type f -print0 \
+            local root file count=0
+            cd -P -- "$NUCLEI_TEMPLATES" || exit 1
+            root=$(pwd -P && printf '.') || exit 1
+            root="${root%.}"; root="${root%$'\n'}"
+            local -a prune=(-name .git -o -name prior-runs -o -name reports
+                -o -name .run-state -o -name .phase-backups -o -name logs
+                -o -name tmp -o -name temp -o -name cache -o -name caches
+                -o -name .cache -o -name .tmp
+                # Also exclude earlier managed output trees, not just this run.
+                -o -exec test -e '{}/.nullsec.lock' ';'
+                -o -exec test -e '{}/.scan-meta' ';')
+            if [ -n "$OUTPUT_DIR" ]; then
+                # Round 2 ownership validates the physical root and lock identity.
+                # Comparisons use slash boundaries; -samefile avoids globbing paths.
+                _output_owned || exit 1
+                case "$root" in "$OUTPUT_ROOT"|"$OUTPUT_ROOT"/*) exit 1 ;; esac
+                case "$OUTPUT_ROOT" in "${root%/}/"*) prune+=(-o -samefile "$OUTPUT_ROOT") ;; esac
+            fi
+            # GNU find's default traversal never follows directory symlinks.
+            # Source symlinks are detected below, never read through.
+            find . -type d \( "${prune[@]}" \) -prune -o \
+                \( -type l -o \( -type f \( -name '*.yaml' -o -name '*.yml' \) \) \) -print0 \
                 | LC_ALL=C sort -z \
-                | while IFS= read -r -d '' file; do sha256sum -- "$file" || exit 1; done \
+                | {
+                    while IFS= read -r -d '' file; do
+                        [ ! -L "$file" ] || exit 1
+                        # Both top-level descriptor keys are required. Other YAML
+                        # is ambiguous without a YAML parser, so fail to unknown.
+                        grep -Eq '^id:[[:blank:]]*[^[:blank:]#]' "$file" \
+                            && grep -Eq '^info:[[:blank:]]*(#.*)?$' "$file" || exit 1
+                        sha256sum -- "$file" || exit 1
+                        count=$((count + 1))
+                    done
+                    [ "$count" -gt 0 ] || exit 1
+                } \
                 | sha256sum
         ) && digest="${candidate%% *}"
     fi
-    printf 'VERSION=unknown\nROOT=%s\nSELECTED=%s\nCONTENT_SHA256=%s\nSEVERITY=%s\n' \
+    printf 'VERSION=unknown\nCORPUS=nuclei-yaml-v1\nROOT=%s\nSELECTED=%s\nCONTENT_SHA256=%s\nSEVERITY=%s\n' \
         "$NUCLEI_TEMPLATES" "$selected" "$digest" "$NUCLEI_SEVERITY"
 )
 
