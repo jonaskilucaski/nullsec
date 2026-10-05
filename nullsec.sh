@@ -3932,6 +3932,26 @@ phase7_vulnerability_scanning() {
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 8: JavaScript Analysis & Secret Extraction
 # ─────────────────────────────────────────────────────────────────────────────
+_isolate_js_verification_history() {
+    local p8dir="$OUTPUT_DIR/phase8-javascript" listing history archive destination
+    validate_output_tree && validate_output_path "$p8dir/js-files" dir || return 1
+    listing=$(mktemp -- "$p8dir/.js-history.XXXXXXXX") \
+        || { state_error "Cannot prepare JavaScript history isolation."; return 1; }
+    validate_output_path "$listing" file || return 1
+    find "$p8dir/js-files" -type d -name prior-runs -prune -print0 > "$listing" \
+        || { state_error "Cannot enumerate JavaScript history."; return 1; }
+    while IFS= read -r -d '' history; do
+        validate_output_path "$history" dir && _managed_mkdir "$p8dir/prior-runs" || return 1
+        archive=$(mktemp -d -- "$p8dir/prior-runs/js-history.XXXXXXXX") \
+            || { state_error "Cannot reserve JavaScript history archive."; return 1; }
+        destination="$archive/prior-runs"
+        validate_output_path "$archive" dir && validate_output_path "$destination" dir \
+            && mv -T -- "$history" "$destination" \
+            || { state_error "JavaScript history isolation failed; verification refused."; return 1; }
+    done < "$listing"
+    _managed_remove "$listing" && validate_output_tree
+}
+
 phase8_javascript_analysis() {
     validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase8_javascript_analysis: skipped by authorization policy"; _skip_phase; return 0; }
@@ -4000,6 +4020,9 @@ phase8_javascript_analysis() {
         return 1
     fi
 
+    # Recursive consumers must never receive preserved history. Generation
+    # preparation clears old active files; relocate its retained history too.
+    _isolate_js_verification_history || return 1
     cat "$p8dir/js-files/"*.js > "$p8dir/all-js-content.txt" 2>/dev/null
 
     : > "$p8dir/trufflehog-secrets.json"
