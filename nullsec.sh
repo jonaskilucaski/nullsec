@@ -529,13 +529,74 @@ nuclei_template_identity() (
             find . -type d \( "${prune[@]}" \) -prune -o \
                 \( -type l -o \( -type f \( -name '*.yaml' -o -name '*.yml' \) \) \) -print0 \
                 | LC_ALL=C sort -z \
+                | python3 -I -B -c '
+# Optional installed PyYAML: isolated imports, read-only node composition,
+# no YAML object construction. Unavailable/error/inconclusive => unknown.
+import os, stat, sys
+import yaml
+
+class DescriptorLoader(yaml.SafeLoader):
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("Aliases are unverifiable")
+        return super().compose_node(parent, index)
+
+def validate(root):
+    if not isinstance(root, yaml.nodes.MappingNode):
+        raise ValueError("Descriptor must be a mapping")
+    pending = [root]
+    scalar_tags = {"tag:yaml.org,2002:" + tag for tag in
+                   ("str", "null", "bool", "int", "float", "timestamp")}
+    while pending:
+        node = pending.pop()
+        if isinstance(node, yaml.nodes.MappingNode):
+            if node.tag != "tag:yaml.org,2002:map":
+                raise ValueError("Unsupported mapping tag")
+            keys = set()
+            for key, value in node.value:
+                # String keys avoid implicit-type/merge/complex-key ambiguity.
+                if not isinstance(key, yaml.nodes.ScalarNode) or key.tag != "tag:yaml.org,2002:str":
+                    raise ValueError("Unverifiable mapping key")
+                if key.value in keys:
+                    raise ValueError("Duplicate mapping key")
+                keys.add(key.value)
+                pending.append(value)
+        elif isinstance(node, yaml.nodes.SequenceNode):
+            if node.tag != "tag:yaml.org,2002:seq":
+                raise ValueError("Unsupported sequence tag")
+            pending.extend(node.value)
+        elif not isinstance(node, yaml.nodes.ScalarNode) or node.tag not in scalar_tags:
+            raise ValueError("Unsupported scalar tag")
+    fields = {key.value: value for key, value in root.value}
+    identifier = fields.get("id")
+    info = fields.get("info")
+    if (not isinstance(identifier, yaml.nodes.ScalarNode)
+            or identifier.tag != "tag:yaml.org,2002:str" or not identifier.value.strip()
+            or not isinstance(info, yaml.nodes.MappingNode) or not info.value):
+        raise ValueError("Unrecognizable descriptor identity")
+
+try:
+    for filename in sys.stdin.buffer.read().split(b"\0"):
+        if not filename:
+            continue
+        # Do not consume symlinks, including a replacement before open.
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("Not a regular descriptor")
+            loader = DescriptorLoader(stream)
+            try:
+                root = loader.get_single_node()
+            finally:
+                loader.dispose()
+            validate(root)
+        sys.stdout.buffer.write(filename + b"\0")
+except Exception:
+    sys.exit(1)
+' 2>/dev/null \
                 | {
                     while IFS= read -r -d '' file; do
                         [ ! -L "$file" ] || exit 1
-                        # Both top-level descriptor keys are required. Other YAML
-                        # is ambiguous without a YAML parser, so fail to unknown.
-                        grep -Eq '^id:[[:blank:]]*[^[:blank:]#]' "$file" \
-                            && grep -Eq '^info:[[:blank:]]*(#.*)?$' "$file" || exit 1
                         sha256sum -- "$file" || exit 1
                         count=$((count + 1))
                     done
