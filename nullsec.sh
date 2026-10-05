@@ -1284,13 +1284,28 @@ _phase_digest() (
 )
 
 _write_phase_state() {
-    local id="$1" status="$2" digest="$3"
-    _atomic_state_write "$OUTPUT_DIR/.run-state/$id" <<EOF
-GENERATION=$GENERATION_ID
-PHASE=$id
-STATUS=$status
-DIGEST=$digest
-EOF
+    local id="$1" status="$2" digest="$3" blocked_at="${4:--}" text
+    _phase_dir "$id" >/dev/null || return 1
+    [[ "$GENERATION_ID" =~ ^[0-9a-f]{64}$ ]] || return 1
+    _valid_phase_state "$status" "$digest" "$blocked_at" || return 1
+    printf -v text 'GENERATION=%s\nPHASE=%s\nSTATUS=%s\nDIGEST=%s' \
+        "$GENERATION_ID" "$id" "$status" "$digest"
+    [ "$blocked_at" = - ] || text+=$'\n'"BLOCKED_AT=$blocked_at"
+    _atomic_state_write "$OUTPUT_DIR/.run-state/$id" <<< "$text"
+}
+
+_valid_phase_state() {
+    local status="$1" digest="$2" blocked_at="$3"
+    case "$status" in pending|running|failed|partial) [ "$digest" = - ] || return 1 ;;
+        skipped) [ "$digest" = - ] || [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1 ;;
+        complete|zero-result) [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1 ;;
+        *) return 1 ;; esac
+    if [ "$blocked_at" != - ]; then
+        # Only successful but uncommitted outcomes carry checkpoint metadata.
+        case "$status" in complete|zero-result|skipped) [ "$digest" != - ] || return 1 ;; *) return 1 ;; esac
+        _checkpoint_phases "$blocked_at" >/dev/null || return 1
+        [ "$blocked_at" != 12 ] || return 1
+    fi
 }
 
 _read_phase_state() {
@@ -1298,14 +1313,17 @@ _read_phase_state() {
     local -a lines=()
     validate_output_path "$file" file && [ -f "$file" ] || return 1
     mapfile -t lines < "$file" || return 1
-    [ "${#lines[@]}" = 4 ] || return 1
+    [ "${#lines[@]}" = 4 ] || [ "${#lines[@]}" = 5 ] || return 1
     PHASE_STATUS="${lines[2]#STATUS=}"; PHASE_DIGEST="${lines[3]#DIGEST=}"
-    case "$PHASE_STATUS" in pending|running|failed|partial) [ "$PHASE_DIGEST" = - ] || return 1 ;;
-        skipped) [ "$PHASE_DIGEST" = - ] || [[ "$PHASE_DIGEST" =~ ^[0-9a-f]{64}$ ]] || return 1 ;;
-        complete|zero-result) [[ "$PHASE_DIGEST" =~ ^[0-9a-f]{64}$ ]] || return 1 ;;
-        *) return 1 ;; esac
+    PHASE_BLOCKED_AT=-
+    if [ "${#lines[@]}" = 5 ]; then
+        PHASE_BLOCKED_AT="${lines[4]#BLOCKED_AT=}"
+        [ "$PHASE_BLOCKED_AT" != - ] || return 1
+    fi
+    _valid_phase_state "$PHASE_STATUS" "$PHASE_DIGEST" "$PHASE_BLOCKED_AT" || return 1
     printf -v text 'GENERATION=%s\nPHASE=%s\nSTATUS=%s\nDIGEST=%s' \
         "$GENERATION_ID" "$id" "$PHASE_STATUS" "$PHASE_DIGEST"
+    [ "$PHASE_BLOCKED_AT" = - ] || text+=$'\n'"BLOCKED_AT=$PHASE_BLOCKED_AT"
     _state_equals "$file" "$text"
 }
 
@@ -1322,6 +1340,7 @@ save_checkpoint() {
     required=$(_checkpoint_phases "$next") || return 1
     for id in $required; do
         _read_phase_state "$id" && _phase_terminal || { state_error "Missing completion proof for phase $id"; return 1; }
+        [ "$PHASE_BLOCKED_AT" = - ] || { state_error "Phase $id was blocked from checkpoint eligibility."; return 1; }
         digest=$(_phase_digest "$id") || return 1
         [ "$digest" = "$PHASE_DIGEST" ] || { state_error "Phase $id evidence changed before commit."; return 1; }
     done
@@ -1339,7 +1358,7 @@ phase_done() {
 }
 
 validate_generation_resume() {
-    local file="$OUTPUT_DIR/.scan-meta" text id required allowed digest checkpoint
+    local file="$OUTPUT_DIR/.scan-meta" text id required allowed digest checkpoint blocked_by="" dir action_file action
     local -a lines=()
     validate_output_tree || return 1
     [ ! -e "$OUTPUT_DIR/.run-state/transition" ] || { state_error "Interrupted generation transition; use a new output directory and retain this evidence."; return 1; }
@@ -1361,8 +1380,9 @@ validate_generation_resume() {
     _state_equals "$OUTPUT_DIR/.run-state/progress" "$text" \
         || { state_error "Checkpoint/generation progress mismatch; use a new output directory."; return 1; }
     required=$(_checkpoint_phases "$checkpoint") || return 1
-    # Terminal state can be ahead only in the next legal commit window. Such
-    # work is rerun, never used to reconstruct or advance the checkpoint.
+    # Ordinary terminal state can be ahead only in the next legal commit window.
+    # Explicitly blocked outcomes additionally require an earlier incomplete
+    # phase and the same committed checkpoint. Neither kind is trusted on resume.
     case "$checkpoint" in
         0) allowed='1' ;; 1) allowed='2' ;; 2) allowed='2.5 3' ;; 3) allowed='4' ;;
         4) allowed='5' ;; 5) allowed='6' ;; 6) allowed='scoring 7' ;;
@@ -1370,17 +1390,33 @@ validate_generation_resume() {
     esac
     for id in "${PHASE_IDS[@]}"; do
         _read_phase_state "$id" || { state_error "Malformed/missing generation phase record: $id"; return 1; }
+        dir=$(_phase_dir "$id") || return 1
+        for action_file in "$dir"/.action-*; do
+            [ -e "$action_file" ] || continue
+            action="${action_file##*/}"; action="${action#.action-}"
+            _read_phase_action "$id" "$action" || { state_error "Malformed/stale current action record for phase $id."; return 1; }
+        done
         case " $required " in *" $id "*)
             _phase_terminal || { state_error "Checkpoint ahead of phase $id completion."; return 1; }
+            [ "$PHASE_BLOCKED_AT" = - ] || { state_error "Checkpoint includes blocked phase $id."; return 1; }
             digest=$(_phase_digest "$id") || return 1
             [ "$digest" = "$PHASE_DIGEST" ] || { state_error "Current evidence does not match phase $id completion."; return 1; } ;;
             *) if _phase_terminal; then
-                case " $allowed " in *" $id "*) ;; *) state_error "Impossible phase completion ahead of checkpoint: $id"; return 1 ;; esac
-                if [ "$id" = 3 ] || [ "$id" = 7 ]; then
+                if [ "$PHASE_BLOCKED_AT" != - ]; then
+                    [ "$PHASE_BLOCKED_AT" = "$checkpoint" ] && [ -n "$blocked_by" ] \
+                        || { state_error "Unproven checkpoint barrier for phase $id."; return 1; }
+                    digest=$(_phase_digest "$id") || return 1
+                    [ "$digest" = "$PHASE_DIGEST" ] || { state_error "Blocked phase $id evidence changed."; return 1; }
+                else
+                    case " $allowed " in *" $id "*) ;; *) state_error "Impossible phase completion ahead of checkpoint: $id"; return 1 ;; esac
+                fi
+                if [ "$PHASE_BLOCKED_AT" = - ] && { [ "$id" = 3 ] || [ "$id" = 7 ]; }; then
                     local predecessor=2.5
                     [ "$id" != 7 ] || predecessor=scoring
                     _read_phase_state "$predecessor" && _phase_terminal || { state_error "Missing indirect prerequisite completion."; return 1; }
                 fi
+            else
+                case "$PHASE_STATUS" in failed|partial|skipped) blocked_by="$id" ;; esac
             fi ;;
         esac
     done
@@ -1440,10 +1476,18 @@ prepare_generation_continuation() {
 
 _skip_phase() { PHASE_SKIPPED=true; }
 
+# Bash's dynamic local scope keeps this declaration inside the current runner,
+# including a parallel worker. Shell/persistence failures still take precedence.
+_set_phase_outcome() {
+    case "${1:-}" in complete|zero-result|skipped|partial|failed) PHASE_OUTCOME="$1" ;;
+        *) state_error "Invalid explicit phase outcome."; return 1 ;; esac
+}
+
 _record_phase_action() {
     local id="$1" action="$2" status="$3" dir
+    [[ "$GENERATION_ID" =~ ^[0-9a-f]{64}$ ]] || return 1
     [[ "$action" =~ ^[a-z0-9-]+$ ]] || return 1
-    case "$status" in skipped|failed|zero-result|complete) ;; *) return 1 ;; esac
+    case "$status" in skipped|failed|partial|zero-result|complete) ;; *) return 1 ;; esac
     dir=$(_phase_dir "$id") || return 1
     _atomic_state_write "$dir/.action-$action" <<EOF
 GENERATION=$GENERATION_ID
@@ -1453,8 +1497,25 @@ STATUS=$status
 EOF
 }
 
+_read_phase_action() {
+    local id="$1" action="$2" dir file text
+    local -a lines=()
+    [[ "$GENERATION_ID" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$action" =~ ^[a-z0-9-]+$ ]] || return 1
+    dir=$(_phase_dir "$id") || return 1
+    file="$dir/.action-$action"
+    validate_output_path "$file" file && [ -f "$file" ] || return 1
+    mapfile -t lines < "$file" || return 1
+    [ "${#lines[@]}" = 4 ] || return 1
+    ACTION_STATUS="${lines[3]#STATUS=}"
+    case "$ACTION_STATUS" in skipped|failed|partial|zero-result|complete) ;; *) return 1 ;; esac
+    printf -v text 'GENERATION=%s\nPHASE=%s\nACTION=%s\nSTATUS=%s' \
+        "$GENERATION_ID" "$id" "$action" "$ACTION_STATUS"
+    _state_equals "$file" "$text"
+}
+
 _run_generation_phase() {
-    local id="$1" fn="$2" PHASE_SKIPPED=false status digest rc dir
+    local id="$1" fn="$2" PHASE_SKIPPED=false PHASE_OUTCOME="" status digest rc dir blocked_at=-
     [[ "$GENERATION_ID" =~ ^[0-9a-f]{64}$ ]] || { state_error "Phase execution requires initialized generation state."; return 1; }
     phase_done "$id" && return 0
     if [ "$id" = 12 ]; then
@@ -1469,27 +1530,40 @@ _run_generation_phase() {
         status=failed
         [ "$PHASE_SKIPPED" = false ] || status=skipped
         _write_phase_state "$id" "$status" - || return 1
+        CHECKPOINT_FROZEN=true
         return 1
     fi
-    status=complete
-    [ "$PHASE_SKIPPED" = false ] || status=skipped
-    # Zero-result refers to evidence, not logs or temporary/input corpora.
-    if [ "$status" = complete ] && ! _phase_has_results "$id"; then status=zero-result; fi
-    if [ "$CHECKPOINT_FROZEN" = true ]; then
-        _write_phase_state "$id" partial - || return 1
-        return 0
+    status="$PHASE_OUTCOME"
+    if [ -z "$status" ]; then
+        status=complete
+        [ "$PHASE_SKIPPED" = false ] || status=skipped
+        # Preserve legacy inference when the caller does not declare an outcome.
+        if [ "$status" = complete ] && ! _phase_has_results "$id"; then status=zero-result; fi
     fi
+    case "$status" in
+        partial|failed)
+            _write_phase_state "$id" "$status" - || return 1
+            CHECKPOINT_FROZEN=true
+            return 1 ;;
+        complete|zero-result|skipped) ;;
+        *) state_error "Invalid phase outcome."; return 1 ;;
+    esac
+    [ "$CHECKPOINT_FROZEN" = false ] || blocked_at="$RESUME_FROM"
     # Phase 4 intentionally augments Phase 3's live host corpus with alternate
     # ports. Rebind that same-generation evidence before committing Phase 4.
     # Interruption between mutation and rebinding fails closed on resume.
     if [ "$id" = 4 ]; then
-        _read_phase_state 3 && _phase_terminal || return 1
-        if [ "$PHASE_STATUS" = zero-result ] && _phase_has_results 3; then PHASE_STATUS=complete; fi
-        digest=$(_phase_digest 3) || return 1
-        _write_phase_state 3 "$PHASE_STATUS" "$digest" || return 1
+        _read_phase_state 3 || return 1
+        if _phase_terminal; then
+            if [ "$PHASE_STATUS" = zero-result ] && _phase_has_results 3; then PHASE_STATUS=complete; fi
+            digest=$(_phase_digest 3) || return 1
+            _write_phase_state 3 "$PHASE_STATUS" "$digest" "$PHASE_BLOCKED_AT" || return 1
+        else
+            [ "$CHECKPOINT_FROZEN" = true ] || return 1
+        fi
     fi
     digest=$(_phase_digest "$id") || return 1
-    _write_phase_state "$id" "$status" "$digest" || return 1
+    _write_phase_state "$id" "$status" "$digest" "$blocked_at" || return 1
     case "$id" in 1|2|3|4|5|6|7|12) save_checkpoint "$id" || return 1 ;; esac
 }
 
@@ -5004,19 +5078,12 @@ EOF
         _read_phase_state "$state_id" || return 1
         printf '  Phase %-7s : %s\n' "$state_id" "$PHASE_STATUS" >> "$report_file" || return 1
     done
-    local pattern action_file action_status action_text
-    local -a action_lines=()
+    local pattern action_file
     for pattern in xss sqli ssrf redirect lfi idor; do
         action_file="$OUTPUT_DIR/phase5-urls/.action-gf-$pattern"
         [ -e "$action_file" ] || continue
-        validate_output_path "$action_file" file || return 1
-        mapfile -t action_lines < "$action_file" || return 1
-        [ "${#action_lines[@]}" = 4 ] || return 1
-        action_status="${action_lines[3]#STATUS=}"
-        case "$action_status" in skipped|failed|zero-result|complete) ;; *) return 1 ;; esac
-        printf -v action_text 'GENERATION=%s\nPHASE=5\nACTION=gf-%s\nSTATUS=%s' "$GENERATION_ID" "$pattern" "$action_status"
-        _state_equals "$action_file" "$action_text" || return 1
-        printf '  gf-%-10s : %s\n' "$pattern" "$action_status" >> "$report_file" || return 1
+        _read_phase_action 5 "gf-$pattern" || return 1
+        printf '  gf-%-10s : %s\n' "$pattern" "$ACTION_STATUS" >> "$report_file" || return 1
     done
 
     for findings_file in \
