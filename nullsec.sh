@@ -483,6 +483,66 @@ resolve_nuclei_templates() {
     return 1
 }
 
+# Maintenance requires both explicit -u and the existing validation permission.
+# Stamp age is never permission to change the operator's template environment.
+update_nuclei_templates() {
+    [ "$UPDATE_NUCLEI" = true ] || return 0
+    authorization_allowed validation || return 1
+    info "Updating Nuclei templates (explicit -u)..."
+    if ! authorized_run validation maintenance "" nuclei -ut; then
+        warn "Nuclei template update failed; continuing with the installed templates." >&2
+        return 1
+    fi
+    if ! touch -- "$HOME/.nuclei-last-update"; then
+        warn "Nuclei templates updated, but the update stamp could not be persisted." >&2
+        return 1
+    fi
+    success "Nuclei templates updated."
+}
+
+# Read local template bytes only. A content digest is not a release version.
+# Symlinks or unreadable files make this conservative inventory unknown.
+nuclei_template_identity() (
+    local selected="$1" digest=unknown links candidate
+    if [ -d "$NUCLEI_TEMPLATES" ]; then
+        candidate=$(
+            cd -- "$NUCLEI_TEMPLATES" || exit 1
+            links=$(find . -type d -name .git -prune -o -type l -print) || exit 1
+            [ -z "$links" ] || exit 1
+            find . -type d -name .git -prune -o -type f -print0 \
+                | LC_ALL=C sort -z \
+                | while IFS= read -r -d '' file; do sha256sum -- "$file" || exit 1; done \
+                | sha256sum
+        ) && digest="${candidate%% *}"
+    fi
+    printf 'VERSION=unknown\nROOT=%s\nSELECTED=%s\nCONTENT_SHA256=%s\nSEVERITY=%s\n' \
+        "$NUCLEI_TEMPLATES" "$selected" "$digest" "$NUCLEI_SEVERITY"
+)
+
+# All target scans share the mode severity and disable Nuclei update checks.
+# Explicit installed template paths avoid first-run template discovery/downloads.
+nuclei_target_scan() {
+    local kind="$1" input="$2" selected="$NUCLEI_TEMPLATES" output="" arg previous="" explicit_templates=false
+    shift 2
+    authorization_allowed validation || return 0
+    for arg in "$@"; do
+        case "$previous" in
+            -t) selected="$arg"; explicit_templates=true ;;
+            -o) output="$arg" ;;
+        esac
+        previous="$arg"
+    done
+    if [ ! -d "$NUCLEI_TEMPLATES" ] || { [ ! -d "$selected" ] && [ ! -f "$selected" ]; }; then
+        warn "Installed Nuclei templates are missing; scan skipped. Use explicit -u or install templates manually."
+        return 1
+    fi
+    local -a policy=(-duc -severity "$NUCLEI_SEVERITY")
+    [ "$explicit_templates" = true ] || policy+=(-t "$NUCLEI_TEMPLATES")
+    [ -n "$output" ] || return 1
+    nuclei_template_identity "$selected" | _atomic_state_write "$output.templates.txt" || return 1
+    authorized_run validation "$kind" "$input" nuclei "${policy[@]}" "$@"
+}
+
 # Host rules are exact names or *.domain (subdomains only, not the apex).
 # Exclusions override inclusions. Filtering requires a loaded current policy.
 _trim_policy_line() {
@@ -1592,10 +1652,10 @@ apply_scan_mode() {
 
         # ── NORMAL ───────────────────────────────────────────────────────────
         # Adds DNS bruteforce, full crawling, JS analysis, and pattern hunting.
-        # Skips the most expensive active steps. Good for daily runs.
+        # Dalfox/SQLMap still require -A -V; skips fuzzing and Phase 12.
         # Typical runtime: 30–60 min.
         normal)
-            info "Scan mode: NORMAL — full discovery + JS analysis, no fuzzing/active confirm"
+            info "Scan mode: NORMAL — discovery + JS + patterns; validators require -A -V; skips fuzzing/Phase 12"
 
             RUN_DNS_BRUTEFORCE=true
             RUN_PERMUTATIONS=false      # permutations are expensive; deep only
@@ -1608,7 +1668,7 @@ apply_scan_mode() {
             RUN_SCREENSHOTS=true
             RUN_VHOST_DISCOVERY=true    # vhost discovery enabled in normal + deep
             RUN_FUZZING=false           # ffuf recursive fuzzing; deep only
-            RUN_ACTIVE_VULNS=false      # active confirmation; deep only
+            RUN_ACTIVE_VULNS=false      # Phase 12 only; Phase 9 validators require -A -V
 
             NUCLEI_SEVERITY="critical,high,medium"
             KATANA_DEPTH=2
@@ -1618,7 +1678,7 @@ apply_scan_mode() {
             NUCLEI_RATE_LIMIT=50
             NUCLEI_CONCURRENCY=25  # balanced; stays under MHE default (30)
 
-            # Phase 9 / 11 timing — normal mode runs both phases.
+            # Phase 9 timing — normal supports validators with -A -V; skips Phase 11.
             # Caps bound DISTINCT INJECTION POINTS (post-dedup), so these are much
             # smaller than the old raw-URL caps and each unit is genuine testing.
             # The timeout is a SAFETY NET for true hangs, not a per-run guillotine:
@@ -1865,7 +1925,7 @@ usage() {
     echo "  -o <dir>          Output directory (default: ./recon-<domain>-<timestamp>)"
     echo "  -m <mode>         Capability preset: fast | normal | deep  (default: normal)"
     echo "  -s                Skip tool checking"
-    echo "  -u                Update Nuclei templates before scanning"
+    echo "  -u                Explicitly update Nuclei templates in Phase 7 (requires -A -V)"
     echo "  -r                Enable rate limiting / polite delays between phases"
     echo "  -c <dir>          Resume scan from checkpoint in existing output directory"
     echo "  --version         Show NullSec version and author"
@@ -1895,7 +1955,7 @@ usage() {
     echo "          Runtime: ~5-15 min  |  Good for: hourly scheduled runs"
     echo ""
     echo "  normal  Discovery + JS analysis + pattern hunting"
-    echo "          Skips: permutations, Arjun, directory fuzzing, active confirmation"
+    echo "          Dalfox/SQLMap require -A -V; skips permutations, Arjun, fuzzing, Phase 12"
     echo "          Runtime: ~30-60 min  |  Good for: daily scheduled runs"
     echo ""
     echo "  deep    Broadest preset: supported phases and higher limits, subject to permissions"
@@ -2303,7 +2363,7 @@ phase2_validation() {
     if [ -s "$p2dir/valid-subdomains.txt" ]; then
         if authorization_allowed validation && [ -d "$NUCLEI_TEMPLATES/http/takeovers" ]; then
             info "Scanning for subdomain takeover vulnerabilities..."
-            if ! authorized_run validation list "$p2dir/valid-subdomains.txt" nuclei -l @AUTHORIZED_INPUT@ \
+            if ! nuclei_target_scan list "$p2dir/valid-subdomains.txt" -l @AUTHORIZED_INPUT@ \
                 -t "$NUCLEI_TEMPLATES/http/takeovers/" \
                 -o "$p2dir/takeover-findings.txt" \
                 -silent 2>"$p2dir/takeover-nuclei.log"; then
@@ -3589,34 +3649,12 @@ phase7_vulnerability_scanning() {
     backup_phase_outputs "$p7dir" || return 1
     rm -f "$p7dir"/{all-findings.txt,all-findings.json,exposure-findings.txt,exposure-findings.json,critical-findings.txt,high-medium-findings.txt,cve-findings.txt,api-findings.txt,endpoint-findings.txt,js-exposure-findings.txt,scan1-nuclei.log,scan1-stats.json,scan2-nuclei.log,scan2-stats.json} 2>/dev/null || true
 
-    # Optional template update — auto-updates if templates are older than 7 days
-    local nuclei_stamp="$HOME/.nuclei-last-update"
-    local needs_update=false
+    # Only explicit -u authorizes maintenance; missing/old stamps do nothing.
     if [ "$UPDATE_NUCLEI" = true ]; then
-        needs_update=true
-    elif [ ! -f "$nuclei_stamp" ]; then
-        needs_update=true
-        info "Nuclei templates have never been updated — auto-updating..."
+        update_nuclei_templates 2>"$p7dir/template-update.log" || phase_status=1
+        resolve_nuclei_templates false || true
     else
-        local days_since
-        days_since=$(( ( $(date +%s) - $(date -r "$nuclei_stamp" +%s) ) / 86400 ))
-        if [ "$days_since" -ge 7 ]; then
-            needs_update=true
-            info "Nuclei templates are $days_since days old — auto-updating..."
-        else
-            info "Nuclei templates are up to date ($days_since days old). Use -u to force update."
-        fi
-    fi
-
-    if [ "$needs_update" = true ]; then
-        info "Updating Nuclei templates..."
-        if authorized_run validation maintenance "" nuclei -ut 2>/dev/null; then
-            touch "$nuclei_stamp"
-            success "Nuclei templates updated."
-        else
-            warn "Nuclei template update failed; continuing with the installed templates."
-            phase_status=1
-        fi
+        info "Using installed Nuclei templates without updating (use -u to opt in)."
     fi
 
     # UNSIGNED-TEMPLATE ADVISORY: nuclei emits
@@ -3741,8 +3779,7 @@ phase7_vulnerability_scanning() {
     # always ≥ the worker count, eliminating the "[WRN] concurrency > max-host-
     # error" warning and preventing mid-scan host skips on fragile targets.
     info "Running consolidated Nuclei scan ($NUCLEI_SEVERITY severity)..."
-    authorized_run validation list "$host_targets" nuclei -l @AUTHORIZED_INPUT@ \
-        -severity "$NUCLEI_SEVERITY" \
+    nuclei_target_scan list "$host_targets" -l @AUTHORIZED_INPUT@ \
         -exclude-tags headers,cookie-flags,info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
         -c "$NUCLEI_CONCURRENCY" -bs "$NUCLEI_CONCURRENCY" \
@@ -3761,13 +3798,7 @@ phase7_vulnerability_scanning() {
     _p7_report_skips "$p7dir/scan1-nuclei.log" "7.1 severity scan"
 
     # 7.2 Exposure / misconfig scan against the full URL list
-    # BUG-4 FIX: Add -exclude-severity info so info-severity exposure templates
-    # (e.g. cookie attribute checkers) are excluded even when the -tags filter
-    # pulls them in.  Previously -exclude-tags info only excluded templates
-    # carrying the "info" tag, which is a different dimension from severity;
-    # many high-volume info-severity exposure templates carry no such tag and
-    # slipped through, dramatically inflating this scan's template corpus and
-    # wall-clock time.  Using -es info is the correct, severity-level gate.
+    # Tags select template categories; the shared mode severity constrains them.
     #
     # CONCURRENCY FIX: 7.2 targets the full URL corpus (potentially hundreds of
     # paths per host).  A host-error skip here is more damaging than in 7.1
@@ -3777,10 +3808,9 @@ phase7_vulnerability_scanning() {
     local _p7_url_conc=$(( NUCLEI_CONCURRENCY / 2 ))
     [ "$_p7_url_conc" -lt 10 ] && _p7_url_conc=10
     info "Scanning for exposures and misconfigurations..."
-    authorized_run validation list "$combined_targets" nuclei -l @AUTHORIZED_INPUT@ \
+    nuclei_target_scan list "$combined_targets" -l @AUTHORIZED_INPUT@ \
         -tags exposure,config,misconfig \
         -exclude-tags headers,cookie-flags \
-        -exclude-severity info \
         -rate-limit "$NUCLEI_RATE_LIMIT" \
         -c "$_p7_url_conc" -bs "$_p7_url_conc" \
         -mhe "$_p7_url_conc" \
@@ -4682,8 +4712,8 @@ phase12_active_vulns() {
 
     if [ -s "$p9dir/ssrf-candidates.txt" ]; then
         info "Testing SSRF candidates with Nuclei OAST templates..."
-        if ! authorized_run validation list "$p9dir/ssrf-candidates.txt" nuclei -l @AUTHORIZED_INPUT@ -tags ssrf \
-            -severity medium,high,critical -rate-limit "$NUCLEI_RATE_LIMIT" \
+        if ! nuclei_target_scan list "$p9dir/ssrf-candidates.txt" -l @AUTHORIZED_INPUT@ -tags ssrf \
+            -rate-limit "$NUCLEI_RATE_LIMIT" \
             -timeout 10 -o "$p12dir/ssrf-confirmed.txt" -silent 2>/dev/null; then
             warn "SSRF confirmation scan failed; partial output was preserved."
             phase_status=1
@@ -4693,7 +4723,7 @@ phase12_active_vulns() {
 
     if [ -s "$p9dir/redirect-candidates.txt" ]; then
         info "Confirming Open Redirect candidates with Nuclei..."
-        if ! authorized_run validation list "$p9dir/redirect-candidates.txt" nuclei -l @AUTHORIZED_INPUT@ -tags redirect \
+        if ! nuclei_target_scan list "$p9dir/redirect-candidates.txt" -l @AUTHORIZED_INPUT@ -tags redirect \
             -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
             -o "$p12dir/redirect-confirmed.txt" -silent 2>/dev/null; then
             warn "Open-redirect confirmation scan failed; partial output was preserved."
@@ -4704,7 +4734,7 @@ phase12_active_vulns() {
 
     if [ -s "$p9dir/lfi-candidates.txt" ]; then
         info "Confirming LFI candidates with Nuclei..."
-        if ! authorized_run validation list "$p9dir/lfi-candidates.txt" nuclei -l @AUTHORIZED_INPUT@ -tags lfi \
+        if ! nuclei_target_scan list "$p9dir/lfi-candidates.txt" -l @AUTHORIZED_INPUT@ -tags lfi \
             -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
             -o "$p12dir/lfi-confirmed.txt" -silent 2>/dev/null; then
             warn "LFI confirmation scan failed; partial output was preserved."
@@ -4717,7 +4747,7 @@ phase12_active_vulns() {
         local bypass_template="$NUCLEI_TEMPLATES/http/fuzzing/403-bypass.yaml"
         if [ -f "$bypass_template" ]; then
             info "Attempting 403 Forbidden bypass techniques..."
-            if ! authorized_run validation list "$OUTPUT_DIR/phase3-probing/status-403.txt" nuclei -l @AUTHORIZED_INPUT@ \
+            if ! nuclei_target_scan list "$OUTPUT_DIR/phase3-probing/status-403.txt" -l @AUTHORIZED_INPUT@ \
                 -t "$bypass_template" \
                 -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
                 -o "$p12dir/403-bypass-confirmed.txt" -silent 2>/dev/null; then
@@ -4735,7 +4765,7 @@ phase12_active_vulns() {
             | head -20 > "$p12dir/graphql-targets.txt" 2>/dev/null || : > "$p12dir/graphql-targets.txt"
         if [ -s "$p12dir/graphql-targets.txt" ]; then
             info "Testing GraphQL endpoints for introspection..."
-            if ! authorized_run validation list "$p12dir/graphql-targets.txt" nuclei -l @AUTHORIZED_INPUT@ -tags graphql \
+            if ! nuclei_target_scan list "$p12dir/graphql-targets.txt" -l @AUTHORIZED_INPUT@ -tags graphql \
                 -rate-limit "$NUCLEI_RATE_LIMIT" -timeout 10 \
                 -o "$p12dir/graphql-findings.txt" -silent 2>/dev/null; then
                 warn "GraphQL confirmation scan failed; partial output was preserved."
@@ -4929,6 +4959,18 @@ EOF
         head -25 "$OUTPUT_DIR/asset-scoring/scored-targets.txt" >> "$report_file" || { state_error "Report write failed."; return 1; }
         echo "" >> "$report_file" || { state_error "Report write failed."; return 1; }
     fi
+
+    # Only direct current-phase identity records are included, never prior-runs.
+    local template_record
+    printf '\nNUCLEI TEMPLATE IDENTITIES (local pre-scan inventory; version may be unknown):\n' \
+        >> "$report_file" || { state_error "Report write failed."; return 1; }
+    for template_record in "$OUTPUT_DIR/phase2-validation/"*.templates.txt \
+        "$OUTPUT_DIR/phase7-vulns/"*.templates.txt "$OUTPUT_DIR/phase12-active-vulns/"*.templates.txt; do
+        [ -f "$template_record" ] || continue
+        printf '\n--- %s ---\n' "${template_record#"$OUTPUT_DIR"/}" >> "$report_file" \
+            && cat -- "$template_record" >> "$report_file" \
+            || { state_error "Template identity report write failed."; return 1; }
+    done
 
     cat >> "$report_file" << EOF
 

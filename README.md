@@ -159,8 +159,10 @@ If your templates are installed under the newer local path, you can also set:
 export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"
 ```
 
-Missing templates show a warning only; normal mode does not fail only because the template directory is absent.
-Or let NullSec update templates before a scan with the `-u` option.
+Missing templates produce a warning during discovery. Phase 2 skips unavailable takeover templates; the shared scan launcher refuses unavailable template paths with an error.
+NullSec updates templates only with explicit `-u`, during an authorized Phase 7 run (`-A -V`) with live hosts. A missing or old update stamp never authorizes an update. Updates therefore occur after Phase 2 takeover checks. Without `-u`, every Nuclei scan disables automatic update checks and uses explicit installed template paths. Update failures remain visible in `phase7-vulns/template-update.log` and fail Phase 7. The update stamp is written only after a successful explicit update; stamp write failures also fail the phase.
+
+Each target scan records a local template inventory beside its output as `*.templates.txt`, and the report includes current records. It records the template root, selected path, mode severity, and a deterministic SHA-256 digest of relative filenames and regular-file contents (excluding `.git` directories). The release version is honestly reported as `unknown`; the digest is a content identity, not a release version. Symlinks or inventory read failures produce an `unknown` digest. Inspection is local and read-only and runs before each scan, so takeover records can differ from later records after explicit updates. Preserve the actual template files for reproduction; the digest alone cannot restore them or capture concurrent edits.
 
 ## Installation
 
@@ -264,7 +266,7 @@ Usage: ./nullsec.sh -d <target-domain> [options]
   -V            Permit active validation; also requires -A
   -K            Permit secret verification; disabled by default
   -s            Skip the dependency check
-  -u            Update Nuclei templates before scanning
+  -u            Explicitly update templates in Phase 7 (requires -A -V)
   -r            Add polite delays between phases
   -c <dir>      Resume from an existing NullSec output directory
   --version     Show NullSec version and author
@@ -344,6 +346,10 @@ The table describes preset capabilities **after** the corresponding action permi
 | `fast` | Frequent or scheduled checks | Passive discovery, live probing, URL collection, and critical-only Nuclei scanning; skips cloud enumeration, brute force, port scanning, JavaScript analysis, screenshots, pattern hunting, fuzzing, and active confirmation | 5–15 minutes |
 | `normal` | Daily reconnaissance | Adds DNS brute force, cloud checks, port scanning, asset scoring, JavaScript analysis, pattern hunting, screenshots; skips permutations, Arjun, directory fuzzing, and Phase 12 confirmation | 30–60 minutes |
 | `deep` | First-time onboarding or thorough periodic scans | Selects all otherwise supported phases subject to explicit permissions, increases selected limits, and includes permutations, Arjun, directory fuzzing, and active confirmation | 1–4+ hours |
+
+Normal mode generates pattern candidates with `-A`; Dalfox and SQLMap can run only with separate explicit `-A -V` permission and installed tools. Normal mode skips Phase 12 confirmation, but that does not disable its permission-gated Phase 9 validators.
+
+Every target-facing Nuclei scan, including takeover, exposure/configuration, and Phase 12 scans, uses the same severity policy: `critical` in fast, `critical,high,medium` in normal, and `critical,high,medium,low` in deep. Category tags remain separate filters and do not override severity. A preset never grants validation permission.
 
 Runtime depends on the number of discovered assets, target responsiveness, network conditions, WAF behavior, tool versions, and configured limits.
 
@@ -456,7 +462,7 @@ asset-scoring/scoring-summary.txt
 
 ### Phase 7 — Nuclei scanning
 
-Runs a consolidated severity-filtered scan and a dedicated exposure or misconfiguration scan. JSON exports are parsed into separate critical, high/medium, CVE, API, endpoint, JavaScript exposure, and general exposure files.
+Runs a consolidated scan and a dedicated exposure or misconfiguration scan, both constrained by the mode severity policy and explicit `-A -V`. Exposure/config/misconfig tags remain intact. JSON exports are parsed into separate critical, high/medium, CVE, API, endpoint, JavaScript exposure, and general exposure files.
 
 Primary outputs:
 
