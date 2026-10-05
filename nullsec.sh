@@ -3793,6 +3793,8 @@ phase7_vulnerability_scanning() {
     if [ ! -s "$host_targets" ]; then
         warn "All live hosts were filtered out as out-of-scope for TARGET=$TARGET. Skipping Phase 7."
         merge_phase_backup "$p7dir" || return 1
+        # A no-host skip cannot turn failed required maintenance into success.
+        [ "$phase_status" -eq 0 ] || return "$phase_status"
 
         polite_sleep
         _skip_phase
