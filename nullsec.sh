@@ -2572,14 +2572,14 @@ phase2_validation() {
         awk '{print $1}' "$p2dir/resolved.txt" | sed 's/\.$//' | in_scope | sort -u > "$p2dir/valid-subdomains.txt"
     fi
 
-    local total_enum valid wildcards
+    local total_enum valid
     total_enum=$(count_lines "$p1dir/all-subdomains.txt")
     valid=$(count_lines "$p2dir/valid-subdomains.txt")
-    wildcards=$(count_lines "$p2dir/wildcards.txt")
 
     info "Total enumerated  : $total_enum"
     info "Actually resolved : $valid"
-    info "Wildcards filtered: $wildcards"
+    info "Manual wildcard filtering: unverified (dnsx invocation contract requires remediation)"
+    info "Exact number of wildcard-filtered responses: unavailable"
 
     if [ "$valid" -eq 0 ]; then
         warn "Phase 2 produced 0 valid subdomains. Later web phases will be skipped or empty."
@@ -3968,6 +3968,23 @@ _p7_report_skips() {
 
 # PHASE 7: Vulnerability Scanning (Nuclei)
 # ─────────────────────────────────────────────────────────────────────────────
+# -je evidence must be exactly one JSON array of finding objects. An absent or
+# whitespace-only export is incomplete (status 2), not proof of zero findings.
+# Parse/schema/path failures return 1; only a validated array emits its count.
+_nuclei_export_count() {
+    local file="$1" count
+    validate_output_path "$file" file || return 1
+    [ -f "$file" ] || return 2
+    count=$(jq -ers '
+        if length == 0 then "incomplete"
+        elif length == 1 and (.[0] | type == "array" and all(.[]; type == "object"))
+        then (.[0] | length)
+        else error("Expected one Nuclei JSON array of finding objects") end
+    ' "$file" 2>/dev/null) || return 1
+    [ "$count" != incomplete ] || return 2
+    printf '%s\n' "$count"
+}
+
 phase7_vulnerability_scanning() {
     validate_output_tree || return 1
     authorization_allowed validation || { info "phase7_vulnerability_scanning: skipped by authorization policy"; _skip_phase; return 0; }
@@ -4172,6 +4189,29 @@ phase7_vulnerability_scanning() {
     fi
     _p7_report_skips "$p7dir/scan2-nuclei.log" "7.2 exposure scan"
 
+    # Validate required sibling exports independently. Scanner exit status and
+    # text output cannot establish completeness of missing structured evidence.
+    local primary_count=unavailable exposure_count=unavailable
+    local export_kind export_file export_count export_rc structured_incomplete=false
+    for export_kind in primary exposure; do
+        case "$export_kind" in
+            primary) export_file="$p7dir/all-findings.json" ;;
+            exposure) export_file="$p7dir/exposure-findings.json" ;;
+        esac
+        if export_count=$(_nuclei_export_count "$export_file"); then
+            printf -v "${export_kind}_count" '%s' "$export_count"
+        else
+            export_rc=$?
+            if [ "$export_rc" -eq 2 ]; then
+                structured_incomplete=true
+                warn "Nuclei $export_kind structured export is missing or whitespace-only; coverage is partial. Evidence: $export_file"
+            else
+                phase_status=1
+                warn "Nuclei $export_kind structured export is invalid or unreadable; coverage failed. Evidence: $export_file"
+            fi
+        fi
+    done
+
     # 7.3 Split consolidated JSON into the category files other phases expect
     # BUG-5 FIX: nuclei -je (--json-export) emits a JSON ARRAY, not JSONL.
     # The previous code used bare `jq -r 'select(...)'` which applies select()
@@ -4195,7 +4235,7 @@ phase7_vulnerability_scanning() {
     # multiple files (e.g. a critical CVE against an admin endpoint lands in
     # critical-findings, cve-findings, AND endpoint-findings).
     local category_routes="$p7dir/.category-routes.tmp.$$"
-    if jq -r '
+    if [ "$primary_count" != unavailable ] && jq -r '
       .[] |
       (. ["template-id"] + " " + .host) as $line |
       (.info.severity // "unknown") as $sev |
@@ -4218,7 +4258,7 @@ phase7_vulnerability_scanning() {
                 endpoint)    printf '%s\n' "$line" >> "$p7dir/endpoint-findings.txt" ;;
             esac
         done < "$category_routes"
-    elif [ -s "$p7dir/all-findings.json" ]; then
+    elif [ "$primary_count" != unavailable ]; then
         warn "Failed to parse Nuclei JSON into category files."
         phase_status=1
     fi
@@ -4229,52 +4269,6 @@ phase7_vulnerability_scanning() {
 
     # Clean up temp files (happy path; SIGINT path is handled by _nullsec_cleanup)
     rm -f "$host_targets" "$combined_targets"
-
-    # 7.4 Tally all findings
-    # COUNT FIX: the previous form
-    #     total_findings=$(jq 'length' all-findings.json 2>/dev/null || echo "0")
-    # silently substituted "0" for any jq failure — missing file, malformed
-    # JSON (e.g. nuclei killed mid-flush), empty file, jq absent, etc.  This
-    # produced "Total findings: 0" runs even when scan1-nuclei.log clearly
-    # showed dozens of matches.  We now:
-    #   1. Check that the JSON file exists and is non-empty before invoking jq;
-    #   2. Capture both jq's exit status and a separate text-file fallback;
-    #   3. Warn loudly when the two counts disagree (a signal that the JSON
-    #      export failed and findings exist only in the .txt output).
-    local total_findings=0
-    local text_findings
-    text_findings=$(count_lines "$p7dir/all-findings.txt")
-
-    if [ ! -s "$p7dir/all-findings.json" ]; then
-        # JSON not produced — fall back to text count.  This commonly means
-        # nuclei was killed by a signal before flushing JSON, or the template
-        # set hit zero matches (in which case text_findings will also be 0).
-        if [ "$text_findings" -gt 0 ]; then
-            warn "all-findings.json missing or empty but all-findings.txt has $text_findings matches — JSON export failed."
-            warn "Findings are preserved in $p7dir/all-findings.txt; downstream category split was skipped."
-            total_findings="$text_findings"
-        fi
-    else
-        local _jq_err
-        _jq_err=$(mktemp)
-        total_findings=$(jq 'length' "$p7dir/all-findings.json" 2>"$_jq_err")
-        local _jq_exit=$?
-        if [ "$_jq_exit" -ne 0 ] || ! [[ "$total_findings" =~ ^[0-9]+$ ]]; then
-            warn "jq failed to parse all-findings.json (exit $_jq_exit). Falling back to text-line count."
-            [ -s "$_jq_err" ] && warn "  jq stderr: $(head -1 "$_jq_err")"
-            total_findings="$text_findings"
-        elif [ "$total_findings" -eq 0 ] && [ "$text_findings" -gt 0 ]; then
-            # JSON parsed as empty array but text file has lines — schema
-            # mismatch (nuclei version change) or path mismatch.
-            warn "JSON reports 0 findings but all-findings.txt has $text_findings — possible export/version mismatch."
-            warn "  Trusting text count; manually inspect $p7dir/all-findings.json"
-            total_findings="$text_findings"
-        fi
-        rm -f "$_jq_err"
-    fi
-
-    local exposure_count
-    exposure_count=$(count_lines "$p7dir/exposure-findings.txt")
 
     merge_phase_backup "$p7dir" || return 1
 
@@ -4299,7 +4293,16 @@ phase7_vulnerability_scanning() {
         return 1
     fi
 
-    success "Phase 7 complete! Total findings: $total_findings (+ $exposure_count exposure/misconfig)"
+    if [ "$structured_incomplete" = true ]; then
+        _set_phase_outcome partial || return 1
+        warn "Phase 7 structured coverage is partial; primary findings: $primary_count; exposure findings: $exposure_count."
+    elif [ "$primary_count" -gt 0 ] || [ "$exposure_count" -gt 0 ]; then
+        _set_phase_outcome complete || return 1
+        success "Phase 7 complete! Total findings: $primary_count (+ $exposure_count exposure/misconfig)"
+    else
+        _set_phase_outcome zero-result || return 1
+        success "Phase 7 complete! Both structured exports contain zero findings."
+    fi
     polite_sleep
     return 0
 }
@@ -5189,6 +5192,26 @@ _report_context() {
             case "$ACTION_STATUS" in failed) failed=true ;; partial) partial=true ;; esac
         done
     done
+    # Even a legacy terminal state cannot prove complete structured coverage
+    # without both current exports. Historical exports are never consulted.
+    _read_phase_state 7 || return 1
+    case "$PHASE_STATUS" in complete|zero-result)
+        local export_file export_count export_rc structured_total=0
+        for export_file in "$OUTPUT_DIR/phase7-vulns/all-findings.json" \
+            "$OUTPUT_DIR/phase7-vulns/exposure-findings.json"; do
+            if export_count=$(_nuclei_export_count "$export_file"); then
+                structured_total=$(( structured_total + export_count ))
+            else
+                export_rc=$?
+                [ "$export_rc" -eq 2 ] || { state_error "Report refused: invalid Phase 7 structured export."; return 1; }
+                partial=true
+            fi
+        done
+        if [ "$PHASE_STATUS" = zero-result ] && [ "$structured_total" -gt 0 ]; then
+            state_error "Report refused: Phase 7 zero-result state contradicts structured findings."
+            return 1
+        fi ;;
+    esac
     # Known persistence/preservation failures can strengthen, never erase,
     # the failure outcome established by validated persisted state.
     [ "$STATE_FAILED" = false ] || failed=true
@@ -5220,7 +5243,7 @@ _report_evidence_row() {
 }
 
 _report_nuclei_severity() {
-    local relative file summary
+    local relative file summary export_count export_rc
     local -a exports=()
     _read_phase_state 7 || return 1
     printf '\nPHASE 7 UNIFIED SEVERITY (deduplicated available current JSON exports):\n' || return 1
@@ -5232,11 +5255,13 @@ _report_nuclei_severity() {
     for relative in phase7-vulns/all-findings.json phase7-vulns/exposure-findings.json; do
         file="$OUTPUT_DIR/$relative"
         validate_output_path "$file" file || return 1
-        if [ -s "$file" ]; then
+        if export_count=$(_nuclei_export_count "$file"); then
             exports+=("$file")
-            printf '  Evidence: %s (current JSON export)\n' "$relative" || return 1
+            printf '  Evidence: %s (current validated JSON array; records=%s)\n' "$relative" "$export_count" || return 1
         else
-            printf '  Evidence: %s (no JSON export recorded; severity coverage unavailable for this source)\n' "$relative" || return 1
+            export_rc=$?
+            [ "$export_rc" -eq 2 ] || { state_error "Cannot validate Phase 7 structured evidence: $relative"; return 1; }
+            printf '  Evidence: %s (missing or whitespace-only export; structured coverage partial/unavailable for this source)\n' "$relative" || return 1
         fi
     done
     if [ "${#exports[@]}" = 0 ]; then
@@ -5330,13 +5355,13 @@ EOF
         done
     done
     _report_nuclei_severity || return 1
+    printf '\nManual wildcard filtering: unverified (dnsx invocation contract requires remediation)\nExact number of wildcard-filtered responses: unavailable\n' || return 1
     printf '\nCURRENT EVIDENCE SUMMARY (paths relative to OUTPUT DIR):\n' || return 1
     while IFS='|' read -r id label relative source; do
         _report_evidence_row "$id" "$label" "$relative" "$source" || return 1
     done <<'EVIDENCE'
 1|Total Enumerated|phase1-subdomains/all-subdomains.txt|current-generation phase output
 2|Resolved / Valid|phase2-validation/valid-subdomains.txt|current-generation phase output
-2|Wildcards Filtered|phase2-validation/wildcards.txt|current-generation phase output
 2|Potential subdomain takeover|phase2-validation/takeover-findings.txt|Nuclei takeover-template matches
 2.5|S3 existence evidence|phase2.5-cloud/s3/exists.txt|observed cloud evidence; impact not independently established
 2.5|S3 anonymous endpoint read observed|phase2.5-cloud/s3/readable.txt|anonymous HTTP 200; listing/content sensitivity and impact not independently established
@@ -5382,7 +5407,7 @@ scoring|Top Targets (25%)|asset-scoring/top-targets.txt|current-generation phase
 7|Primary category: Critical|phase7-vulns/critical-findings.txt|primary scan category; overall severity uses both JSON exports
 7|Primary category: High / Medium|phase7-vulns/high-medium-findings.txt|primary scan category; overall severity uses both JSON exports
 7|CVEs|phase7-vulns/cve-findings.txt|primary scan category; overall severity uses both JSON exports
-7|Exposures|phase7-vulns/exposure-findings.txt|exposure/config/misconfig scan text output
+7|Exposure scan text evidence|phase7-vulns/exposure-findings.txt|human-readable evidence; structured counts use validated JSON arrays
 7|Primary scan text evidence|phase7-vulns/all-findings.txt|scanner text matches; not independent impact confirmation
 8|AWS Access Keys|phase8-javascript/aws-access-keys.txt|regex-only candidate matches; not verified
 8|Google API Keys|phase8-javascript/google-api-keys.txt|regex-only candidate matches; not verified

@@ -375,14 +375,13 @@ phase1-subdomains/amass-detailed.txt
 
 ### Phase 2 — Validation and resolution
 
-Uses dnsx to resolve discovered names, records DNS responses, filters wildcard behavior, and runs Nuclei takeover templates.
+Uses dnsx to resolve discovered names, records DNS responses, and runs Nuclei takeover templates. The current wildcard invocation still requires remediation, so manual wildcard filtering is unverified. The exact number of wildcard-filtered responses is unavailable; the legacy `wildcards.txt` path is not wildcard evidence and is not counted in reports.
 
 Primary outputs:
 
 ```text
 phase2-validation/valid-subdomains.txt
 phase2-validation/resolved.txt
-phase2-validation/wildcards.txt
 phase2-validation/takeover-findings.txt
 ```
 
@@ -477,6 +476,8 @@ asset-scoring/scoring-summary.txt
 
 Runs a consolidated scan and a dedicated exposure or misconfiguration scan, both constrained by the mode severity policy and explicit `-A -V`. Exposure/config/misconfig tags remain intact. JSON exports are parsed into separate critical, high/medium, CVE, API, endpoint, JavaScript exposure, and general exposure files.
 
+Complete Phase 7 structured coverage requires both current-generation `-je` exports to contain exactly one valid JSON array of finding objects. Findings and counts come from those arrays even when text output is empty. Two empty arrays establish zero-result coverage. Missing or whitespace-only exports declare partial coverage; malformed, truncated, non-array, and JSONL exports fail closed. One incomplete or invalid sibling prevents complete coverage, and archived exports cannot supply missing current evidence. Severity totals still deduplicate available validated findings and retain their evidence paths.
+
 Primary outputs:
 
 ```text
@@ -486,6 +487,7 @@ phase7-vulns/critical-findings.txt
 phase7-vulns/high-medium-findings.txt
 phase7-vulns/cve-findings.txt
 phase7-vulns/exposure-findings.txt
+phase7-vulns/exposure-findings.json
 ```
 
 ### Phase 8 — JavaScript analysis
@@ -802,7 +804,7 @@ Resume with the same target and mode:
 
 ### Nuclei produces no findings
 
-No output can mean no matching templates, inaccessible targets, filtering, rate limiting, WAF interference, stale templates, or a genuinely clean result. Review the Nuclei logs and statistics in `phase7-vulns/` before drawing conclusions.
+No output can mean no matching templates, inaccessible targets, filtering, rate limiting, WAF interference, stale templates, or a genuinely clean result. Review the Nuclei logs and both structured exports in `phase7-vulns/` before drawing conclusions.
 
 ### Candidate counts are very large
 
