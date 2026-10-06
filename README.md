@@ -275,7 +275,7 @@ Usage: ./nullsec.sh -d <target-domain> [options]
   -h            Show help
 ```
 
-The target must be an ASCII DNS hostname such as `example.com`, with at least two labels. Each label must contain 1–63 ASCII letters, digits, or hyphens, without a leading or trailing hyphen. The canonical name must be at most 253 characters. Uppercase is converted to lowercase and one trailing DNS dot is removed. Structurally valid `xn--` labels are accepted; Unicode, underscores, empty labels/repeated dots, URLs, paths, wildcards, IPv4/IPv6 literals, and CIDR ranges are rejected. Target syntax is checked before output creation or tool execution, including when `-I` supplies an explicit policy.
+The target must be an ASCII DNS hostname such as `example.com`, with at least two labels. Each label must contain 1–63 ASCII letters, digits, or hyphens, without a leading or trailing hyphen. The canonical name must be at most 253 characters. Uppercase is converted to lowercase and one trailing DNS dot is removed. Structurally valid `xn--` labels are accepted; Unicode, underscores, empty labels/repeated dots, URLs, paths, wildcards, IPv4/IPv6 literals, numeric-only dotted names, and CIDR ranges are rejected. Target syntax is checked before output creation or tool execution, including when `-I` supplies an explicit policy.
 
 Unexpected positional arguments are rejected, including arguments after `--` or before later options. A final `--` with no remaining arguments is accepted. Repeated valid options retain their last supplied value.
 

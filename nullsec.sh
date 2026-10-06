@@ -449,13 +449,13 @@ check_command() {
 }
 
 # A target is an ASCII DNS name, independently of the authorization policy.
-# One final DNS dot is removed; IPv4 and IPv6 literals are never targets.
+# One final DNS dot is removed; IP literals and numeric-only names are refused.
 normalize_target_hostname() {
     local LC_ALL=C host="${1:-}"
     host="${host,,}"; host="${host%.}"
     [ "${#host}" -le 253 ] &&
         [[ "$host" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] &&
-        ! [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+        ! [[ "$host" =~ ^[0-9.]+$ ]] || return 1
     printf '%s\n' "$host"
 }
 
