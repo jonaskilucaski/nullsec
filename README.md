@@ -476,6 +476,8 @@ asset-scoring/scoring-summary.txt
 
 Runs a consolidated scan and a dedicated exposure or misconfiguration scan, both constrained by the mode severity policy and explicit `-A -V`. Exposure/config/misconfig tags remain intact. JSON exports are parsed into separate critical, high/medium, CVE, API, endpoint, JavaScript exposure, and general exposure files.
 
+Nuclei statistics JSON mode uses the boolean `-stats-json` display flag; structured vulnerability findings remain stored via `-je`.
+
 Complete Phase 7 structured coverage requires both current-generation `-je` exports to contain exactly one valid JSON array of finding objects. Findings and counts come from those arrays even when text output is empty. Two empty arrays establish zero-result coverage. Missing or whitespace-only exports declare partial coverage; malformed, truncated, non-array, and JSONL exports fail closed. One incomplete or invalid sibling prevents complete coverage, and archived exports cannot supply missing current evidence. Severity totals still deduplicate available validated findings and retain their evidence paths.
 
 Primary outputs:

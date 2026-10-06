@@ -4021,7 +4021,7 @@ phase7_vulnerability_scanning() {
     fi
 
     backup_phase_outputs "$p7dir" || return 1
-    rm -f "$p7dir"/{all-findings.txt,all-findings.json,exposure-findings.txt,exposure-findings.json,critical-findings.txt,high-medium-findings.txt,cve-findings.txt,api-findings.txt,endpoint-findings.txt,js-exposure-findings.txt,scan1-nuclei.log,scan1-stats.json,scan2-nuclei.log,scan2-stats.json} 2>/dev/null || true
+    rm -f "$p7dir"/{all-findings.txt,all-findings.json,exposure-findings.txt,exposure-findings.json,critical-findings.txt,high-medium-findings.txt,cve-findings.txt,api-findings.txt,endpoint-findings.txt,js-exposure-findings.txt,scan1-nuclei.log,scan2-nuclei.log} 2>/dev/null || true
 
     # Only explicit -u authorizes maintenance; missing/old stamps do nothing.
     if [ "$UPDATE_NUCLEI" = true ]; then
@@ -4161,8 +4161,7 @@ phase7_vulnerability_scanning() {
         -c "$NUCLEI_CONCURRENCY" -bs "$NUCLEI_CONCURRENCY" \
         -mhe "$NUCLEI_CONCURRENCY" \
         -timeout 10 \
-        -stats -stats-interval 30 \
-        -stats-json "$p7dir/scan1-stats.json" \
+        -stats -stats-json -stats-interval 30 \
         -je "$p7dir/all-findings.json" \
         -o "$p7dir/all-findings.txt" \
         2>"$p7dir/scan1-nuclei.log"
@@ -4191,8 +4190,7 @@ phase7_vulnerability_scanning() {
         -c "$_p7_url_conc" -bs "$_p7_url_conc" \
         -mhe "$_p7_url_conc" \
         -timeout 10 \
-        -stats -stats-interval 30 \
-        -stats-json "$p7dir/scan2-stats.json" \
+        -stats -stats-json -stats-interval 30 \
         -je "$p7dir/exposure-findings.json" \
         -o "$p7dir/exposure-findings.txt" \
         2>"$p7dir/scan2-nuclei.log"
