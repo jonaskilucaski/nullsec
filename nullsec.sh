@@ -4757,7 +4757,7 @@ phase9_pattern_hunting() {
     p9_total=$(( p9_cors + p9_ssrf + p9_xss + p9_hhi ))
     if [ "$p9_total" -gt 0 ]; then
         notify "🎯 Pattern Hits — Phase 9" \
-            "Vulnerability patterns detected on \`${TARGET}\`:\nCORS misconfigs: *${p9_cors}*\nSSRF candidates: *${p9_ssrf}*\nXSS confirmed: *${p9_xss}*\nHost-header inject: *${p9_hhi}*"
+            "Vulnerability patterns detected on \`${TARGET}\`:\nUnconfirmed CORS header leads; impact not established: *${p9_cors}*\nSSRF candidates: *${p9_ssrf}*\nXSS confirmed: *${p9_xss}*\nHost-header inject: *${p9_hhi}*"
     fi
     return "$phase_status"
 }
