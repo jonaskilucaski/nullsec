@@ -66,7 +66,7 @@ Package availability and names may differ by distribution.
 
 ### Required tools
 
-The script now performs **mode-aware** dependency checks. A tool is treated as fatal only when the selected scan mode and authorization policy enable a phase that needs it. Missing optional tools are reported clearly and the related check is skipped or reduced.
+The script now performs **mode-aware** dependency checks. A tool is treated as fatal only when the selected scan mode and authorization policy enable a phase that needs it. Missing optional tools are reported clearly; checks that actually use them are skipped or reduced.
 
 | Tool | Purpose | Required when |
 |---|---|---|
@@ -92,7 +92,7 @@ The script now performs **mode-aware** dependency checks. A tool is treated as f
 
 ### Optional tools
 
-NullSec continues when optional tools are unavailable, but the related checks are skipped or reduced.
+NullSec continues when optional tools are unavailable. Checks that use them are skipped or reduced; detecting an unused tool adds no coverage.
 
 | Tool | Enhancement |
 |---|---|
@@ -102,12 +102,12 @@ NullSec continues when optional tools are unavailable, but the related checks ar
 | SQLMap | SQL injection testing |
 | gf | Higher-signal URL pattern filtering |
 | anew | Efficient unique-result merging |
-| qsreplace | Query-string manipulation support |
+| qsreplace | Detected only; not launched by current execution |
 | Hakrawler | Response-based crawling and discovery |
 | Cariddi | Endpoint and secret-oriented crawling |
 | dig | DNS ownership evidence collection |
-| cloud_enum | Detected but intentionally not used for ungated global-name mutation |
-| S3Scanner | Optional cloud tooling |
+| cloud_enum | Detected but intentionally unused: global-name mutations cannot be ownership-gated safely |
+| S3Scanner (`s3scanner`) | Detected only; not launched by current execution |
 | TruffleHog | Secret verification requires `-K`; regex extraction remains local |
 
 ### Wordlists
@@ -345,17 +345,17 @@ Passive services remain external: certificate transparency, installed passive da
 
 The table describes preset capabilities **after** the corresponding action permissions are supplied. Without `-A`, every mode is limited to passive collection. Vhost discovery remains disabled by the host-only policy.
 
-| Mode | Intended use | Main behavior | Approximate runtime |
-|---|---|---|---|
-| `fast` | Frequent or scheduled checks | Passive discovery, live probing, URL collection, and critical-only Nuclei scanning; skips cloud enumeration, brute force, port scanning, JavaScript analysis, screenshots, pattern hunting, fuzzing, and active confirmation | 5–15 minutes |
-| `normal` | Daily reconnaissance | Adds DNS brute force, cloud checks, port scanning, asset scoring, JavaScript analysis, pattern hunting, screenshots; skips permutations, Arjun, directory fuzzing, and Phase 12 confirmation | 30–60 minutes |
-| `deep` | First-time onboarding or thorough periodic scans | Selects all otherwise supported phases subject to explicit permissions, increases selected limits, and includes permutations, Arjun, directory fuzzing, and active confirmation | 1–4+ hours |
+| Mode | Intended use | Main behavior |
+|---|---|---|
+| `fast` | Frequent or scheduled checks | Passive discovery, live probing, URL collection, and critical-only Nuclei scanning; skips cloud enumeration, brute force, port scanning, JavaScript analysis, screenshots, pattern hunting, fuzzing, and active confirmation |
+| `normal` | Daily reconnaissance | Adds DNS brute force, cloud checks, port scanning, asset scoring, JavaScript analysis, pattern hunting, screenshots; skips permutations, Arjun, directory fuzzing, and Phase 12 confirmation |
+| `deep` | First-time onboarding or thorough periodic scans | Selects all otherwise supported phases subject to explicit permissions, increases selected limits, and includes permutations, Arjun, directory fuzzing, and active confirmation |
 
 Normal mode generates pattern candidates with `-A`; Dalfox and SQLMap can run only with separate explicit `-A -V` permission and installed tools. Normal mode skips Phase 12 confirmation, but that does not disable its permission-gated Phase 9 validators.
 
 Every target-facing Nuclei scan, including takeover, exposure/configuration, and Phase 12 scans, uses the same severity policy: `critical` in fast, `critical,high,medium` in normal, and `critical,high,medium,low` in deep. Category tags remain separate filters and do not override severity. A preset never grants validation permission.
 
-Runtime depends on the number of discovered assets, target responsiveness, network conditions, WAF behavior, tool versions, and configured limits.
+Runtime depends on permissions, the number of discovered assets, target responsiveness, network conditions, WAF behavior, tool versions, and configured limits. Presets do not guarantee a completion time.
 
 ## Workflow
 
@@ -681,7 +681,6 @@ Edit the configuration section near the top of `nullsec.sh` before running large
 Important settings include:
 
 ```bash
-HTTPX_THREADS=30
 FFUF_THREADS=20
 NUCLEI_RATE_LIMIT=50
 NUCLEI_CONCURRENCY=25
@@ -694,6 +693,8 @@ MAX_CORS_HOSTS=100
 MAX_SCORE_HOSTS=200
 MAX_BUCKET_MUTATIONS=200
 ```
+
+HTTP probing uses the concurrency already specified by the existing httpx invocations and tool defaults; there is no separate preset thread control.
 
 Phase 8 through 11 also have wall-clock timeouts, while Dalfox, SQLMap, and ffuf have dedicated execution limits and candidate caps.
 
@@ -734,6 +735,8 @@ export TELEGRAM_CHAT_ID='your-chat-id'
 ```
 
 Never hardcode a real token into a public repository. If a token is exposed, revoke it immediately through BotFather.
+
+Notifications are sent as plain text. Markdown punctuation and literal backslashes in labels, counts, and evidence paths are preserved without interpretation.
 
 Notifications have a 5-second connection timeout and a 10-second total deadline. Curl failures remain nonfatal. Temporary credential configs are removed after completion or failure and by the existing INT/TERM cleanup path.
 

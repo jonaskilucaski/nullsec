@@ -58,7 +58,6 @@ PERM_WORDLIST="$SECLISTS/Discovery/DNS/subdomains-top1million-5000.txt"
 WEB_WORDLIST="$SECLISTS/Discovery/Web-Content/raft-large-directories.txt"
 
 # Thread / concurrency controls
-HTTPX_THREADS=30
 GAU_THREADS=5
 ARJUN_THREADS=10
 FFUF_THREADS=20
@@ -149,7 +148,7 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 # You can override any of them manually after that call if needed.             #
 #==============================================================================#
 
-# Phase enable/disable flags (all true by default; fast mode disables several)
+# Preset capability flags; authorization can disable paths in every mode.
 RUN_DNS_BRUTEFORCE=true       # Phase 1: PureDNS wordlist bruteforce
 RUN_PERMUTATIONS=true         # Phase 1: Gotator permutation generation
 RUN_CLOUD_ENUM=true           # Phase 2.5: Cloud storage bucket enumeration
@@ -408,7 +407,7 @@ print_banner() {
         printf '║%*s%s%*s║\n' "$left" "" "$text" "$right" ""
     }
 
-    echo -e "${CYAN}"
+    printf '%b\n' "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════════════════════╗"
     echo "║                                                                              ║"
     echo "║      ███╗   ██╗ ██╗   ██╗ ██╗      ██╗      ███████╗ ███████╗  ██████╗       ║"
@@ -425,7 +424,7 @@ print_banner() {
     _banner_center "Bug Bounty Hunter & Security Researcher"
     echo "║                                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    printf '%b\n' "${NC}"
     echo ""
 
     unset -f _banner_center
@@ -433,16 +432,16 @@ print_banner() {
 
 print_phase() {
     echo ""
-    echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║${NC} ${YELLOW}$1${NC}"
-    echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════════════════════╝${NC}"
+    printf '%b%s%b\n' "${MAGENTA}" "╔══════════════════════════════════════════════════════════════════════════════╗" "${NC}"
+    printf '%b║%b %b%s%b\n' "$MAGENTA" "$NC" "$YELLOW" "$1" "$NC"
+    printf '%b%s%b\n' "${MAGENTA}" "╚══════════════════════════════════════════════════════════════════════════════╝" "${NC}"
     echo ""
 }
 
-info()    { echo -e "${BLUE}[$(date +%H:%M)][INFO]${NC} $1"; }
-success() { echo -e "${GREEN}[$(date +%H:%M)][SUCCESS]${NC} $1"; }
-warn()    { echo -e "${YELLOW}[$(date +%H:%M)][WARNING]${NC} $1"; }
-error()   { echo -e "${RED}[$(date +%H:%M)][ERROR]${NC} $1"; }
+info()    { printf '%b[%s][INFO]%b %s\n' "$BLUE" "$(date +%H:%M)" "$NC" "$1"; }
+success() { printf '%b[%s][SUCCESS]%b %s\n' "$GREEN" "$(date +%H:%M)" "$NC" "$1"; }
+warn()    { printf '%b[%s][WARNING]%b %s\n' "$YELLOW" "$(date +%H:%M)" "$NC" "$1"; }
+error()   { printf '%b[%s][ERROR]%b %s\n' "$RED" "$(date +%H:%M)" "$NC" "$1"; }
 
 check_command() {
     command -v "$1" &>/dev/null
@@ -503,10 +502,10 @@ count_lines() {
 check_readable_file() {
     local file="$1" label="${2:-$1}"
     if [ -s "$file" ] && [ -r "$file" ]; then
-        echo -e "  ${GREEN}✓${NC} $label"
+        printf '%s%b%s%b%s\n' "  " "${GREEN}" "✓" "${NC}" " $label"
         return 0
     fi
-    echo -e "  ${YELLOW}○${NC} $label (missing, empty, or unreadable — related phase may be skipped/reduced)"
+    printf '%s%b%s%b%s\n' "  " "${YELLOW}" "○" "${NC}" " $label (missing, empty, or unreadable — related phase may be skipped/reduced)"
     return 1
 }
 
@@ -1018,8 +1017,8 @@ polite_sleep() {
 #   notify "☁️ Permission evidence" "3 cloud permission observations; impact not established"
 #   notify "✅ Done" "All 12 phases finished in 42m 17s"
 #
-# Messages are sent in Markdown format.  Asterisks and backticks are safe to
-# use in the severity label and message body.
+# Messages are sent as plain text: caller content, including Markdown
+# punctuation and literal backslashes, is preserved without markup parsing.
 # Parallel phase shells reset the main signal traps. Give the tracked sender
 # its own cleanup too, so terminating a parallel tree removes its credentials.
 _notification_curl() (
@@ -1036,9 +1035,9 @@ notify() {
     [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ] && return 0
     [[ "$TELEGRAM_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ && "$TELEGRAM_CHAT_ID" =~ ^-?[0-9]+$ ]] || return 1
     local label="$1" body="$2" text cfg
-    text=$(printf '*[NullSec]* %s
-`Target:` %s
-`Time:  ` %s
+    text=$(printf '[NullSec] %s
+Target: %s
+Time:   %s
 
 %s' \
         "$label" "$TARGET" "$(date '+%Y-%m-%d %H:%M')" "$body")
@@ -1052,7 +1051,6 @@ notify() {
         --connect-timeout 5 --max-time 10 -s -X POST --config "$cfg" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
         --data-urlencode "text=${text}" \
-        --data-urlencode "parse_mode=Markdown" \
         -o /dev/null || true
     _remove_notification_config "$cfg"
 }
@@ -1816,16 +1814,16 @@ apply_scan_mode() {
     case "$SCAN_MODE" in
 
         # ── FAST ─────────────────────────────────────────────────────────────
-        # Passive subdomain sources only, critical-only Nuclei, no heavy active
-        # steps. Good for hourly scheduled runs. Typical runtime: 5–15 min.
+        # Lightweight preset: critical-only Nuclei and fewer optional phases.
+        # Target-facing operations still require explicit permissions.
         fast)
             info "Scan mode: FAST — passive sources, critical vulns, no bruteforce/fuzzing"
 
-            # Phase 1 — passive only; skip bruteforce and permutations
+            # Phase 1 — skip bruteforce and permutations; enumeration needs -A
             RUN_DNS_BRUTEFORCE=false
             RUN_PERMUTATIONS=false
 
-            # Phase 2.5 — skip cloud enum (passive only in fast mode)
+            # Phase 2.5 — skip cloud probes in the fast preset
             RUN_CLOUD_ENUM=false
 
             # Phase 4 — skip port scan
@@ -1840,7 +1838,7 @@ apply_scan_mode() {
             # Asset scoring — skip (not enough data in fast mode)
             RUN_ASSET_SCORING=false
 
-            # Phase 9 — skip pattern hunting (no URLs from crawl anyway)
+            # Phase 9 — skip pattern hunting in the fast preset
             RUN_PATTERN_HUNTING=false
 
             # Phase 10 — skip screenshots
@@ -1849,7 +1847,7 @@ apply_scan_mode() {
             # Phase 11 — skip directory fuzzing
             RUN_FUZZING=false
 
-            # Phase 3 vhost discovery — skip (requires ffuf; fast mode avoids active steps)
+            # Phase 3 vhost discovery — skip; host-only policy also disables this path
             RUN_VHOST_DISCOVERY=false
 
             # Phase 12 — skip active confirmation
@@ -1865,7 +1863,6 @@ apply_scan_mode() {
             AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-300}"
 
             # Concurrency — lower threads since we're running more often
-            HTTPX_THREADS=15
             NUCLEI_RATE_LIMIT=30
             NUCLEI_CONCURRENCY=15  # well below MHE default (30); fast mode is gentle
 
@@ -1891,39 +1888,35 @@ apply_scan_mode() {
         # ── NORMAL ───────────────────────────────────────────────────────────
         # Adds DNS bruteforce, full crawling, JS analysis, and pattern hunting.
         # Dalfox/SQLMap still require -A -V; skips fuzzing and Phase 12.
-        # Typical runtime: 30–60 min.
+        # Runtime depends on assets, tool behavior, limits, and permissions.
         normal)
             info "Scan mode: NORMAL — discovery + JS + patterns; validators require -A -V; skips fuzzing/Phase 12"
 
             RUN_DNS_BRUTEFORCE=true
             RUN_PERMUTATIONS=false      # permutations are expensive; deep only
-            RUN_CLOUD_ENUM=true         # cloud enum runs in normal + deep
+            RUN_CLOUD_ENUM=true         # exact-resource cloud probes require -A and -C
             RUN_PORT_SCAN=true
             RUN_PARAM_DISCOVERY=false   # Arjun is slow; skip for daily cadence
             RUN_ASSET_SCORING=true      # Score & rank targets for focused effort
             RUN_JS_ANALYSIS=true
             RUN_PATTERN_HUNTING=true
             RUN_SCREENSHOTS=true
-            RUN_VHOST_DISCOVERY=true    # vhost discovery enabled in normal + deep
+            RUN_VHOST_DISCOVERY=true    # authorization policy disables direct-IP vhosts
             RUN_FUZZING=false           # ffuf recursive fuzzing; deep only
             RUN_ACTIVE_VULNS=false      # Phase 12 only; Phase 9 validators require -A -V
 
             NUCLEI_SEVERITY="critical,high,medium"
             KATANA_DEPTH=2
             AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-900}"
-
-            HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
             NUCLEI_CONCURRENCY=25  # balanced; stays under MHE default (30)
 
             # Phase 9 timing — normal supports validators with -A -V; skips Phase 11.
             # Caps bound DISTINCT INJECTION POINTS (post-dedup), so these are much
             # smaller than the old raw-URL caps and each unit is genuine testing.
-            # The timeout is a SAFETY NET for true hangs, not a per-run guillotine:
-            # 100 distinct points × dalfox's internal payload set at 100 ms,
-            # parallelised across DALFOX_WORKERS, completes well inside 30 min on a
-            # responsive target. If it hits the ceiling, that signals throttling
-            # (a WAF tarpit), not insufficient budget — raising it would not help.
+            # The timeout bounds each invocation. Candidate count, payloads,
+            # target responsiveness, and tool behavior determine runtime;
+            # reaching the ceiling does not establish a particular cause.
             DALFOX_DELAY=100
             DALFOX_TIMEOUT=1800         # 30 min safety net
             DALFOX_WORKERS=10
@@ -1938,11 +1931,11 @@ apply_scan_mode() {
             ;;
 
         # ── DEEP ─────────────────────────────────────────────────────────────
-        # Full 12-phase pipeline — everything enabled, no caps reduced.
-        # Good for weekly runs or first-time target onboarding.
-        # Typical runtime: 1–4+ hours depending on target size.
+        # Broadest capability preset with higher selected limits.
+        # Explicit permissions and available tools still govern execution;
+        # direct-IP virtual-host discovery remains disabled.
         deep)
-            info "Scan mode: DEEP — full 12-phase pipeline, all phases enabled"
+            info "Scan mode: DEEP — broadest preset, subject to explicit permissions and available tools"
 
             RUN_DNS_BRUTEFORCE=true
             RUN_PERMUTATIONS=true
@@ -1960,8 +1953,6 @@ apply_scan_mode() {
             NUCLEI_SEVERITY="critical,high,medium,low"
             KATANA_DEPTH=3
             AMASS_TIMEOUT="${NULLSEC_AMASS_TIMEOUT:-1800}"
-
-            HTTPX_THREADS=30
             NUCLEI_RATE_LIMIT=50
             NUCLEI_CONCURRENCY=25  # deep scans hit larger host sets; keep under MHE (30)
             MAX_JS_FILES=100
@@ -1976,8 +1967,8 @@ apply_scan_mode() {
             # large real attack surface — far more meaningful than the old
             # raw-URL cap of 1000, which after dedup almost never bit.  Lower
             # worker count keeps deep scans gentle on the target (politeness >
-            # speed for a thorough weekly run).  60 min is a ceiling for genuine
-            # hangs; a responsive target finishes 300 points well under it.
+            # speed for a thorough weekly run). The timeout bounds each
+            # invocation; it does not guarantee completion within that budget.
             DALFOX_DELAY=200
             DALFOX_TIMEOUT=3600         # 60 min safety net
             DALFOX_WORKERS=6            # gentle concurrency for a polite deep scan
@@ -2027,7 +2018,8 @@ check_tools() {
         required_tools+=("ffuf")
     fi
 
-    # Optional tools — script skips relevant steps if missing
+    # Optional-tool detection is retained for preflight compatibility.
+    # qsreplace and s3scanner are never launched; cloud_enum is intentionally unused.
     local optional_tools=("gotator" "gowitness" "dalfox" "sqlmap" "gf"
         "anew" "qsreplace" "hakrawler" "cariddi" "dig"
         "cloud_enum" "s3scanner" "trufflehog")
@@ -2042,16 +2034,16 @@ check_tools() {
         fi
     done
 
-    echo -e "${CYAN}--- Required Tools for mode: $SCAN_MODE ---${NC}"
+    printf '%b%s%b\n' "${CYAN}" "--- Required Tools for mode: $SCAN_MODE ---" "${NC}"
 
     # Amass compatibility: prefer the side-by-side v4 binary for colored
     # FQDN/IP/DNS relationship output, while retaining the maintained binary as
     # a fallback so the framework remains portable.
     if authorization_allowed enumeration; then
     if select_amass; then
-        echo -e "  ${GREEN}✓${NC} $SELECTED_AMASS_BIN ($SELECTED_AMASS_VERSION; $SELECTED_AMASS_KIND)"
+        printf '%s%b%s%b%s\n' "  " "${GREEN}" "✓" "${NC}" " $SELECTED_AMASS_BIN ($SELECTED_AMASS_VERSION; $SELECTED_AMASS_KIND)"
     else
-        echo -e "  ${RED}✗${NC} $AMASS_V4_BIN or amass"
+        printf '%s%b%s%b%s\n' "  " "${RED}" "✗" "${NC}" " $AMASS_V4_BIN or amass"
         missing_required+=("$AMASS_V4_BIN|amass")
     fi
 
@@ -2060,49 +2052,50 @@ check_tools() {
     fi
     for tool in "${unique_required[@]}"; do
         if check_command "$tool"; then
-            echo -e "  ${GREEN}✓${NC} $tool"
+            printf '%s%b%s%b%s\n' "  " "${GREEN}" "✓" "${NC}" " $tool"
         else
-            echo -e "  ${RED}✗${NC} $tool"
+            printf '%s%b%s%b%s\n' "  " "${RED}" "✗" "${NC}" " $tool"
             missing_required+=("$tool")
         fi
     done
 
     echo ""
-    echo -e "${CYAN}--- Optional Tools (enhance results) ---${NC}"
+    printf '%b%s%b\n' "${CYAN}" "--- Optional Tools (availability; includes unused tools) ---" "${NC}"
+    printf '%s\n' "  qsreplace, s3scanner, cloud_enum: detected only; unused by current execution."
     for tool in "${optional_tools[@]}"; do
         if check_command "$tool"; then
-            echo -e "  ${GREEN}✓${NC} $tool"
+            printf '%s%b%s%b%s\n' "  " "${GREEN}" "✓" "${NC}" " $tool"
         else
-            echo -e "  ${YELLOW}○${NC} $tool (not installed — related checks will be skipped/reduced)"
+            printf '%s%b%s%b%s\n' "  " "${YELLOW}" "○" "${NC}" " $tool (not installed — checks using this tool may be skipped/reduced)"
         fi
     done
 
     echo ""
-    echo -e "${CYAN}--- Wordlists / Data Files ---${NC}"
+    printf '%b%s%b\n' "${CYAN}" "--- Wordlists / Data Files ---" "${NC}"
     if [ "$RUN_DNS_BRUTEFORCE" = true ]; then
         check_readable_file "$DNS_WORDLIST" "$DNS_WORDLIST" || true
         check_readable_file "$RESOLVERS" "$RESOLVERS" || true
     else
-        echo -e "  ${YELLOW}○${NC} DNS brute-force wordlists not required in $SCAN_MODE mode"
+        printf '%s%b%s%b%s\n' "  " "${YELLOW}" "○" "${NC}" " DNS brute-force wordlists not required in $SCAN_MODE mode"
     fi
     if [ "$RUN_PERMUTATIONS" = true ]; then
         check_readable_file "$PERM_WORDLIST" "$PERM_WORDLIST" || true
     else
-        echo -e "  ${YELLOW}○${NC} permutation wordlist not required in $SCAN_MODE mode"
+        printf '%s%b%s%b%s\n' "  " "${YELLOW}" "○" "${NC}" " permutation wordlist not required in $SCAN_MODE mode"
     fi
     if [ "$RUN_FUZZING" = true ]; then
         check_readable_file "$WEB_WORDLIST" "$WEB_WORDLIST" || true
         check_readable_file "$SECLISTS/Discovery/Web-Content/raft-large-files.txt" "$SECLISTS/Discovery/Web-Content/raft-large-files.txt" || true
     else
-        echo -e "  ${YELLOW}○${NC} web-content fuzzing wordlists not required in $SCAN_MODE mode"
+        printf '%s%b%s%b%s\n' "  " "${YELLOW}" "○" "${NC}" " web-content fuzzing wordlists not required in $SCAN_MODE mode"
     fi
 
     echo ""
-    echo -e "${CYAN}--- Nuclei Templates ---${NC}"
+    printf '%b%s%b\n' "${CYAN}" "--- Nuclei Templates ---" "${NC}"
     if [ -d "$NUCLEI_TEMPLATES" ]; then
-        echo -e "  ${GREEN}✓${NC} $NUCLEI_TEMPLATES"
+        printf '%s%b%s%b%s\n' "  " "${GREEN}" "✓" "${NC}" " $NUCLEI_TEMPLATES"
     else
-        echo -e "  ${YELLOW}○${NC} not found — run 'nuclei -ut' or set:"
+        printf '%s%b%s%b%s\n' "  " "${YELLOW}" "○" "${NC}" " not found — run 'nuclei -ut' or set:"
         echo '    export NUCLEI_TEMPLATES="$HOME/.local/nuclei-templates"'
     fi
 
@@ -2182,15 +2175,15 @@ usage() {
     echo ""
     echo "  fast    Lightweight preset: probing, URLs, critical Nuclei; no bruteforce/fuzzing"
     echo "          Skips: DNS bruteforce, port scan, JS analysis, fuzzing, active confirm"
-    echo "          Runtime: ~5-15 min  |  Good for: hourly scheduled runs"
+    echo "          Runtime varies with assets, permissions, tools, and configured limits."
     echo ""
     echo "  normal  Discovery + JS analysis + pattern hunting"
     echo "          Dalfox/SQLMap require -A -V; skips permutations, Arjun, fuzzing, Phase 12"
-    echo "          Runtime: ~30-60 min  |  Good for: daily scheduled runs"
+    echo "          Runtime varies with assets, permissions, tools, and configured limits."
     echo ""
     echo "  deep    Broadest preset: supported phases and higher limits, subject to permissions"
     echo "          Selecting deep does not authorize active operations or cloud resources."
-    echo "          Runtime: 1-4+ hours  |  Good for: weekly runs, new target onboarding"
+    echo "          Runtime varies with assets, permissions, tools, and configured limits."
     echo ""
     echo "Examples:"
     echo "  $0 -d example.com"
