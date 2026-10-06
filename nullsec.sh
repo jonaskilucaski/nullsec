@@ -956,7 +956,7 @@ polite_sleep() {
 #
 # Usage: notify "<severity_label>" "<message body>"
 # Examples:
-#   notify "🔥 CRITICAL" "3 writable S3 buckets found"
+#   notify "☁️ Permission evidence" "3 cloud permission observations; impact not established"
 #   notify "✅ Done" "All 12 phases finished in 42m 17s"
 #
 # Messages are sent in Markdown format.  Asterisks and backticks are safe to
@@ -2562,21 +2562,105 @@ phase2_validation() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Offline evidence classifiers. No ACL/policy/IAM observation proves a write.
+# Slurping requires exactly one JSON value: jq -e alone accepts an empty stream.
+_cloud_s3_acl_evidence() {
+    awk '
+        BEGIN { RS="</Grant>" }
+        /acs\.amazonaws\.com\/groups\/global\/AllUsers/ {
+            if (/<Permission>WRITE_ACP<\/Permission>/) print "WRITE_ACP"
+            if (/<Permission>WRITE<\/Permission>/) print "WRITE"
+            if (/<Permission>FULL_CONTROL<\/Permission>/) print "FULL_CONTROL"
+        }
+    '
+}
+
+_cloud_s3_policy_evidence() {
+    jq -ecs --arg bucket "$1" --arg url "$2" '
+        def strings: if type == "array" then . else [.] end;
+        def string_list: strings | length > 0 and all(.[]; type == "string" and length > 0);
+        def public_principal:
+            . == "*" or (type == "object" and
+                (.AWS? | . == "*" or (type == "array" and index("*") != null)));
+        def supported_principal:
+            . == "*" or (type == "object" and keys == ["AWS"] and (.AWS | string_list));
+        def unconditional: (has("Condition") | not) or .Condition == {};
+        def supported:
+            type == "object" and (.Effect | IN("Allow", "Deny")) and
+            (.Principal | supported_principal) and (.Action | string_list) and (.Resource | string_list) and
+            ((has("Condition") | not) or (.Condition | type == "object")) and
+            (has("NotPrincipal") or has("NotAction") or has("NotResource") | not) and
+            (.Action | strings | all(.[]; ascii_downcase |
+                IN("s3:putobject", "s3:putobjectacl", "s3:putbucketacl", "s3:putbucketpolicy", "s3:*", "*")));
+        def object_resource:
+            type == "string" and (startswith("arn:aws:s3:::" + $bucket + "/")) and
+            length > ("arn:aws:s3:::" + $bucket + "/" | length) and
+            (contains("${") | not);
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("Invalid policy JSON") end |
+        .Statement | if type == "object" then [.] else . end |
+        if type == "array" and length > 0 and all(.[]; type == "object") then .
+        else error("Invalid policy statements") end |
+        # Any Deny or unsupported statement suppresses positive conclusions.
+        # This deliberately under-classifies policies needing a full IAM evaluator.
+        (all(.[]; supported) and all(.[]; .Effect == "Allow")) as $simple |
+        {url:$url, phase:"2.5", source:"anonymous policy response", class:"policy-observed",
+         statements:length, positive_conclusions_suppressed:($simple | not), impact:"not established"},
+        (to_entries[] | .key as $index | .value as $s |
+            ($s.Action | strings[] | select(type == "string") | ascii_downcase) as $action |
+            select($action | IN("s3:putobject", "s3:putobjectacl", "s3:putbucketacl", "s3:putbucketpolicy", "s3:*", "*")) |
+            ($action | IN("s3:putobject", "s3:*", "*")) as $object_action |
+            ([$s.Resource | strings[] | select(object_resource)] | length > 0) as $relevant |
+            ($s.Principal | public_principal) as $public |
+            ($s | unconditional) as $unconditional |
+            {url:$url, phase:"2.5", source:"anonymous policy response", statement:$index,
+             action:$action, effect:($s.Effect | if IN("Allow","Deny") then . else "unknown" end),
+             public_principal:$public, object_resource_applicable:$relevant,
+             conditional:($unconditional | not),
+             class:(if $object_action then "policy-putobject-observed" else "policy-administration-observed" end),
+             permission:(if $action == "s3:*" or $action == "*" then "object-creation-and-administration"
+                         elif $object_action then "object-creation" else "administration" end),
+             conclusion:(if $object_action and $simple and $relevant and $public and $unconditional
+                         then "potential-anonymous-object-write-policy"
+                         else "effective-authorization-not-established" end),
+             impact:"not established"})
+    ' 2>/dev/null
+}
+
+_cloud_gcs_listing_observed() {
+    jq -es '
+        length == 1 and (.[0] | type == "object" and .kind == "storage#objects" and
+            (has("error") | not) and
+            ((has("items") | not) or (.items | type == "array" and all(.[]; type == "object"))))
+    ' >/dev/null 2>&1
+}
+
+_cloud_gcs_iam_evidence() {
+    jq -ecs --arg url "$1" '
+        if length == 1 and (.[0] | type == "object" and (.bindings | type == "array") and
+            all(.bindings[]; type == "object" and
+                (.role | type == "string" and test("^(roles/[A-Za-z0-9._]+|projects/[A-Za-z0-9._-]+/roles/[A-Za-z0-9._]+|organizations/[0-9]+/roles/[A-Za-z0-9._]+)$")) and
+                (.members | type == "array" and all(.[]; type == "string")) and
+                ((has("condition") | not) or (.condition | type == "object"))))
+        then .[0] else error("Invalid IAM bindings") end |
+        .bindings[] | . as $binding |
+        .members[] | select(. == "allUsers" or . == "allAuthenticatedUsers") |
+        ($binding.role | IN("roles/storage.objectCreator", "roles/storage.objectAdmin",
+                           "roles/storage.legacyBucketWriter", "roles/storage.admin")) as $write_like |
+        {url:$url, phase:"2.5", source:"anonymous IAM response", class:"public-iam-binding-observed",
+         member:., role:$binding.role, conditional:($binding | has("condition")),
+         permission:(if $binding.role == "roles/storage.objectCreator" then "object-creation"
+                     elif $write_like then "object-creation-and-administration" else "other" end),
+         potential_anonymous_permission:($write_like and . == "allUsers" and ($binding | has("condition") | not)),
+         impact:"not established"}
+    ' 2>/dev/null
+}
+
 # PHASE 2.5: Cloud Storage Enumeration
-# Tests AWS S3, Google Cloud Storage, and Azure Blob Storage for:
-#   - Publicly readable buckets (information disclosure)
-#   - Publicly writable buckets (critical — arbitrary file upload)
-#   - Bucket existence (even non-public buckets confirm infrastructure)
-#
-# Name generation strategy:
-#   Takes the base target (e.g. "acme.com" → "acme") and all discovered
-#   subdomains, then generates permutations with common cloud naming patterns
-#   (acme-backup, acme-dev, acme-assets, acme-prod, etc.)
-#
-# Output feeds into:
-#   - Phase 5: exposed bucket URLs added to all-urls.txt
-#   - Phase 7: exposed buckets added to Nuclei target list
-#   - Report:  dedicated cloud findings section
+# Records provider existence, anonymous endpoint read/listing, and observed
+# ACL/policy/IAM permissions. No write/upload is attempted; impact and effective
+# authorization are not established. Only exact-approved references are probed.
+# Provider URLs remain report evidence and do not feed generic scanning phases.
 # ─────────────────────────────────────────────────────────────────────────────
 phase2_5_cloud_enum() {
     validate_output_tree || return 1
@@ -2751,14 +2835,19 @@ phase2_5_cloud_enum() {
     local az_readable="$cdir/azure/readable.txt"
     local az_cdn_refs="$cdir/azure/cdn-references.txt"
     local cloud_enum_open="$cdir/exposed/cloud_enum-open.txt"
+    local s3_acl_evidence="$cdir/s3/acl-evidence.txt"
+    local s3_policy_evidence="$cdir/s3/policy-evidence.jsonl"
+    local gcs_iam_evidence="$cdir/gcs/iam-evidence.jsonl"
+    # Legacy writable paths contain potential permissions only, never write proof.
     : > "$s3_exists"; : > "$s3_readable"; : > "$s3_writable"
     : > "$gcs_exists"; : > "$gcs_readable"; : > "$gcs_writable"; : > "$gcs_unverified"
     : > "$az_exists"; : > "$az_readable"; : > "$az_cdn_refs"; : > "$cloud_enum_open"
+    : > "$s3_acl_evidence"; : > "$s3_policy_evidence"; : > "$gcs_iam_evidence"
 
     if [ "$s3_verified_count" -gt 0 ]; then
         info "Testing explicitly approved, referenced AWS S3 buckets..."
         _check_s3_bucket() {
-            local name="$1" exists_file="$2" readable_file="$3" writable_file="$4"
+            local name="$1" exists_file="$2" readable_file="$3" writable_file="$4" acl_file="$5" policy_file="$6"
             cloud_resource_allowed "s3:$name" || return 0
             local url="https://${name}.s3.amazonaws.com" rc acl_resp policy_resp
             rc=$(authorized_cloud_curl "s3:$name" -sS --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || printf '000')
@@ -2770,38 +2859,37 @@ phase2_5_cloud_enum() {
 
             # ACL and policy checks are independent of anonymous object listing.
             acl_resp=$(authorized_cloud_curl "s3:$name" -sS --max-time 5 "${url}?acl" 2>/dev/null || true)
-            if printf '%s' "$acl_resp" | awk '
-                BEGIN { RS="</Grant>"; found=0 }
-                /acs\.amazonaws\.com\/groups\/global\/AllUsers/ \
-                    && /<Permission>(WRITE|WRITE_ACP|FULL_CONTROL)<\/Permission>/ { found=1 }
-                END { exit(found ? 0 : 1) }
-            '; then
-                printf '%s\n' "$url" >> "$writable_file"
+            local acl_permissions permission evidence_class policy_evidence evidence_record
+            acl_permissions=$(printf '%s' "$acl_resp" | _cloud_s3_acl_evidence)
+            if [ -n "$acl_permissions" ]; then
+                while IFS= read -r permission; do
+                    evidence_class=acl-administration-observed
+                    if [ "$permission" = WRITE ] || [ "$permission" = FULL_CONTROL ]; then
+                        evidence_class=object-write-like-acl-observed
+                        printf '%s\n' "$url" >> "$writable_file"
+                    fi
+                    printf '%s | principal=AllUsers | permission=%s | class=%s | method=GET | phase=2.5 | source=anonymous ACL response | impact not established\n' \
+                        "$url" "$permission" "$evidence_class" >> "$acl_file"
+                done <<< "$acl_permissions"
+                # Preserve the existing ACL early return and request count.
                 return 0
             fi
 
             policy_resp=$(authorized_cloud_curl "s3:$name" -sS --max-time 5 "${url}?policy" 2>/dev/null || true)
-            if command -v jq >/dev/null 2>&1 && printf '%s' "$policy_resp" | jq -e '
-                def public_principal:
-                    . == "*"
-                    or (type == "object" and (
-                        (.AWS? == "*")
-                        or ((.AWS? | type) == "array" and ((.AWS | index("*")) != null))
-                    ));
-                .Statement[]?
-                | select(.Effect == "Allow")
-                | select(.Principal | public_principal)
-                | select((.Condition? // {}) | length == 0)
-                | (.Action | if type == "array" then .[] else . end)
-                | select(. == "s3:*" or . == "s3:PutObject" or . == "s3:PutObjectAcl")
-            ' >/dev/null 2>&1; then
-                printf '%s\n' "$url" >> "$writable_file"
+            if command -v jq >/dev/null 2>&1 \
+               && policy_evidence=$(printf '%s' "$policy_resp" | _cloud_s3_policy_evidence "$name" "$url"); then
+                while IFS= read -r evidence_record; do
+                    printf '%s\n' "$evidence_record" >> "$policy_file"
+                done <<< "$policy_evidence"
+                if printf '%s' "$policy_evidence" | jq -es 'any(.[]; .conclusion == "potential-anonymous-object-write-policy")' >/dev/null 2>&1; then
+                    printf '%s\n' "$url" >> "$writable_file"
+                fi
             fi
         }
-        export -f _check_s3_bucket
+        export -f _check_s3_bucket _cloud_s3_acl_evidence _cloud_s3_policy_evidence
         xargs -r -P "$CLOUD_ENUM_THREADS" -I {} \
             bash -c 'set -uo pipefail; _check_s3_bucket "$@"' _ {} \
-            "$s3_exists" "$s3_readable" "$s3_writable" \
+            "$s3_exists" "$s3_readable" "$s3_writable" "$s3_acl_evidence" "$s3_policy_evidence" \
             < "$s3_candidates" 2>/dev/null
         unset -f _check_s3_bucket
     fi
@@ -2809,7 +2897,7 @@ phase2_5_cloud_enum() {
     if [ "$gcs_verified_count" -gt 0 ]; then
         info "Testing explicitly approved, referenced Google Cloud Storage buckets..."
         _check_gcs_bucket() {
-            local name="$1" exists_file="$2" readable_file="$3" writable_file="$4"
+            local name="$1" exists_file="$2" readable_file="$3" writable_file="$4" iam_file="$5"
             cloud_resource_allowed "gcs:$name" || return 0
             local url="https://storage.googleapis.com/${name}" meta_rc list_resp iam_resp
             meta_rc=$(authorized_cloud_curl "gcs:$name" -sS --max-time 8 -o /dev/null -w '%{http_code}' \
@@ -2822,30 +2910,28 @@ phase2_5_cloud_enum() {
             list_resp=$(authorized_cloud_curl "gcs:$name" -sS --max-time 8 \
                 "https://storage.googleapis.com/storage/v1/b/${name}/o?maxResults=10" 2>/dev/null || true)
             if command -v jq >/dev/null 2>&1 \
-               && printf '%s' "$list_resp" | jq -e 'select(.kind == "storage#objects" and (.error? | not))' >/dev/null 2>&1; then
+               && printf '%s' "$list_resp" | _cloud_gcs_listing_observed; then
                 printf '%s\n' "$url" >> "$readable_file"
             fi
 
-            # Evaluate public write IAM even when object listing is denied.
+            # Record public IAM bindings independently of anonymous listing.
             iam_resp=$(authorized_cloud_curl "gcs:$name" -sS --max-time 5 \
                 "https://storage.googleapis.com/storage/v1/b/${name}/iam" 2>/dev/null || true)
-            if command -v jq >/dev/null 2>&1 && printf '%s' "$iam_resp" | jq -e '
-                .bindings[]?
-                | select((.condition? // null) == null)
-                | select(.role == "roles/storage.objectCreator"
-                      or .role == "roles/storage.objectAdmin"
-                      or .role == "roles/storage.legacyBucketWriter"
-                      or .role == "roles/storage.admin")
-                | .members[]?
-                | select(. == "allUsers")
-            ' >/dev/null 2>&1; then
-                printf '%s\n' "$url" >> "$writable_file"
+            local iam_evidence evidence_record
+            if command -v jq >/dev/null 2>&1 \
+               && iam_evidence=$(printf '%s' "$iam_resp" | _cloud_gcs_iam_evidence "$url"); then
+                while IFS= read -r evidence_record; do
+                    printf '%s\n' "$evidence_record" >> "$iam_file"
+                done <<< "$iam_evidence"
+                if printf '%s' "$iam_evidence" | jq -es 'any(.[]; .potential_anonymous_permission == true)' >/dev/null 2>&1; then
+                    printf '%s\n' "$url" >> "$writable_file"
+                fi
             fi
         }
-        export -f _check_gcs_bucket
+        export -f _check_gcs_bucket _cloud_gcs_listing_observed _cloud_gcs_iam_evidence
         xargs -r -P "$CLOUD_ENUM_THREADS" -I {} \
             bash -c 'set -uo pipefail; _check_gcs_bucket "$@"' _ {} \
-            "$gcs_exists" "$gcs_readable" "$gcs_writable" \
+            "$gcs_exists" "$gcs_readable" "$gcs_writable" "$gcs_iam_evidence" \
             < "$gcs_candidates" 2>/dev/null
         unset -f _check_gcs_bucket
     fi
@@ -2890,30 +2976,33 @@ phase2_5_cloud_enum() {
     sort -u -o "$s3_exists" "$s3_exists"; sort -u -o "$s3_readable" "$s3_readable"; sort -u -o "$s3_writable" "$s3_writable"
     sort -u -o "$gcs_exists" "$gcs_exists"; sort -u -o "$gcs_readable" "$gcs_readable"; sort -u -o "$gcs_writable" "$gcs_writable"
     sort -u -o "$az_exists" "$az_exists"; sort -u -o "$az_readable" "$az_readable"
+    sort -u -o "$s3_acl_evidence" "$s3_acl_evidence"
+    sort -u -o "$s3_policy_evidence" "$s3_policy_evidence"
+    sort -u -o "$gcs_iam_evidence" "$gcs_iam_evidence"
 
     local exposed_file="$cdir/exposed/all-exposed-buckets.txt"
-    local critical_file="$cdir/exposed/critical-writable.txt"
+    local permission_file="$cdir/exposed/critical-writable.txt"
     cat "$s3_readable" "$gcs_readable" "$az_readable" 2>/dev/null | sort -u > "$exposed_file"
-    cat "$s3_writable" "$gcs_writable" 2>/dev/null | sort -u > "$critical_file"
+    cat "$s3_writable" "$gcs_writable" 2>/dev/null | sort -u > "$permission_file"
 
     # Provider endpoints are outside TARGET's hostname boundary. Keep them in the
     # cloud report but do not feed them into generic URL scanning phases.
     : > "$cdir/exposed/cloud-urls-for-phase5.txt"
 
-    local total_exposed total_writable
+    local total_exposed total_permissions
     total_exposed=$(count_lines "$exposed_file")
-    total_writable=$(count_lines "$critical_file")
-    if [ "$total_writable" -gt 0 ]; then
-        error "🚨 CRITICAL: $total_writable publicly writable bucket(s) found → $critical_file"
-        notify "🚨 CRITICAL — Writable Buckets" \
-            "*${total_writable}* publicly writable cloud bucket(s) found.\nReview: \`${critical_file}\`"
+    total_permissions=$(count_lines "$permission_file")
+    if [ "$total_permissions" -gt 0 ]; then
+        warn "☁️ $total_permissions potential cloud permission exposure(s); impact not established → $permission_file"
+        notify "☁️ Potential Cloud Permission Exposure" \
+            "*${total_permissions}* bucket(s) with observed ACL/policy/IAM permission evidence; impact not established. No write attempted.\nReview: \`${permission_file}\`"
     fi
     if [ "$total_exposed" -gt 0 ]; then
-        warn "☁️  $total_exposed publicly readable bucket(s) found → $exposed_file"
-        notify "☁️ Cloud Storage Exposed" \
-            "*${total_exposed}* publicly readable bucket(s) found.\nSee: \`${exposed_file}\`"
+        warn "☁️  $total_exposed anonymous cloud listing/read observation(s); impact not established → $exposed_file"
+        notify "☁️ Anonymous Cloud Listing/Read Observed" \
+            "*${total_exposed}* anonymous listing/read observation(s); content sensitivity and impact not established.\nSee: \`${exposed_file}\`"
     else
-        success "No ownership-corroborated public cloud storage exposure found."
+        info "No anonymous cloud listing/read observed; inspect separate permission evidence."
     fi
 
     rm -f "$token_file" "$candidates_file" "$s3_candidates" "$gcs_candidates" "$azure_candidates"
@@ -4302,6 +4391,46 @@ phase8_javascript_analysis() {
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 9: Vulnerability Pattern Hunting
 # ─────────────────────────────────────────────────────────────────────────────
+# Classify only the final HEAD response header block. Duplicate/malformed ACAO
+# cannot prove reflection; duplicate ACAC cannot prove credential support.
+_cors_header_lead() {
+    awk -v target="$1" '
+        function trim(value) { sub(/^[ \t]+/, "", value); sub(/[ \t]+$/, "", value); return value }
+        /^HTTP\/[0-9.]+ [1-5][0-9][0-9]([ \t]|\r|$)/ {
+            status=$2; sub(/\r$/, "", status)
+            acao=""; acac=""; origins=0; credentials=0; malformed=0; in_headers=1
+            previous=""; next
+        }
+        {
+            sub(/\r$/, "")
+            if ($0 == "") { in_headers=0; next }
+            if (!in_headers) next
+            if (/^[ \t]/) {
+                if (previous == "access-control-allow-origin") malformed=1
+                if (previous == "access-control-allow-credentials") credentials++
+                next
+            }
+            colon=index($0, ":"); if (!colon) { malformed=1; next }
+            name=tolower(substr($0, 1, colon-1)); value=trim(substr($0, colon+1)); previous=name
+            if (name == "access-control-allow-origin") { origins++; acao=value }
+            if (name == "access-control-allow-credentials") {
+                credentials++; acac=(credentials == 1 ? value : acac "; " value)
+            }
+            if (name ~ /^access-control-allow-(origin|credentials)[ \t]+$/) malformed=1
+        }
+        END {
+            if (malformed || origins != 1 || tolower(acao) != "https://evil.nullsec.com") exit
+            label="CORS-LEAD-REFLECTION"
+            if (credentials == 1 && acac == "true") label="CORS-LEAD-CREDENTIALS"
+            if (credentials == 0) acac="[absent]"
+            if (credentials > 1) acac="[ambiguous duplicate headers] " acac
+            # Retain only header evidence, never response bodies or cookies.
+            gsub(/[[:cntrl:]|]/, "?", acac)
+            printf "[%s] %s | ACAO=%s | ACAC=%s | method=HEAD | status=%s | phase=9 | source=anonymous supplied-origin header observation | impact not established\n", label, target, acao, acac, status
+        }
+    '
+}
+
 phase9_pattern_hunting() {
     validate_output_tree || return 1
     authorization_allowed enumeration || { info "phase9_pattern_hunting: skipped by authorization policy"; _skip_phase; return 0; }
@@ -4493,10 +4622,9 @@ phase9_pattern_hunting() {
     fi
     success "IDOR candidates: $(count_lines "$p9dir/idor-candidates.txt")"
 
-    # 9.7 CORS misconfiguration testing (improved over v1)
-    # v1 only checked for evil.nullsec.com in ACAO, missed the critical ACAC: true + ACAO: * case
-    # Distinguishes CORS-CRITICAL (reflected origin) from CORS-HIGH (* + credentials)
-    info "Testing CORS misconfigurations (up to $MAX_CORS_HOSTS hosts)..."
+    # 9.7 Anonymous HEAD observations establish header behavior only.
+    # They cannot establish authenticated sensitive-data access or severity.
+    info "Observing CORS headers (up to $MAX_CORS_HOSTS hosts; impact not established)..."
     local cors_count=0
     local cors_failures=0
     # BUG-7 FIX: Track a sliding window of the last N attempts so the throttle
@@ -4510,7 +4638,7 @@ phase9_pattern_hunting() {
     local cors_window_size=20
     if authorization_allowed validation && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $cors_count -lt $MAX_CORS_HOSTS ]; do
-            local headers acao acac
+            local headers
             headers=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
                 -H 'Origin: https://evil.nullsec.com' \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
@@ -4544,42 +4672,16 @@ phase9_pattern_hunting() {
                 continue
             fi
 
-            acao=$(echo "$headers" | grep -i 'access-control-allow-origin' | tr -d '\r')
-            acac=$(echo "$headers" | grep -i 'access-control-allow-credentials' | tr -d '\r')
-
-            # BUG-6 FIX: $acao contains the full header line
-            # "Access-Control-Allow-Origin: null", so a regex anchored with
-            # ^null$ can never match.  Extract just the header VALUE (after
-            # the colon, whitespace-trimmed) for the null-origin and
-            # wildcard-with-credentials tests below.  The reflected-origin
-            # case still works on the full line because "evil.nullsec.com"
-            # appears as a substring either way.
-            local acao_value acac_value
-            acao_value=$(echo "$acao" | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]+$//')
-            acac_value=$(echo "$acac" | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]+$//')
-
-            local acao_lower acac_lower
-            acao_lower=$(printf '%s' "$acao_value" | tr '[:upper:]' '[:lower:]')
-            acac_lower=$(printf '%s' "$acac_value" | tr '[:upper:]' '[:lower:]')
-
-            # Only report an origin that exactly reflects the Origin sent in this
-            # request. ACAO:null was not tested with Origin:null, and ACAO:* with
-            # credentials is rejected by browsers, so neither is exploitable here.
-            if [ "$acao_lower" = "https://evil.nullsec.com" ]; then
-                if [ "$acac_lower" = "true" ]; then
-                    echo "[CORS-CRITICAL] $url | exact origin reflection + credentials | $acao | $acac" >> "$p9dir/cors-findings.txt"
-                else
-                    echo "[CORS-MEDIUM] $url | exact origin reflection without credentials | $acao" >> "$p9dir/cors-findings.txt"
-                fi
-            fi
+            # Wildcard/null origins remain nonqualifying for this supplied origin.
+            printf '%s\n' "$headers" | _cors_header_lead "$url" >> "$p9dir/cors-findings.txt"
             cors_count=$(( cors_count + 1 ))
         done < "$p3dir/live-hosts.txt"
     fi
 
     if [ -s "$p9dir/cors-findings.txt" ]; then
-        success "🚨 CORS issues found: $(count_lines "$p9dir/cors-findings.txt")"
+        info "CORS header leads: $(count_lines "$p9dir/cors-findings.txt"); impact not established"
     else
-        info "No CORS misconfigurations detected."
+        info "No qualifying CORS header reflection observed; impact not assessed."
     fi
     [ "$cors_failures" -gt 0 ] && warn "CORS scan: $cors_failures/$cors_count requests failed (timeouts/resets)."
 
@@ -5147,18 +5249,21 @@ EOF
 2|Wildcards Filtered|phase2-validation/wildcards.txt|current-generation phase output
 2|Potential subdomain takeover|phase2-validation/takeover-findings.txt|Nuclei takeover-template matches
 2.5|S3 existence evidence|phase2.5-cloud/s3/exists.txt|observed cloud evidence; impact not independently established
-2.5|S3 Readable|phase2.5-cloud/s3/readable.txt|observed cloud evidence; impact not independently established
-2.5|S3 potential permission evidence|phase2.5-cloud/s3/writable.txt|observed cloud evidence; impact not independently established
+2.5|S3 anonymous endpoint read observed|phase2.5-cloud/s3/readable.txt|anonymous HTTP 200; listing/content sensitivity and impact not independently established
+2.5|S3 potential permission evidence|phase2.5-cloud/s3/writable.txt|legacy path: object-write-like ACL or potential PutObject policy evidence; no write attempted; impact not established
+2.5|S3 observed public ACL evidence|phase2.5-cloud/s3/acl-evidence.txt|distinct ACL administration/object-write-like observations; not confirmed object-write capability
+2.5|S3 observed policy evidence|phase2.5-cloud/s3/policy-evidence.jsonl|PutObject/resource/administration classification; Deny or unsupported evaluation suppresses positive conclusions; impact not established
 2.5|GCS existence evidence|phase2.5-cloud/gcs/exists.txt|observed cloud evidence; impact not independently established
-2.5|GCS Readable|phase2.5-cloud/gcs/readable.txt|observed cloud evidence; impact not independently established
+2.5|GCS anonymous listing/read observed|phase2.5-cloud/gcs/readable.txt|schema-qualified anonymous listing response; content sensitivity and impact not established
 2.5|Azure existence evidence|phase2.5-cloud/azure/exists.txt|observed cloud evidence; impact not independently established
-2.5|Azure Readable|phase2.5-cloud/azure/readable.txt|observed cloud evidence; impact not independently established
-2.5|Combined storage exposure evidence|phase2.5-cloud/exposed/all-exposed-buckets.txt|observed cloud evidence; impact not independently established
-2.5|GCS potential permission evidence|phase2.5-cloud/gcs/writable.txt|observed IAM evidence; impact not independently established
+2.5|Azure anonymous listing/read observed|phase2.5-cloud/azure/readable.txt|anonymous HTTP 200 with enumeration marker; content sensitivity and impact not established
+2.5|Combined anonymous listing/read observations|phase2.5-cloud/exposed/all-exposed-buckets.txt|anonymous endpoint read/listing evidence only; impact not established
+2.5|GCS potential permission evidence|phase2.5-cloud/gcs/writable.txt|legacy path: unconditional allUsers object-creation/admin role observations; no write attempted; impact not established
+2.5|GCS observed public IAM bindings|phase2.5-cloud/gcs/iam-evidence.jsonl|exact role/member/condition presence; allAuthenticatedUsers distinct from allUsers; impact not established
 2.5|GCS unverified evidence|phase2.5-cloud/gcs/unverified.txt|provider reference evidence
 2.5|Azure CDN references|phase2.5-cloud/azure/cdn-references.txt|discovery references; not storage exposure proof
 2.5|Cloud enumeration output|phase2.5-cloud/exposed/cloud_enum-open.txt|existing enumeration evidence; phase/action state governs coverage
-2.5|Combined potential cloud permission evidence|phase2.5-cloud/exposed/critical-writable.txt|existing S3/GCS policy/ACL classification; no new impact assertion
+2.5|Combined potential cloud permission evidence|phase2.5-cloud/exposed/critical-writable.txt|legacy path only, not Critical severity or confirmed write; ACL/policy/IAM observations; impact not established
 2.5|Unverified Names (NOTE)|phase2.5-cloud/exposed/unverified-candidates.txt|name candidates; not proof of ownership or probing
 2.5|Cloud reference evidence lines|phase2.5-cloud/ownership-evidence.txt|DNS/web reference leads; references do not prove ownership or permission
 2.5|Provider reference names|phase2.5-cloud/ownership-corroborated-names.txt|names extracted from references before approval filtering; not ownership proof
@@ -5206,7 +5311,7 @@ scoring|Top Targets (25%)|asset-scoring/top-targets.txt|current-generation phase
 9|SQLi Candidates|phase9-patterns/sqli-candidates.txt|current-generation phase output
 9|LFI Candidates|phase9-patterns/lfi-candidates.txt|current-generation phase output
 9|IDOR Candidates|phase9-patterns/idor-candidates.txt|current-generation phase output
-9|CORS Issues|phase9-patterns/cors-findings.txt|current-generation phase output
+9|Unconfirmed CORS header leads|phase9-patterns/cors-findings.txt|anonymous HEAD supplied-origin reflection; ACAO/ACAC/status recorded; authenticated sensitivity and impact not established; no severity assigned
 9|Host Header Inject|phase9-patterns/host-injection-findings.txt|current-generation phase output
 11|Paths Discovered|phase11-fuzzing/dirs/all-found-paths.txt|current-generation phase output
 11|Backup/Config Files|phase11-fuzzing/dirs/all-found-backups.txt|current-generation phase output
@@ -5508,7 +5613,7 @@ main() {
 
     if [ "$scan_failed" = false ]; then
         notify "✅ Scan Complete — ${TARGET}" \
-            "All enabled phases finished in *${elapsed_mins}m ${elapsed_secs}s*\n\nSubdomains: *${nc_subs}* | Live: *${nc_live}*\nCritical vulns: *${nc_crit}* | High/Med: *${nc_high}*\nExposed buckets: *${nc_buckets}* | JS secrets: *${nc_secrets}*\n\nReport: \`${OUTPUT_DIR}/reports/recon-report.txt\`"
+            "All enabled phases finished in *${elapsed_mins}m ${elapsed_secs}s*\n\nSubdomains: *${nc_subs}* | Live: *${nc_live}*\nCritical vulns: *${nc_crit}* | High/Med: *${nc_high}*\nAnonymous cloud listing/read observations: *${nc_buckets}* | JS secrets: *${nc_secrets}*\n\nReport: \`${OUTPUT_DIR}/reports/recon-report.txt\`"
         print_phase "🎉 RECONNAISSANCE COMPLETE!"
         success "All enabled phases completed successfully."
     else

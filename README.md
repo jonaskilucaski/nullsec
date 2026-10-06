@@ -388,7 +388,13 @@ phase2-validation/takeover-findings.txt
 
 Builds cloud leads from DNS/web references, but probes only exact provider resources also approved by `-C`, with target-facing enumeration authorized by `-A`. References do not establish ownership or permission.
 
-Unapproved resources and global namespace guesses are **not probed**. Public-write detection is based on anonymous ACL, policy, or IAM inspection rather than uploading a test object.
+Unapproved resources and global namespace guesses are **not probed**. Cloud results distinguish provider existence, anonymous listing/read observations, observed ACL/policy/IAM permissions, and potential object-creation permissions. No write/upload request is performed, so permission observations never establish confirmed anonymous write capability or Critical severity. Effective authorization, content sensitivity, and impact are not established by these checks.
+
+S3 `WRITE_ACP` and `PutObjectAcl` are administration evidence. `WRITE` and `FULL_CONTROL` remain object-write-like ACL observations. An unconditional public `PutObject` Allow must identify an object resource in the approved bucket to qualify as potential policy evidence; bucket-only and other-bucket resources do not qualify. Any Deny or unsupported policy statement conservatively suppresses positive policy conclusions; this is not a full IAM evaluator. The existing ACL early return remains, so a qualifying ACL observation does not imply policy coverage.
+
+GCS records the exact public IAM role and member, distinguishing `allUsers` from `allAuthenticatedUsers` and conditional bindings from unconditional ones. Creator and administration roles remain potential permission evidence; conditional and authenticated-public bindings do not qualify as potential anonymous permission. Empty or malformed policy/IAM/listing JSON does not qualify. GCS listing observations require the provider listing schema. S3 retains anonymous HTTP 200 endpoint-read evidence without fetching a listing body; Azure retains anonymous HTTP 200 enumeration-marker evidence and has no write classifier.
+
+The legacy `s3/writable.txt`, `gcs/writable.txt`, and `exposed/critical-writable.txt` paths remain for compatibility. Their records mean potential permission exposure only; their filenames do not establish write capability or severity. Distinct evidence files retain administration, ACL, policy applicability, and IAM binding classifications without storing raw policies or condition contents.
 
 Primary outputs:
 
@@ -397,6 +403,9 @@ phase2.5-cloud/ownership-evidence.txt
 phase2.5-cloud/exposed/unverified-candidates.txt
 phase2.5-cloud/exposed/all-exposed-buckets.txt
 phase2.5-cloud/exposed/critical-writable.txt
+phase2.5-cloud/s3/acl-evidence.txt
+phase2.5-cloud/s3/policy-evidence.jsonl
+phase2.5-cloud/gcs/iam-evidence.jsonl
 ```
 
 ### Phase 3 — Live web probing
@@ -508,10 +517,12 @@ Builds investigation lists for:
 - SQL injection
 - LFI
 - IDOR
-- CORS misconfiguration
+- CORS header reflection leads
 - Host-header injection
 
 When `-A -V` is supplied and the tools are available, Dalfox and SQLMap receive deduplicated, capped, currently authorized injection points. CORS and host-header checks include failure-window logic that stops early when throttling or network instability is detected.
+
+CORS uses the existing anonymous HEAD request only. `CORS-LEAD-CREDENTIALS` records the supplied origin reflected with a single `ACAC: true`; `CORS-LEAD-REFLECTION` records reflection without proven credential support. Both are unconfirmed leads with impact not established and no severity assigned. Evidence includes the target URL, ACAO, ACAC, HEAD method, observed response status, and source phase. Duplicate or malformed ACAO does not qualify; duplicate ACAC cannot prove credential support. Wildcard and null origins remain nonqualifying for the supplied origin. No response body, authentication, sensitive-data access, or browser exploit is inferred. High/Critical impact requires separately proven evidence.
 
 Primary outputs:
 
