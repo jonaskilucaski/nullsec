@@ -275,7 +275,9 @@ Usage: ./nullsec.sh -d <target-domain> [options]
   -h            Show help
 ```
 
-The target must be a plain DNS domain such as `example.com`. Do not pass a URL, path, wildcard, IP address, CIDR range, or labels with leading/trailing hyphens.
+The target must be an ASCII DNS hostname such as `example.com`, with at least two labels. Each label must contain 1–63 ASCII letters, digits, or hyphens, without a leading or trailing hyphen. The canonical name must be at most 253 characters. Uppercase is converted to lowercase and one trailing DNS dot is removed. Structurally valid `xn--` labels are accepted; Unicode, underscores, empty labels/repeated dots, URLs, paths, wildcards, IPv4/IPv6 literals, and CIDR ranges are rejected. Target syntax is checked before output creation or tool execution, including when `-I` supplies an explicit policy.
+
+Unexpected positional arguments are rejected, including arguments after `--` or before later options. A final `--` with no remaining arguments is accepted. Repeated valid options retain their last supplied value.
 
 `-o` and `-c` cannot be used together. A new explicit `-o` directory must be empty. Resume verifies the stored target and authorization fingerprint before any network launch. Re-supply the policy options and permissions used for the original run.
 
@@ -695,7 +697,7 @@ Phase 8 through 11 also have wall-clock timeouts, while Dalfox, SQLMap, and ffuf
 
 ### Amass selection
 
-NullSec prefers a side-by-side Amass v4 binary called `amass-v4` and falls back to `amass`.
+With `AMASS_PREFER_V4=true` (the default), NullSec selects the configured side-by-side v4 binary when its version output identifies a valid v4 release, otherwise falling back to an available `amass`. With preference disabled, only `amass` is selected: a configured v4 binary does not provide a fallback. Dependency preflight and Phase 1 use the same selection rule, and enumeration still requires `-A`.
 
 Override the behavior with environment variables:
 
@@ -710,6 +712,8 @@ Set a custom Amass timeout for larger domains:
 ```bash
 NULLSEC_AMASS_TIMEOUT=1800 ./nullsec.sh -d example.com
 ```
+
+`NULLSEC_AMASS_TIMEOUT` accepts only canonical positive base-10 integers from `1` through `86400` seconds (the operational safety maximum). Leading zeros, signs, whitespace, fractions, arithmetic expressions, and larger values are rejected before output creation. An unset or empty value preserves the mode defaults: fast `300`, normal `900`, deep `1800` seconds.
 
 Force the fallback binary:
 
@@ -728,6 +732,8 @@ export TELEGRAM_CHAT_ID='your-chat-id'
 ```
 
 Never hardcode a real token into a public repository. If a token is exposed, revoke it immediately through BotFather.
+
+Notifications have a 5-second connection timeout and a 10-second total deadline. Curl failures remain nonfatal. Temporary credential configs are removed after completion or failure and by the existing INT/TERM cleanup path.
 
 Recommended `.gitignore` entries:
 

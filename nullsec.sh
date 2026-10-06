@@ -173,6 +173,7 @@ KATANA_DEPTH=3
 # Default normal-mode budget is 900s. Deep mode raises the default to 1800s.
 # Override per run, for example:
 #   NULLSEC_AMASS_TIMEOUT=1800 ./nullsec.sh -d example.com
+# Overrides must be canonical decimal integers in 1..86400 seconds.
 # Prefer Amass v4.2.x because it streams the colored Open Asset Model graph:
 #   host.example.com (FQDN) --> a_record --> 192.0.2.10 (IPAddress)
 # Override these with environment variables when using a different binary name
@@ -208,6 +209,17 @@ NC='\033[0m'
 _PARALLEL_PIDS=()
 _ACTIVE_PIDS=()
 _CLEANUP_RUNNING=false
+_NOTIFICATION_CONFIGS=()
+
+_remove_notification_config() {
+    local cfg="$1" item
+    local -a kept=()
+    rm -f -- "$cfg" || return 1
+    for item in "${_NOTIFICATION_CONFIGS[@]}"; do
+        [ "$item" = "$cfg" ] || kept+=("$item")
+    done
+    _NOTIFICATION_CONFIGS=("${kept[@]}")
+}
 
 _register_active_pid() {
     local pid="${1:-}"
@@ -337,6 +349,11 @@ _nullsec_cleanup() {
     _CLEANUP_RUNNING=true
     trap - SIGINT SIGTERM
 
+    local _cfg
+    for _cfg in "${_NOTIFICATION_CONFIGS[@]}"; do
+        _remove_notification_config "$_cfg" || true
+    done
+
     echo ""
     warn "Scan interrupted — terminating child processes and preserving output..."
 
@@ -429,6 +446,48 @@ error()   { echo -e "${RED}[$(date +%H:%M)][ERROR]${NC} $1"; }
 
 check_command() {
     command -v "$1" &>/dev/null
+}
+
+# A target is an ASCII DNS name, independently of the authorization policy.
+# One final DNS dot is removed; IPv4 and IPv6 literals are never targets.
+normalize_target_hostname() {
+    local LC_ALL=C host="${1:-}"
+    host="${host,,}"; host="${host%.}"
+    [ "${#host}" -le 253 ] &&
+        [[ "$host" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] &&
+        ! [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s\n' "$host"
+}
+
+validate_amass_timeout_override() {
+    local LC_ALL=C value="${NULLSEC_AMASS_TIMEOUT:-}"
+    [ -n "$value" ] || return 0
+    # Bound the digit count before numeric comparison to prevent overflow.
+    if ! [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$value" -gt 86400 ]; then
+        error "Invalid configuration: NULLSEC_AMASS_TIMEOUT must be a canonical decimal integer in 1..86400 seconds."
+        return 1
+    fi
+}
+
+# Shared dependency/execution decision. Only version probes run here.
+select_amass() {
+    SELECTED_AMASS_BIN=""; SELECTED_AMASS_VERSION=""; SELECTED_AMASS_KIND=""
+    local bin version
+    if [ "$AMASS_PREFER_V4" = true ] && bin=$(command -v "$AMASS_V4_BIN"); then
+        version=$("$bin" -version 2>&1 | head -n 1 || true)
+        if [[ "$version" =~ ^v4\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?([[:space:]].*)?$ ]]; then
+            SELECTED_AMASS_BIN="$bin"; SELECTED_AMASS_VERSION="$version"
+            SELECTED_AMASS_KIND=preferred
+            return 0
+        fi
+    fi
+    if bin=$(command -v amass); then
+        SELECTED_AMASS_BIN="$bin"
+        SELECTED_AMASS_VERSION=$("$bin" -version 2>&1 | head -n 1 || true)
+        SELECTED_AMASS_KIND=fallback
+        return 0
+    fi
+    return 1
 }
 
 # Safe line count — handles missing or empty files gracefully
@@ -961,6 +1020,18 @@ polite_sleep() {
 #
 # Messages are sent in Markdown format.  Asterisks and backticks are safe to
 # use in the severity label and message body.
+# Parallel phase shells reset the main signal traps. Give the tracked sender
+# its own cleanup too, so terminating a parallel tree removes its credentials.
+_notification_curl() (
+    local cfg="$1" pid
+    shift
+    trap 'rm -f -- "$cfg"' EXIT
+    trap 'exit 130' SIGINT SIGTERM
+    "$@" &
+    pid=$!
+    wait "$pid"
+)
+
 notify() {
     [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ] && return 0
     [[ "$TELEGRAM_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ && "$TELEGRAM_CHAT_ID" =~ ^-?[0-9]+$ ]] || return 1
@@ -971,16 +1042,19 @@ notify() {
 
 %s' \
         "$label" "$TARGET" "$(date '+%Y-%m-%d %H:%M')" "$body")
-    cfg=$(mktemp)
-    chmod 600 "$cfg"
+    cfg=$(mktemp) || return 1
+    _NOTIFICATION_CONFIGS+=("$cfg")
+    chmod 600 "$cfg" || { _remove_notification_config "$cfg"; return 1; }
     printf 'url = "https://api.telegram.org/bot%s/sendMessage"
-' "$TELEGRAM_TOKEN" > "$cfg"
-    authorized_run passive service telegram curl -q --proto '=https' --max-redirs 0 -s -X POST --config "$cfg" \
+' "$TELEGRAM_TOKEN" > "$cfg" || { _remove_notification_config "$cfg"; return 1; }
+    # Noncritical notifications get 5s to connect and a 10s total deadline.
+    _run_tracked_command _notification_curl "$cfg" authorized_run passive service telegram curl -q --proto '=https' --max-redirs 0 \
+        --connect-timeout 5 --max-time 10 -s -X POST --config "$cfg" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
         --data-urlencode "text=${text}" \
         --data-urlencode "parse_mode=Markdown" \
         -o /dev/null || true
-    rm -f "$cfg"
+    _remove_notification_config "$cfg"
 }
 
 CHECKPOINT_FILE=""
@@ -1973,17 +2047,9 @@ check_tools() {
     # Amass compatibility: prefer the side-by-side v4 binary for colored
     # FQDN/IP/DNS relationship output, while retaining the maintained binary as
     # a fallback so the framework remains portable.
-    local amass_v4_version=""
     if authorization_allowed enumeration; then
-    if check_command "$AMASS_V4_BIN"; then
-        amass_v4_version=$("$AMASS_V4_BIN" -version 2>&1 | head -n 1 || true)
-    fi
-    if [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_v4_version" == v4.* ]]; then
-        echo -e "  ${GREEN}✓${NC} $AMASS_V4_BIN ($amass_v4_version; preferred colored graph engine)"
-    elif check_command "amass"; then
-        echo -e "  ${YELLOW}✓${NC} amass (fallback; usable Amass v4 binary not selected)"
-    elif [[ "$amass_v4_version" == v4.* ]]; then
-        echo -e "  ${GREEN}✓${NC} $AMASS_V4_BIN ($amass_v4_version)"
+    if select_amass; then
+        echo -e "  ${GREEN}✓${NC} $SELECTED_AMASS_BIN ($SELECTED_AMASS_VERSION; $SELECTED_AMASS_KIND)"
     else
         echo -e "  ${RED}✗${NC} $AMASS_V4_BIN or amass"
         missing_required+=("$AMASS_V4_BIN|amass")
@@ -2219,20 +2285,16 @@ phase1_subdomain_discovery() {
     }
 
     if authorization_allowed enumeration; then
-    amass_version=""
-    if [ "$AMASS_PREFER_V4" = true ] && check_command "$AMASS_V4_BIN"; then
-        amass_version=$("$AMASS_V4_BIN" -version 2>&1 | head -n 1 || true)
-    fi
-
-    if [ "$AMASS_PREFER_V4" = true ] && [[ "$amass_version" == v4.* ]]; then
-        _nullsec_run_amass_v4 "$(command -v "$AMASS_V4_BIN")"
+    if select_amass; then
+    amass_bin="$SELECTED_AMASS_BIN"
+    amass_version="$SELECTED_AMASS_VERSION"
+    if [ "$SELECTED_AMASS_KIND" = preferred ]; then
+        _nullsec_run_amass_v4 "$amass_bin"
         [ "$STATE_FAILED" = false ] || return 1
 
-    elif check_command "amass"; then
+    else
         # The normal binary can itself be v4, in which case preserve the same
         # graph experience. Otherwise use the maintained v5 database/export flow.
-        amass_bin=$(command -v amass)
-        amass_version=$("$amass_bin" -version 2>&1 | head -n 1 || true)
         amass_help=$("$amass_bin" enum -h 2>&1 || true)
 
         if [[ "$amass_version" == v4.* ]]; then
@@ -2276,6 +2338,7 @@ phase1_subdomain_discovery() {
             fi
             rm -f "$amass_export"
         fi
+    fi
     else
         error "Neither a valid $AMASS_V4_BIN nor amass is available."
         rc=127
@@ -3574,6 +3637,50 @@ phase6_parameters() {
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE 6b: Asset Scoring & Prioritization
 # ─────────────────────────────────────────────────────────────────────────────
+# Scoring reads URL-only corpora, httpx metadata (URL in the first field),
+# and service records (URL or bare host:port). Only the authority owns evidence.
+_scoring_record_host() {
+    local LC_ALL=C kind="$1" record="$2" normalized authority
+    case "$kind" in
+        detailed) record="${record%%[[:space:]]*}" ;;
+        url|service) ;;
+        *) return 1 ;;
+    esac
+    if [ "$kind" != service ] || [[ "$record" == *://* ]]; then
+        [[ "${record,,}" == http://* || "${record,,}" == https://* ]] || return 1
+    else
+        [[ "$record" == *:* ]] || return 1
+    fi
+    normalized=$(normalize_scope_input "$record") || return 1
+    authority="${normalized#*://}"; authority="${authority%%[/?#]*}"
+    if [ "${3:-}" = representative ]; then
+        # Keep the selected observed service's scheme and port. Grouping DNS
+        # identities must not invent a default-port endpoint for later phases.
+        printf '%s\t%s://%s\n' "${authority%%:*}" "${normalized%%://*}" "$authority"
+        return 0
+    fi
+    printf '%s\n' "${authority%%:*}"
+}
+
+_scoring_index() {
+    local LC_ALL=C kind="$1" source="$2" record host
+    [ -s "$source" ] || return 0
+    while IFS= read -r record || [ -n "$record" ]; do
+        host=$(_scoring_record_host "$kind" "$record") || continue
+        printf '%s\t%s\n' "$host" "${record,,}"
+    done < "$source"
+}
+
+_scoring_lookup() {
+    local operation="$1" host="$2" file="$3"
+    awk -F '\t' -v operation="$operation" -v host="$host" '
+        $1 == host { n++; if (operation == "records") print substr($0, index($0, "\t") + 1) }
+        END {
+            if (operation == "count") print n+0
+            if (operation == "has") exit (n == 0)
+        }' "$file"
+}
+
 phase_asset_scoring() {
     validate_output_tree || return 1
     phase_done scoring && return 0
@@ -3598,13 +3705,16 @@ phase_asset_scoring() {
     fi
 
     # ── Build the host universe ──────────────────────────────────────────────
-    # Normalize all live-host URLs to scheme://hostname (no trailing path/port
-    # variations) so we can match against URL-based files consistently.
+    # One deterministic observed service per DNS host, regardless of scheme,
+    # path, case, trailing DNS dot, or port. Preserve its scheme/port in output.
     info "Building host universe from live-hosts.txt..."
     local host_list="$score_dir/.host-universe.txt"
-    sed -E 's|^(https?://[^/]+).*|\1|' "$p3dir/live-hosts.txt" \
-        | tr '[:upper:]' '[:lower:]' \
-        | sort -u \
+    local record
+    while IFS= read -r record || [ -n "$record" ]; do
+        _scoring_record_host url "$record" representative || continue
+    done < "$p3dir/live-hosts.txt" \
+        | LC_ALL=C sort -u \
+        | awk -F '\t' '!seen[$1]++ {print $2}' \
         | head -"$MAX_SCORE_HOSTS" > "$host_list"
 
     local total_hosts
@@ -3612,48 +3722,35 @@ phase_asset_scoring() {
     info "Scoring $total_hosts unique hosts..."
 
     # ── Prepare lookup files ─────────────────────────────────────────────────
-    # Pre-lowercase all input files into temp copies so grep -c matches are
-    # case-insensitive without paying per-host grep -i overhead.
+    # Index each record by its exact canonical hostname. The payload is kept
+    # separately for parameter/technology signals, never for host attribution.
     local tmp_dir="$score_dir/.tmp"
     mkdir -p "$tmp_dir"
 
-    _lc_copy() {
-        # Usage: _lc_copy <src> <dest>  — lowercases into dest, or touches empty
-        if [ -s "$1" ]; then
-            tr '[:upper:]' '[:lower:]' < "$1" > "$2"
-        else
-            : > "$2"
-        fi
-    }
-
-    _lc_copy "$p3dir/status-200.txt"            "$tmp_dir/s200"
-    _lc_copy "$p3dir/status-401.txt"            "$tmp_dir/s401"
-    _lc_copy "$p3dir/status-403.txt"            "$tmp_dir/s403"
-    _lc_copy "$p3dir/status-500.txt"            "$tmp_dir/s500"
-    _lc_copy "$p3dir/clean-hosts.txt"           "$tmp_dir/detailed"
-    _lc_copy "$p4dir/services-on-ports.txt"     "$tmp_dir/alt-ports"
-    _lc_copy "$p5dir/api-endpoints.txt"         "$tmp_dir/apis"
-    _lc_copy "$p5dir/sensitive-endpoints.txt"   "$tmp_dir/sensitive"
-    _lc_copy "$p5dir/interesting-files.txt"     "$tmp_dir/interesting"
-    _lc_copy "$p5dir/live-js-files.txt"         "$tmp_dir/jsfiles"
+    _scoring_index url "$p3dir/status-200.txt"          > "$tmp_dir/s200"
+    _scoring_index url "$p3dir/status-401.txt"          > "$tmp_dir/s401"
+    _scoring_index url "$p3dir/status-403.txt"          > "$tmp_dir/s403"
+    _scoring_index url "$p3dir/status-500.txt"          > "$tmp_dir/s500"
+    _scoring_index detailed "$p3dir/clean-hosts.txt"    > "$tmp_dir/detailed"
+    _scoring_index service "$p4dir/services-on-ports.txt" > "$tmp_dir/alt-ports"
+    _scoring_index url "$p5dir/api-endpoints.txt"       > "$tmp_dir/apis"
+    _scoring_index url "$p5dir/sensitive-endpoints.txt" > "$tmp_dir/sensitive"
+    _scoring_index url "$p5dir/interesting-files.txt"   > "$tmp_dir/interesting"
+    _scoring_index url "$p5dir/live-js-files.txt"       > "$tmp_dir/jsfiles"
 
     # Merge all GF pattern matches into one file for counting
     local gf_merged="$tmp_dir/gf-all"
     : > "$gf_merged"
+    local gf_file
     for gf_file in "$p5dir"/gf-*.txt; do
-        [ -s "$gf_file" ] && cat "$gf_file" >> "$gf_merged"
+        _scoring_index url "$gf_file" >> "$gf_merged"
     done
-    tr '[:upper:]' '[:lower:]' < "$gf_merged" > "$gf_merged.lc" && mv "$gf_merged.lc" "$gf_merged"
 
     # Merge all parameter files (passive + Arjun) — count unique params per host
     # Parameters from Unfurl are global (not per-host), so we go back to the
     # raw URL corpus and extract params per host directly.
     local param_source="$tmp_dir/url-params"
-    if [ -s "$p5dir/all-urls.txt" ]; then
-        tr '[:upper:]' '[:lower:]' < "$p5dir/all-urls.txt" > "$param_source"
-    else
-        : > "$param_source"
-    fi
+    _scoring_index url "$p5dir/all-urls.txt" > "$param_source"
 
     # Tech keywords that boost score — common high-value/vuln-prone stacks
     local tech_keywords="wordpress|wp-content|jira|jenkins|drupal|tomcat|struts|coldfusion|phpmyadmin|weblogic|grafana|kibana|elasticsearch|solr|confluence|bitbucket|gitlab|sonarqube|spring-boot|actuator|swagger|openapi|graphql"
@@ -3668,39 +3765,32 @@ phase_asset_scoring() {
         local score=0
         local reasons=""
 
-        # Extract just the hostname portion for matching inside URLs
+        # Match the DNS identity independently of the representative's port.
         local hostname
-        hostname=$(echo "$host" | sed -E 's|^https?://||')
+        hostname=$(_scoring_record_host url "$host") || continue
 
         # ── Status code signals ──────────────────────────────────────────
-        if grep -qF "$hostname" "$tmp_dir/s200" 2>/dev/null; then
+        if _scoring_lookup has "$hostname" "$tmp_dir/s200"; then
             score=$((score + 5))
             reasons="${reasons}200:+5 "
         fi
-        if grep -qF "$hostname" "$tmp_dir/s401" 2>/dev/null; then
+        if _scoring_lookup has "$hostname" "$tmp_dir/s401"; then
             score=$((score + 15))
             reasons="${reasons}401:+15 "
         fi
-        if grep -qF "$hostname" "$tmp_dir/s403" 2>/dev/null; then
+        if _scoring_lookup has "$hostname" "$tmp_dir/s403"; then
             score=$((score + 15))
             reasons="${reasons}403:+15 "
         fi
-        if grep -qF "$hostname" "$tmp_dir/s500" 2>/dev/null; then
+        if _scoring_lookup has "$hostname" "$tmp_dir/s500"; then
             score=$((score + 20))
             reasons="${reasons}500:+20 "
         fi
 
         # ── Non-standard port services ───────────────────────────────────
-        # BUG-12: grep -cF prints "0" AND exits 1 on zero matches.  The naive
-        # `$(grep -cF ... || echo 0)` pattern captures TWO lines ("0\n0") because
-        # grep already emitted "0" before exiting 1, then || fires echo 0 adding
-        # a second line.  The subsequent `[ "$count" -gt 0 ]` then fails with
-        # "integer expression expected".
-        # Fix: brace-group the grep + fallback and pipe to head -1 so we always
-        # take only the first output line regardless of which branch ran.
         local alt_port_count=0
         if [ -s "$tmp_dir/alt-ports" ]; then
-            alt_port_count=$( { grep -cF "$hostname" "$tmp_dir/alt-ports" 2>/dev/null || echo 0; } | head -1)
+            alt_port_count=$( _scoring_lookup count "$hostname" "$tmp_dir/alt-ports")
         fi
         if [ "$alt_port_count" -gt 0 ]; then
             local pts=$((alt_port_count * 10))
@@ -3711,7 +3801,7 @@ phase_asset_scoring() {
         # ── API endpoints ────────────────────────────────────────────────
         local api_count=0
         if [ -s "$tmp_dir/apis" ]; then
-            api_count=$( { grep -cF "$hostname" "$tmp_dir/apis" 2>/dev/null || echo 0; } | head -1)
+            api_count=$( _scoring_lookup count "$hostname" "$tmp_dir/apis")
         fi
         if [ "$api_count" -gt 0 ]; then
             local pts=$((api_count * 3))
@@ -3722,7 +3812,7 @@ phase_asset_scoring() {
         # ── Sensitive endpoints ──────────────────────────────────────────
         local sens_count=0
         if [ -s "$tmp_dir/sensitive" ]; then
-            sens_count=$( { grep -cF "$hostname" "$tmp_dir/sensitive" 2>/dev/null || echo 0; } | head -1)
+            sens_count=$( _scoring_lookup count "$hostname" "$tmp_dir/sensitive")
         fi
         if [ "$sens_count" -gt 0 ]; then
             local pts=$((sens_count * 5))
@@ -3733,7 +3823,7 @@ phase_asset_scoring() {
         # ── Interesting files (config/bak/env) ───────────────────────────
         local int_count=0
         if [ -s "$tmp_dir/interesting" ]; then
-            int_count=$( { grep -cF "$hostname" "$tmp_dir/interesting" 2>/dev/null || echo 0; } | head -1)
+            int_count=$( _scoring_lookup count "$hostname" "$tmp_dir/interesting")
         fi
         if [ "$int_count" -gt 0 ]; then
             local pts=$((int_count * 4))
@@ -3744,7 +3834,7 @@ phase_asset_scoring() {
         # ── GF pattern matches ───────────────────────────────────────────
         local gf_count=0
         if [ -s "$gf_merged" ]; then
-            gf_count=$( { grep -cF "$hostname" "$gf_merged" 2>/dev/null || echo 0; } | head -1)
+            gf_count=$( _scoring_lookup count "$hostname" "$gf_merged")
         fi
         if [ "$gf_count" -gt 0 ]; then
             local pts=$((gf_count * 2))
@@ -3755,7 +3845,7 @@ phase_asset_scoring() {
         # ── Live JS files ────────────────────────────────────────────────
         local js_count=0
         if [ -s "$tmp_dir/jsfiles" ]; then
-            js_count=$( { grep -cF "$hostname" "$tmp_dir/jsfiles" 2>/dev/null || echo 0; } | head -1)
+            js_count=$( _scoring_lookup count "$hostname" "$tmp_dir/jsfiles")
         fi
         if [ "$js_count" -gt 0 ]; then
             local pts=$((js_count * 2))
@@ -3767,7 +3857,7 @@ phase_asset_scoring() {
         local param_count=0
         if [ -s "$param_source" ]; then
             # Count unique param keys in URLs matching this host
-            param_count=$(grep -F "$hostname" "$param_source" 2>/dev/null \
+            param_count=$(_scoring_lookup records "$hostname" "$param_source" \
                 | grep -oE '[?&][a-zA-Z0-9_-]+=' \
                 | sed 's/[?&]//;s/=$//' \
                 | sort -u \
@@ -3781,7 +3871,7 @@ phase_asset_scoring() {
         # ── Tech stack keywords ──────────────────────────────────────────
         if [ -s "$tmp_dir/detailed" ]; then
             local tech_match
-            tech_match=$(grep -iF "$hostname" "$tmp_dir/detailed" 2>/dev/null \
+            tech_match=$(_scoring_lookup records "$hostname" "$tmp_dir/detailed" \
                 | grep -oiE "$tech_keywords" \
                 | sort -u | head -5)
             if [ -n "$tech_match" ]; then
@@ -5393,15 +5483,21 @@ main() {
         esac
     done
 
-    TARGET=$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+    shift $((OPTIND - 1))
+    if [ "$#" -gt 0 ]; then
+        error "Unexpected positional arguments; use the documented options."
+        exit 1
+    fi
+
     if [ -z "$TARGET" ]; then
         error "Target domain is required!"
         usage
     fi
-    if ! [[ "$TARGET" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
-        error "Target must be a plain DNS domain name with no URL, wildcard, path, IP, CIDR, or leading/trailing hyphen labels."
+    if ! TARGET=$(normalize_target_hostname "$TARGET"); then
+        error "Invalid target hostname: use an ASCII DNS name with at least two labels, each 1..63 characters, and at most 253 characters total; IP literals are refused."
         exit 1
     fi
+    validate_amass_timeout_override || exit 1
     if [ "$OUTPUT_EXPLICIT" = true ] && [ -n "$RESUME_DIR" ]; then
         error "Use either -o for a new scan or -c to resume, not both."
         exit 1
