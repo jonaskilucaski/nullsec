@@ -2568,7 +2568,6 @@ phase2_validation() {
     info "Resolving subdomains with dnsx..."
     : > "$p2dir/resolved.txt"
     : > "$p2dir/valid-subdomains.txt"
-    : > "$p2dir/wildcards.txt"
 
     local resolvers_file="$p2dir/resolvers.txt"
     printf '8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n' > "$resolvers_file"
@@ -2576,7 +2575,7 @@ phase2_validation() {
     if ! authorized_run enumeration list "$p1dir/all-subdomains.txt" dnsx -l @AUTHORIZED_INPUT@ \
         -r "$resolvers_file" \
         -o "$p2dir/resolved.txt" \
-        -wd "$p2dir/wildcards.txt" \
+        -wd "$TARGET" \
         -a -resp -silent -rl 100 2>"$p2dir/dnsx-error.log"; then
         warn "dnsx failed; see $p2dir/dnsx-error.log. Partial output was preserved."
         phase_errors=$(( phase_errors + 1 ))
@@ -2593,7 +2592,7 @@ phase2_validation() {
 
     info "Total enumerated  : $total_enum"
     info "Actually resolved : $valid"
-    info "Manual wildcard filtering: unverified (dnsx invocation contract requires remediation)"
+    info "Manual wildcard filtering: requested for $TARGET"
     info "Exact number of wildcard-filtered responses: unavailable"
 
     if [ "$valid" -eq 0 ]; then
@@ -5402,7 +5401,7 @@ EOF
         done
     done
     _report_nuclei_severity || return 1
-    printf '\nManual wildcard filtering: unverified (dnsx invocation contract requires remediation)\nExact number of wildcard-filtered responses: unavailable\n' || return 1
+    printf '\nManual wildcard filtering: requested for %s\nExact number of wildcard-filtered responses: unavailable\n' "$TARGET" || return 1
     printf '\nCURRENT EVIDENCE SUMMARY (paths relative to OUTPUT DIR):\n' || return 1
     while IFS='|' read -r id label relative source; do
         _report_evidence_row "$id" "$label" "$relative" "$source" || return 1

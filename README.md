@@ -375,7 +375,7 @@ phase1-subdomains/amass-detailed.txt
 
 ### Phase 2 — Validation and resolution
 
-Uses dnsx to resolve discovered names, records DNS responses, and runs Nuclei takeover templates. The current wildcard invocation still requires remediation, so manual wildcard filtering is unverified. The exact number of wildcard-filtered responses is unavailable; the legacy `wildcards.txt` path is not wildcard evidence and is not counted in reports.
+Uses dnsx to resolve discovered names, records DNS responses, and runs Nuclei takeover templates. Manual wildcard filtering is requested using the normalized authorized target domain (`-wd "$TARGET"`). The exact number of wildcard-filtered responses is unavailable and is not counted in reports.
 
 Primary outputs:
 
