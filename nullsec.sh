@@ -67,8 +67,8 @@ GOWITNESS_THREADS=4
 
 # Limits
 MAX_JS_FILES=50         # max JS files to download in phase 8
-MAX_JS_FILE_BYTES=5242880   # 5 MiB maximum per downloaded JavaScript response
-MAX_JS_TOTAL_BYTES=52428800 # 50 MiB aggregate JavaScript download ceiling
+MAX_JS_FILE_BYTES=5242880   # 5 MiB maximum retained JS bytes per file
+MAX_JS_TOTAL_BYTES=52428800 # 50 MiB retained JS payload ceiling for the current run
 MAX_ARJUN_HOSTS=5       # max hosts to run Arjun against
 MAX_SCREENSHOTS=50      # max screenshots per category in phase 10
 MAX_CORS_HOSTS=100      # max hosts to test CORS against
@@ -2224,7 +2224,9 @@ phase1_subdomain_discovery() {
     amass_clean="$p1dir/amass-clean.txt"
     amass_legacy="$p1dir/amass.txt"
     amass_clean_log="$p1dir/amass-clean-export.log"
-    : > "$amass_clean"
+    if [ ! -e "$amass_clean" ]; then
+        _atomic_state_write "$amass_clean" < /dev/null || return 1
+    fi
     : > "$amass_legacy"
     : > "$amass_clean_log"
     : > "$p1dir/amass-detailed.txt"
@@ -2234,16 +2236,34 @@ phase1_subdomain_discovery() {
     # This cleaner extracts only clean, in-scope FQDN tokens and removes graph
     # relationship/object lines such as Netblock, IPAddress, ASN, ns_record, etc.
     _nullsec_export_clean_amass() {
-        local input="$1" output="$2"
-        if [ -s "$input" ]; then
-            grep -Eiv 'Netblock|IPAddress|RIROrganization|ASN|contains|managed_by|announces|ns_record|mx_record' "$input" 2>/dev/null \
-                | grep -Eo '(\*\.)?([a-zA-Z0-9_-]+\.)+[a-zA-Z0-9_-]+' \
-                | sed -E 's/^\*\.//; s/\.$//' \
-                | tr '[:upper:]' '[:lower:]' \
-                | in_scope \
-                | sort -u > "$output" || : > "$output"
-        else
-            : > "$output"
+        local input="$1" output="$2" tmp index status
+        local -a statuses
+        validate_output_path "$input" file && validate_output_path "$output" file || return 1
+        [ -f "$input" ] && [ -r "$input" ] \
+            || { state_error "Cannot read Amass cleaner input: $input"; return 1; }
+        tmp=$(mktemp -- "${output}.tmp.XXXXXXXX") \
+            || { state_error "Cannot create Amass cleaner temporary output."; return 1; }
+        grep -Eiv 'Netblock|IPAddress|RIROrganization|ASN|contains|managed_by|announces|ns_record|mx_record' "$input" 2>/dev/null \
+            | grep -Eo '(\*\.)?([a-zA-Z0-9_-]+\.)+[a-zA-Z0-9_-]+' \
+            | sed -E 's/^\*\.//; s/\.$//' \
+            | tr '[:upper:]' '[:lower:]' \
+            | in_scope \
+            | sort -u > "$tmp"
+        statuses=("${PIPESTATUS[@]}")
+        for index in "${!statuses[@]}"; do
+            status="${statuses[$index]}"
+            # grep status 1 means no matches, including valid empty input.
+            if [ "$status" -ne 0 ] && { [ "$index" -gt 1 ] || [ "$status" -ne 1 ]; }; then
+                validate_output_path "$tmp" file && rm -f -- "$tmp"
+                state_error "Amass cleaner processing failed; prior output preserved."
+                return 1
+            fi
+        done
+        if ! validate_output_path "$tmp" file || ! validate_output_path "$output" file \
+            || ! mv -fT -- "$tmp" "$output"; then
+            validate_output_path "$tmp" file && rm -f -- "$tmp"
+            state_error "Amass cleaner replacement failed; prior output preserved."
+            return 1
         fi
     }
     # Run Amass v4 without redirecting stdout. Keeping stdout attached to the
@@ -2274,7 +2294,7 @@ phase1_subdomain_discovery() {
 
         # Export only clean, in-scope FQDNs. Keep the full graph separately for
         # diagnostics; never merge raw graph relationship lines downstream.
-        _nullsec_export_clean_amass "$amass_detailed" "$amass_clean"
+        _nullsec_export_clean_amass "$amass_detailed" "$amass_clean" || return 1
     }
 
     if authorization_allowed enumeration; then
@@ -2282,7 +2302,7 @@ phase1_subdomain_discovery() {
     amass_bin="$SELECTED_AMASS_BIN"
     amass_version="$SELECTED_AMASS_VERSION"
     if [ "$SELECTED_AMASS_KIND" = preferred ]; then
-        _nullsec_run_amass_v4 "$amass_bin"
+        _nullsec_run_amass_v4 "$amass_bin" || return 1
         [ "$STATE_FAILED" = false ] || return 1
 
     else
@@ -2291,7 +2311,7 @@ phase1_subdomain_discovery() {
         amass_help=$("$amass_bin" enum -h 2>&1 || true)
 
         if [[ "$amass_version" == v4.* ]]; then
-            _nullsec_run_amass_v4 "$amass_bin"
+            _nullsec_run_amass_v4 "$amass_bin" || return 1
             [ "$STATE_FAILED" = false ] || return 1
         elif grep -q -- '-src' <<< "$amass_help"; then
             # Older Amass fallback. This path is retained only for portability;
@@ -2301,7 +2321,8 @@ phase1_subdomain_discovery() {
             : > "$amass_raw"
             _run_tracked_command authorized_run enumeration host "$TARGET" timeout --signal=INT --kill-after=30s "$AMASS_TIMEOUT"                 "$amass_bin" enum                     -passive -src -d @AUTHORIZED_INPUT@                     -o "$amass_raw"                     2> "$p1dir/amass-error.log"
             rc=$?
-            _nullsec_export_clean_amass "$amass_raw" "$amass_clean"
+            _nullsec_export_clean_amass "$amass_raw" "$amass_clean" \
+                || { rm -f -- "$amass_raw"; return 1; }
             rm -f "$amass_raw"
         else
             info "Using installed Amass v5 database/export fallback."
@@ -2323,7 +2344,8 @@ phase1_subdomain_discovery() {
 
             if "$amass_bin" subs                 -names -nocolor                 -d "$TARGET"                 -dir "$amass_state"                 -o "$amass_export"                 >/dev/null 2>> "$amass_log"; then
                 if [ -s "$amass_export" ]; then
-                    _nullsec_export_clean_amass "$amass_export" "$amass_clean"
+                    _nullsec_export_clean_amass "$amass_export" "$amass_clean" \
+                        || { rm -f -- "$amass_export"; return 1; }
                 fi
             else
                 warn "Amass v5 result export failed; see $amass_log"
@@ -4361,32 +4383,64 @@ phase8_javascript_analysis() {
     info "Downloading up to $MAX_JS_FILES JavaScript files..."
     local js_count=0 js_attempts=0 js_failures=0 total_bytes=0
     while IFS= read -r js_url && [ "$js_count" -lt "$MAX_JS_FILES" ]; do
-        local filename tmp_file file_bytes
-        filename=$(printf '%s' "$js_url" | sha256sum | awk '{print $1}')
-        tmp_file="$p8dir/js-files/.${filename}.tmp.$$"
+        local filename tmp_file file_bytes remaining_bytes response_limit destination stop_downloads=false
+        if [ "$total_bytes" -ge "$MAX_JS_TOTAL_BYTES" ]; then
+            info "Retained JS payload ceiling reached (${MAX_JS_TOTAL_BYTES} bytes); stopping."
+            break
+        fi
+        remaining_bytes=$(( MAX_JS_TOTAL_BYTES - total_bytes ))
+        response_limit="$MAX_JS_FILE_BYTES"
+        [ "$response_limit" -le "$remaining_bytes" ] || response_limit="$remaining_bytes"
+        filename=$(printf '%s' "$js_url" | sha256sum | awk '{print $1}') \
+            || { state_error "Cannot name retained JavaScript file."; phase_status=1; break; }
+        destination="$p8dir/js-files/$filename.js"
+        validate_output_path "$destination" file || { phase_status=1; break; }
+        tmp_file=$(mktemp -- "$p8dir/js-files/.${filename}.tmp.XXXXXXXX") \
+            || { state_error "Cannot create JavaScript temporary output."; phase_status=1; break; }
         js_attempts=$(( js_attempts + 1 ))
-        if authorized_run enumeration host "$js_url" curl -q --proto '=http,https' --max-redirs 0 -fsk --max-time 15 --max-filesize "$MAX_JS_FILE_BYTES" \
+        # curl's size enforcement is best effort; independently bound retained
+        # payload below. This counter does not measure aggregate wire bytes.
+        if authorized_run enumeration host "$js_url" curl -q --proto '=http,https' --max-redirs 0 -fsk --max-time 15 --max-filesize "$response_limit" \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             @AUTHORIZED_INPUT@ -o "$tmp_file" 2>/dev/null && [ -s "$tmp_file" ]; then
-            file_bytes=$(wc -c < "$tmp_file")
-            if [ $(( total_bytes + file_bytes )) -gt "$MAX_JS_TOTAL_BYTES" ]; then
-                warn "Aggregate JavaScript download limit reached (${MAX_JS_TOTAL_BYTES} bytes); stopping."
-                rm -f "$tmp_file"
-                break
+            if ! validate_output_path "$tmp_file" file \
+                || ! file_bytes=$(wc -c < "$tmp_file") \
+                || ! [[ "$file_bytes" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]]; then
+                state_error "Cannot measure JavaScript temporary payload."
+                js_failures=$(( js_failures + 1 )); phase_status=1; stop_downloads=true
+            elif [ "$file_bytes" -gt "$response_limit" ] \
+                || [ $(( total_bytes + file_bytes )) -gt "$MAX_JS_TOTAL_BYTES" ]; then
+                warn "JavaScript response exceeds its retained JS byte budget ($response_limit bytes); stopping."
+                js_failures=$(( js_failures + 1 )); stop_downloads=true
+            elif ! validate_output_path "$destination" file \
+                || ! mv -fT -- "$tmp_file" "$destination"; then
+                state_error "Cannot persist retained JavaScript file: $destination"
+                js_failures=$(( js_failures + 1 )); phase_status=1; stop_downloads=true
+            else
+                total_bytes=$(( total_bytes + file_bytes ))
+                js_count=$(( js_count + 1 ))
+                tmp_file=""
             fi
-            mv -f "$tmp_file" "$p8dir/js-files/$filename.js"
-            total_bytes=$(( total_bytes + file_bytes ))
-            js_count=$(( js_count + 1 ))
         else
-            rm -f "$tmp_file"
             js_failures=$(( js_failures + 1 ))
         fi
+        if [ -n "$tmp_file" ]; then
+            if ! validate_output_path "$tmp_file" file || ! rm -f -- "$tmp_file"; then
+                state_error "Cannot remove JavaScript temporary output."
+                phase_status=1; stop_downloads=true
+            fi
+        fi
+        [ "$stop_downloads" = false ] || break
     done < "$scoped_js"
     rm -f "$scoped_js"
-    success "Downloaded $js_count JavaScript files (${total_bytes} bytes); failures: $js_failures/$js_attempts"
+    success "Retained $js_count JavaScript files (${total_bytes} retained JS bytes); failures: $js_failures/$js_attempts"
 
     if [ "$js_count" -eq 0 ]; then
         error "Every JavaScript download failed or exceeded the configured limits."
+        merge_phase_backup "$p8dir" || return 1
+        return 1
+    fi
+    if [ "$phase_status" -ne 0 ]; then
         merge_phase_backup "$p8dir" || return 1
         return 1
     fi

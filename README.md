@@ -492,7 +492,11 @@ phase7-vulns/exposure-findings.json
 
 ### Phase 8 — JavaScript analysis
 
-Downloads a bounded number of in-scope JavaScript responses with per-file and aggregate size limits. When TruffleHog is installed and `-K` is explicitly supplied, it runs in verified-only mode; targeted regex extraction still runs without TruffleHog. It also extracts possible in-scope API endpoints.
+Downloads a bounded number of in-scope JavaScript responses. `MAX_JS_TOTAL_BYTES` is the maximum retained JS payload bytes for the current run, and `MAX_JS_FILE_BYTES` limits retained bytes per file. Before each request, the effective per-response retained limit is the smaller of the per-file ceiling and the remaining aggregate budget; exact aggregate exhaustion stops further requests. Independently measured payload bytes and file counts increase only after successful persistence. Failed responses, rejected payloads, and failed renames do not increase retained counters; persistence errors fail the phase.
+
+The retained JS payload ceiling is not a guaranteed aggregate network-transfer cap. Candidate count and the existing curl timeout additionally bound requests; curl `--max-filesize` provides best-effort early enforcement using the effective per-response limit. Its enforcement can depend on response metadata and curl behavior, and the retained counter is not a wire-byte meter.
+
+When TruffleHog is installed and `-K` is explicitly supplied, it runs in verified-only mode; targeted regex extraction still runs without TruffleHog. It also extracts possible in-scope API endpoints.
 
 Primary outputs:
 
@@ -510,6 +514,8 @@ phase8-javascript/live-js-endpoints.txt
 ```
 
 Treat regex-only secret matches as unverified until ownership, validity, exposure, and impact are safely established.
+
+NS-030 remains deferred: hashed JS filenames are derived from the selected canonical URL, with no persisted per-file source/status/content-digest manifest. Aggregate candidate matches require source verification.
 
 ### Phase 9 — Vulnerability pattern hunting
 
