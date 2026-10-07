@@ -373,6 +373,8 @@ phase1-subdomains/amass-detailed.txt
 
 `amass-detailed.txt` is diagnostic graph output only. NullSec merges only `amass-clean.txt` into the final subdomain corpus.
 
+The Amass cleaner splits textual records into complete candidate fields on ASCII whitespace. It removes at most one final comma, then at most one balanced `(...)` or `[...]` wrapper; internal punctuation (including `=`, `:`, `/`, and `@`) remains part of the field. Each complete candidate is lowercased, has at most one trailing DNS dot removed, and must pass strict DNS hostname validation and the existing scope policy before deduplication. Graph/object keywords elsewhere in the record do not discard valid hosts. Malformed tokens, embedded URLs/userinfo, and domain-looking substrings inside larger fields yield no hostname evidence.
+
 ### Phase 2 — Validation and resolution
 
 Uses dnsx to resolve discovered names, records DNS responses, and runs Nuclei takeover templates. Manual wildcard filtering is requested using the normalized authorized target domain (`-wd "$TARGET"`). The exact number of wildcard-filtered responses is unavailable and is not counted in reports.

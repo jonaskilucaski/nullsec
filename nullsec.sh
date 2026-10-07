@@ -2233,27 +2233,38 @@ phase1_subdomain_discovery() {
 
     # Amass v4 detailed output is a relationship graph. It is useful for
     # diagnostics, but it must never be merged directly into all-subdomains.txt.
-    # This cleaner extracts only clean, in-scope FQDN tokens and removes graph
-    # relationship/object lines such as Netblock, IPAddress, ASN, ns_record, etc.
+    # Candidate fields are separated only by ASCII whitespace. Allow one final
+    # comma and one balanced () or [] wrapper; all internal punctuation stays
+    # intact. Validate complete fields, never hostname-shaped substrings.
     _nullsec_export_clean_amass() {
-        local input="$1" output="$2" tmp index status
+        local input="$1" output="$2" tmp candidate status
         local -a statuses
         validate_output_path "$input" file && validate_output_path "$output" file || return 1
         [ -f "$input" ] && [ -r "$input" ] \
             || { state_error "Cannot read Amass cleaner input: $input"; return 1; }
         tmp=$(mktemp -- "${output}.tmp.XXXXXXXX") \
             || { state_error "Cannot create Amass cleaner temporary output."; return 1; }
-        grep -Eiv 'Netblock|IPAddress|RIROrganization|ASN|contains|managed_by|announces|ns_record|mx_record' "$input" 2>/dev/null \
-            | grep -Eo '(\*\.)?([a-zA-Z0-9_-]+\.)+[a-zA-Z0-9_-]+' \
-            | sed -E 's/^\*\.//; s/\.$//' \
-            | tr '[:upper:]' '[:lower:]' \
+        LC_ALL=C awk '{
+            count = split($0, fields, /[[:space:]]+/)
+            for (i = 1; i <= count; i++) {
+                candidate = fields[i]
+                sub(/,$/, "", candidate)
+                if (candidate ~ /^\(.*\)$/ || candidate ~ /^\[.*\]$/)
+                    candidate = substr(candidate, 2, length(candidate) - 2)
+                if (candidate != "") print candidate
+            }
+        }' "$input" \
+            | while IFS= read -r candidate; do
+                # Lowercase, remove one DNS dot, and validate the whole name
+                # before in_scope performs its existing authorization checks.
+                normalize_target_hostname "$candidate" || continue
+            done \
             | in_scope \
             | sort -u > "$tmp"
         statuses=("${PIPESTATUS[@]}")
-        for index in "${!statuses[@]}"; do
-            status="${statuses[$index]}"
-            # grep status 1 means no matches, including valid empty input.
-            if [ "$status" -ne 0 ] && { [ "$index" -gt 1 ] || [ "$status" -ne 1 ]; }; then
+        for status in "${statuses[@]}"; do
+            # These stages return zero for valid empty input; any error fails.
+            if [ "$status" -ne 0 ]; then
                 validate_output_path "$tmp" file && rm -f -- "$tmp"
                 state_error "Amass cleaner processing failed; prior output preserved."
                 return 1
