@@ -2242,6 +2242,15 @@ phase1_subdomain_discovery() {
         validate_output_path "$input" file && validate_output_path "$output" file || return 1
         [ -f "$input" ] && [ -r "$input" ] \
             || { state_error "Cannot read Amass cleaner input: $input"; return 1; }
+        # Reject raw NUL bytes before Bash read can discard them from evidence.
+        LC_ALL=C tr -d '\000' < "$input" | cmp -s - "$input"
+        statuses=("${PIPESTATUS[@]}")
+        for status in "${statuses[@]}"; do
+            if [ "$status" -ne 0 ]; then
+                state_error "Amass cleaner input contains NUL bytes or byte precheck failed; prior output preserved."
+                return 1
+            fi
+        done
         tmp=$(mktemp -- "${output}.tmp.XXXXXXXX") \
             || { state_error "Cannot create Amass cleaner temporary output."; return 1; }
         LC_ALL=C awk '{
