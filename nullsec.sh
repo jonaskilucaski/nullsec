@@ -3356,9 +3356,12 @@ phase5_url_discovery() {
     # 5.2 Hakrawler — lightweight spider for additional coverage
     if check_command "hakrawler" && [ -s "$p3dir/live-hosts.txt" ]; then
         info "Running Hakrawler..."
-        cat "$p3dir/live-hosts.txt" \
+        if ! cat "$p3dir/live-hosts.txt" \
             | authorized_run enumeration stream "" hakrawler -d 2 -timeout 10 -u 2>/dev/null \
-            > "$p5dir/hakrawler-urls.txt"
+            > "$p5dir/hakrawler-urls.txt"; then
+            warn "Hakrawler failed; partial output was preserved."
+            phase_errors=$(( phase_errors + 1 ))
+        fi
         success "Hakrawler: $(count_lines "$p5dir/hakrawler-urls.txt") URLs"
     else
         touch "$p5dir/hakrawler-urls.txt"
@@ -3367,9 +3370,12 @@ phase5_url_discovery() {
     # 5.3 Cariddi — full crawler with built-in secrets/endpoint detection
     if check_command "cariddi" && [ -s "$p3dir/live-hosts.txt" ]; then
         info "Running Cariddi (secrets + endpoint mode)..."
-        cat "$p3dir/live-hosts.txt" \
+        if ! cat "$p3dir/live-hosts.txt" \
             | authorized_run enumeration stream "" cariddi -s -e -intensive 1 \
-            > "$p5dir/cariddi-urls.txt" 2>/dev/null
+            > "$p5dir/cariddi-urls.txt" 2>/dev/null; then
+            warn "Cariddi failed; partial output was preserved."
+            phase_errors=$(( phase_errors + 1 ))
+        fi
         success "Cariddi: $(count_lines "$p5dir/cariddi-urls.txt") items"
     else
         touch "$p5dir/cariddi-urls.txt"
