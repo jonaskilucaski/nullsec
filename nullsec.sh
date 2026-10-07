@@ -4802,10 +4802,13 @@ phase9_pattern_hunting() {
     if authorization_allowed validation && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $cors_count -lt $MAX_CORS_HOSTS ]; do
             local headers
-            headers=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
+            if ! headers=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
                 -H 'Origin: https://evil.nullsec.com' \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                -I @AUTHORIZED_INPUT@ 2>/dev/null)
+                -I @AUTHORIZED_INPUT@ 2>/dev/null); then
+                warn "CORS observation request failed; partial output was preserved."
+                phase_status=1
+            fi
 
             # Update sliding window — append result, trim to window_size
             local _result
@@ -4858,11 +4861,14 @@ phase9_pattern_hunting() {
     if authorization_allowed validation && [ -s "$p3dir/live-hosts.txt" ]; then
         while IFS= read -r url && [ $hhi_count -lt 30 ]; do
             local resp
-            resp=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
+            if ! resp=$(authorized_run validation host "$url" curl -q --proto '=http,https' --max-redirs 0 -sk --max-time 5 \
                 -H 'Host: evil.nullsec.com' \
                 -H 'X-Forwarded-Host: evil.nullsec.com' \
                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                @AUTHORIZED_INPUT@ 2>/dev/null)
+                @AUTHORIZED_INPUT@ 2>/dev/null); then
+                warn "Host-header observation request failed; partial output was preserved."
+                phase_status=1
+            fi
 
             local _result
             if [ -z "$resp" ]; then
