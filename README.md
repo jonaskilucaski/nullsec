@@ -1,6 +1,6 @@
 # NullSec
 
-**Current version:** v1.0.2
+**Current version:** v1.0.3
 
 **NullSec** is a Bash-based bug bounty reconnaissance automation framework that organizes target discovery, validation, web probing, URL collection, prioritization, vulnerability scanning, JavaScript analysis, visual reconnaissance, fuzzing, and reporting into a checkpointed multi-phase workflow.
 
@@ -204,7 +204,7 @@ Display the current version:
 Expected output:
 
 ```text
-NullSec Framework v1.0.2
+NullSec Framework v1.0.3
 Created by Jonaski
 ```
 
@@ -846,6 +846,19 @@ Then reproduce each behavior manually with a controlled request and compare it a
 8. Test IDOR, authorization, business logic, and authenticated workflows manually.
 
 ## Changelog
+
+### v1.0.3
+
+Audited hardening and reliability release covering:
+
+- Authorization/scope and target/parser/preflight hardening
+- Filesystem/persistence safety and generation/history isolation
+- Checkpoint/state correctness and reporting/finalization integrity
+- Cloud/CORS evidence qualification and structured scanner-evidence validation
+- dnsx wildcard-filter contract and Nuclei stats argument corrections
+- Amass hostname extraction and boundary hardening
+- JavaScript retained-byte budgeting and storage safety
+- Maintainability/documentation cleanup
 
 ### v1.0.2
 - Fixed Nuclei templates path detection

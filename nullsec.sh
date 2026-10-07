@@ -29,7 +29,7 @@ umask 077
 #                           CONFIGURATION SECTION                              #
 #==============================================================================#
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 AUTHOR="Jonaski"
 
 TARGET=""
