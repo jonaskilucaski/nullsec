@@ -667,7 +667,9 @@ except Exception:
         "$NUCLEI_TEMPLATES" "$selected" "$digest" "$NUCLEI_SEVERITY"
 )
 
-# All target scans share the mode severity and disable Nuclei update checks.
+# Target scans use the mode severity unless a caller explicitly clears it.
+# Phase 2 clears it only for the installed takeover template directory.
+# All target scans disable Nuclei update checks.
 # Explicit installed template paths avoid first-run template discovery/downloads.
 nuclei_target_scan() {
     local kind="$1" input="$2" selected="$NUCLEI_TEMPLATES" output="" arg previous="" explicit_templates=false
@@ -684,7 +686,8 @@ nuclei_target_scan() {
         warn "Installed Nuclei templates are missing; scan skipped. Use explicit -u or install templates manually."
         return 1
     fi
-    local -a policy=(-duc -severity "$NUCLEI_SEVERITY")
+    local -a policy=(-duc)
+    [ -z "$NUCLEI_SEVERITY" ] || policy+=(-severity "$NUCLEI_SEVERITY")
     [ "$explicit_templates" = true ] || policy+=(-t "$NUCLEI_TEMPLATES")
     [ -n "$output" ] || return 1
     nuclei_template_identity "$selected" | _atomic_state_write "$output.templates.txt" || return 1
@@ -2622,15 +2625,14 @@ phase2_validation() {
     if [ -s "$p2dir/valid-subdomains.txt" ]; then
         if authorization_allowed validation && [ -d "$NUCLEI_TEMPLATES/http/takeovers" ]; then
             info "Scanning for subdomain takeover vulnerabilities..."
-            if ! nuclei_target_scan list "$p2dir/valid-subdomains.txt" -l @AUTHORIZED_INPUT@ \
+            # Explicit takeover templates must not inherit the general severity preset.
+            if ! NUCLEI_SEVERITY="" nuclei_target_scan list "$p2dir/valid-subdomains.txt" -l @AUTHORIZED_INPUT@ \
                 -t "$NUCLEI_TEMPLATES/http/takeovers/" \
                 -o "$p2dir/takeover-findings.txt" \
                 -silent 2>"$p2dir/takeover-nuclei.log"; then
-                warn "Nuclei takeover scan failed; see $p2dir/takeover-nuclei.log."
+                warn "Nuclei takeover scan failed; results are inconclusive. Partial output was preserved; see $p2dir/takeover-nuclei.log."
                 phase_errors=$(( phase_errors + 1 ))
-            fi
-
-            if [ -s "$p2dir/takeover-findings.txt" ]; then
+            elif [ -s "$p2dir/takeover-findings.txt" ]; then
                 success "🚨 Potential takeover vulnerabilities found! → $p2dir/takeover-findings.txt"
             else
                 info "No takeover vulnerabilities detected."
