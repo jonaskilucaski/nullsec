@@ -2423,20 +2423,22 @@ phase1_subdomain_discovery() {
     fi
     success "Assetfinder: $(count_lines "$p1dir/assetfinder.txt") subdomains"
 
+    # crt.sh is an optional external passive source. Its temporary outage must
+    # not freeze the Phase 1 checkpoint or invalidate successful source results.
     info "Querying crt.sh (Certificate Transparency)..."
     local crt_body crt_tmp crt_code
     crt_body="$p1dir/.crtsh-response.tmp.$$"
     crt_tmp="$p1dir/.crtsh-results.tmp.$$"
 
-    crt_code=$(authorized_run passive service "https://crt.sh/?q=%25.$TARGET&output=json" curl -q --proto '=https' --max-redirs 0 -sS         --connect-timeout 10         --max-time 45         --retry 4         --retry-delay 5         --retry-max-time 180         --retry-all-errors         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"         -o "$crt_body"         -w '%{http_code}'         "https://crt.sh/?q=%25.$TARGET&output=json"         2>/dev/null || true)
+    if crt_code=$(authorized_run passive service "https://crt.sh/?q=%25.$TARGET&output=json" curl -q --proto '=https' --max-redirs 0 -sS         --connect-timeout 10         --max-time 45         --retry 4         --retry-delay 5         --retry-max-time 180         --retry-all-errors         -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"         -o "$crt_body"         -w '%{http_code}'         "https://crt.sh/?q=%25.$TARGET&output=json"         2>/dev/null) \
+        && [ "$crt_code" = "200" ]        && jq -e 'type == "array"' "$crt_body" >/dev/null 2>&1; then
 
-    if [ "$crt_code" = "200" ]        && jq -e 'type == "array"' "$crt_body" >/dev/null 2>&1; then
+        if jq -r '.[]?.name_value // empty' "$crt_body"             | sed 's/\*\.//g'             | tr '[:upper:]' '[:lower:]'             | in_scope             | sort -u > "$crt_tmp" \
+            && mv -fT -- "$crt_tmp" "$p1dir/crtsh.txt"; then
 
-        if jq -r '.[]?.name_value // empty' "$crt_body"             | sed 's/\*\.//g'             | tr '[:upper:]' '[:lower:]'             | in_scope             | sort -u > "$crt_tmp"; then
-
-            mv -f "$crt_tmp" "$p1dir/crtsh.txt"
+            success "crt.sh: $(count_lines "$p1dir/crtsh.txt") subdomains"
         else
-            warn "crt.sh response parsing failed; keeping previous results."
+            warn "crt.sh response parsing or saving failed; keeping previous results."
             rm -f "$crt_tmp"
             [ -f "$p1dir/crtsh.txt" ] || : > "$p1dir/crtsh.txt"
         fi
@@ -2447,10 +2449,6 @@ phase1_subdomain_discovery() {
     fi
 
     rm -f "$crt_body" "$crt_tmp"
-
-    # crt.sh is an optional external passive source. Its temporary outage must
-    # not freeze the Phase 1 checkpoint or invalidate successful source results.
-    success "crt.sh: $(count_lines "$p1dir/crtsh.txt") subdomains"
 
     info "Merging passive enumeration results..."
     if ! cat "$p1dir/subfinder.txt" "$p1dir/amass-clean.txt" \
